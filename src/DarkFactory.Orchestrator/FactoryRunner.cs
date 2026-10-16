@@ -574,14 +574,17 @@ public sealed class FactoryItemStops(FactoryOptions options, WorkSourceRegistry 
 {
     public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) => StopAsync(sources.Of(item.Naming), item.Id, ct);
 
-    private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct)
+    public Task<ControlResult> DraftRepositoryAsync(ItemRef item, RepoRef repository, CancellationToken ct) =>
+        StopAsync(sources.Of(item.Naming), item.Id, ct, repository);
+
+    private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct, RepoRef? repository = null)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var stopper = new ItemStopper(owner, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
             new GitHubPullRequests(githubHttp, app), FactoryRunner.Controls(options), log);
-        return await stopper.StopAsync(id, ct);
+        return repository is null ? await stopper.StopAsync(id, ct) : await stopper.DraftRepositoryAsync(id, repository, ct);
     }
 }
 

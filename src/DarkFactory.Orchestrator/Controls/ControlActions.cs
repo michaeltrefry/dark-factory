@@ -16,6 +16,10 @@ public interface IItemStops
 {
     /// <summary>Stops one item of any source (sc-25982), on the source its id names.</summary>
     Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct);
+
+    /// <summary>Draft only this repository's changeset PRs of a retained multi-repository coordinator.</summary>
+    Task<ControlResult> DraftRepositoryAsync(ItemRef item, RepoRef repository, CancellationToken ct) =>
+        Task.FromResult(new ControlResult(false, $"{item}: repository stop NOT finished: scoped changeset drafting is unavailable; the repository stays manually paused."));
 }
 
 /// <summary>
@@ -105,6 +109,13 @@ public sealed class ControlActions(
             return FreezeOnlyContinues;
         }
         var stories = new List<ItemRef>();
+        var retainedPlans = new List<string>();
+        if (ControlScope.RepositoryOf(scope) is not null)
+        {
+            // Hold future releases/delivery here without turning a repository Stop into a global plan Stop.
+            // Only a human Continue lifts this manual pause; cancelled children are never resurrected by it.
+            await controls.SetAsync(scope, ControlState.Paused, by, ct);
+        }
         var unknown = new List<string>();
         if (ControlScope.ItemOf(scope) is { } story)
         {
@@ -130,11 +141,29 @@ public sealed class ControlActions(
             var repository = ControlScope.RepositoryOf(scope)?.Key;
             var items = await db.WorkItems.AsNoTracking()
                 .Where(i => i.State != WorkState.Done && i.State != WorkState.Cancelled
-                    && (repository == null || i.Repo.ToLower() == repository)
+                    && (repository == null || i.Repo.ToLower() == repository
+                        || db.LedgerEntries.Any(e => e.WorkItemId == i.Id && e.Step == RunPipeline.Steps.PlanStories))
                     && (epicSource == null || (i.Source == epicSource && i.EpicId == epicNumber)))
                 .OrderBy(i => i.Id)
-                .Select(i => new { i.Source, i.ExternalId })
+                .Select(i => new { i.Id, i.Source, i.ExternalId, i.Repo })
                 .ToListAsync(ct);
+            if (repository is not null)
+            {
+                var ids = items.Select(i => i.Id).ToArray();
+                var rows = await db.LedgerEntries.AsNoTracking().Where(e => ids.Contains(e.WorkItemId)).OrderBy(e => e.Id).ToListAsync(ct);
+                items.RemoveAll(i =>
+                {
+                    var history = rows.Where(e => e.WorkItemId == i.Id).ToList();
+                    var children = Plans.PlanRelease.StoriesOf(history.LastOrDefault(e => e.Step == RunPipeline.Steps.PlanStories)?.Detail);
+                    if (children.Count == 0) return false;
+                    var repos = Plans.PlanRelease.RecordedRepos(history.LastOrDefault(e => e.Step == RunPipeline.Steps.Plan)?.Detail,
+                        children, RepoRef.Parse(i.Repo));
+                    if (repos is not null && repos.Order.All(r => RepoRef.Parse(r).Key == repository)) return false;
+                    if (repos is not null && !repos.Order.Any(r => RepoRef.Parse(r).Key == repository)) return true;
+                    retainedPlans.Add(i.ExternalId);
+                    return true;
+                });
+            }
             var found = items.Select(i => ItemNaming.ParseAny(i.ExternalId) is { } r && r.Naming.Source == i.Source ? r : null).ToList();
             if (epic is not null)
             {
@@ -147,6 +176,9 @@ public sealed class ControlActions(
         }
         var ok = unknown.Count == 0;
         var results = new List<string>();
+        if (ControlScope.RepositoryOf(scope) is not null)
+            results.Add($"{scope} manually paused until human Continue; only this repository's active items are stopped."
+                + (retainedPlans.Count == 0 ? "" : $" Multi-repository plans retained: {string.Join(", ", retainedPlans)}; other repositories continue, cancelled children keep their plans incomplete."));
         foreach (var item in stories)
         {
             await controls.SetAsync(ControlScope.Item(item.ToString()), ControlState.Stopping, by, ct);
@@ -172,12 +204,28 @@ public sealed class ControlActions(
                     : $"{item}: stop NOT finished ({ex.Message}); it stays Stopping and the next poll or `factory stop` retries it.");
             }
         }
+        foreach (var plan in retainedPlans)
+        {
+            try
+            {
+                var drafted = stops is null
+                    ? new ControlResult(false, $"{plan}: repository stop NOT finished: retry with a configured stop handler to draft its selected changeset PRs.")
+                    : await stops.DraftRepositoryAsync(ItemNaming.ParseAny(plan)!, ControlScope.RepositoryOf(scope)!, ct);
+                ok &= drafted.Ok;
+                results.Add(drafted.Message);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                ok = false;
+                results.Add($"{plan}: repository stop NOT finished ({ex.Message}); the repository stays manually paused. Retry `factory stop --repo` to finish drafting.");
+            }
+        }
         if (unknown.Count > 0)
         {
             results.Add($"{unknown.Count} item(s) with an unknown epic NOT stopped: {string.Join(", ", unknown)} "
                 + "(the board could not be read); stop them with `factory stop --item` or retry.");
         }
-        else if (stories.Count == 0)
+        else if (stories.Count == 0 && results.Count == 0)
         {
             return new ControlResult(true, $"{scope}: no active items to stop.");
         }

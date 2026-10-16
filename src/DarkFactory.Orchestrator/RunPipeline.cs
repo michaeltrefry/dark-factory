@@ -933,7 +933,7 @@ public sealed partial class RunPipeline(
     {
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
-        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
+        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveWithoutRepositoryAsync(known.ExternalId, known.EpicId, ct);
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -951,9 +951,7 @@ public sealed partial class RunPipeline(
         }
         if (known is not null)
         {
-            // A waiting plan coordinates each repository independently; a gate pass uses its recorded pass repository.
-            if (known.State != WorkState.Planned && !Lifecycle.IsTerminal(known.State))
-                knownControl = await RepositoryControlAsync(known.ExternalId, known.EpicId, known.Repo, ct);
+            // Repository controls are checked only after the fresh spec and the ledger resolve the operation repository.
             if (knownControl == ControlState.Stopping) return await StopIdleAsync(known, storyId, ct);
             if (knownControl == ControlState.Paused)
             {
@@ -1022,6 +1020,14 @@ public sealed partial class RunPipeline(
         var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
+        if (known is not null && item.State != WorkState.Planned && !Lifecycle.IsTerminal(item.State))
+        {
+            var resolvedControl = await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct);
+            if (resolvedControl == ControlState.Stopping) return await StopIdleLockedAsync(item, storyId, ct);
+            if (resolvedControl == ControlState.Paused)
+                return await OutcomeAsync(item, PausedMessage(item.ExternalId), ct);
+        }
+
         // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created. Looked up
         // until the item is first claimed: a plan's story is linked before its claim (WithoutPlanAsync refuses one that is not),
         // so an item that was ever claimed without a link is no plan's story and is not looked up on every later run.
@@ -1974,6 +1980,12 @@ public sealed partial class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        return await StopIdleLockedAsync(item, storyId, ct);
+    }
+
+    /// <summary>The idle stop when this flow already holds the item's run lock.</summary>
+    private async Task<RunOutcome> StopIdleLockedAsync(WorkItem item, int storyId, CancellationToken ct)
+    {
         var repo = RepoRef.Parse(item.Repo);
         Workspace? workspace = null;
         if (!Lifecycle.IsTerminal(item.State))

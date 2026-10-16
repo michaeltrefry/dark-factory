@@ -495,7 +495,9 @@ public class MultiRepoPipelineTests
         public FakeShortcutBoard Board { get; } = new();
         public ShortcutWorkSource Source { get; }
         public HookedLocks Locks { get; } = new();
-        public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), TimeProvider.System);
+        public IControls? ControlReads { get; set; }
+        public IDbContextFactory<LedgerDbContext> Contexts => new LedgerDbContextFactory(_options);
+        public IControls Controls => new LedgerControls(Contexts, TimeProvider.System);
         public string Logged => _log.ToString();
         /// <summary>The repositories the factory is configured for (<c>Factory:DefaultRepo</c>, <c>Factory:Repos</c>, <c>GitHub:Watch:Repos</c>).</summary>
         public IReadOnlyList<RepoRef> Configured { get; set; } = TwoRepoAnswers.Both;
@@ -504,7 +506,7 @@ public class MultiRepoPipelineTests
 
         public Task<RunOutcome> Run(int id = PlanId, CancellationToken ct = default) =>
             new RunPipeline(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, _repos, Worker, _repos, Sandbox, _log,
-                controls: Controls, controlPollInterval: TimeSpan.FromMilliseconds(10),
+                controls: ControlReads ?? Controls, controlPollInterval: TimeSpan.FromMilliseconds(10),
                 gate: new GateStage(_repos, Reviewer, TimeSpan.FromMilliseconds(5), CiTimeout, Risk: FakeCodeGraphRisk.Reader(CodeGraph)),
                 planner: _planner is null ? null : new Seat(_planner), configuredRepos: Configured).RunAsync(id, ct);
 
@@ -1250,6 +1252,149 @@ public class MultiRepoPipelineTests
     /// Plans <see cref="Independent"/> (upstream first), merges both stories and opens the upstream changeset pull request: the plan
     /// item is in Review there, and the downstream changeset only waits for its turn.
     /// </summary>
+    [Theory]
+    [InlineData(false, ControlState.Paused)]
+    [InlineData(false, ControlState.Stopping)]
+    [InlineData(true, ControlState.Paused)]
+    [InlineData(true, ControlState.Stopping)]
+    public async Task A_control_during_multi_repo_empty_or_merged_evidence_records_no_delivery(bool mergedOutside, ControlState state)
+    {
+        var h = new Harness();
+        var ids = await h.Plan();
+        await h.Step();
+        await h.Merge(ids[0]);
+        if (mergedOutside)
+        {
+            Assert.Equal(WorkState.Review, await h.Step());
+            h.UpRepo.SquashOutside(ChangesetBranch);
+            Assert.Equal(WorkState.Escalated, (await h.Run()).State);
+            Assert.Equal(WorkState.Planned, await h.Step());
+            h.UpRepo.OnPullRead = Hold;
+        }
+        else
+        {
+            h.UpRepo.Advance("main", [.. h.UpRepo.At(h.UpRepo.Tip(ChangesetBranch))]);
+            h.UpRepo.OnDiffRead = (_, _) => Hold();
+        }
+        void Hold() => h.Controls.SetAsync("item:sc-500", state, "human", CancellationToken.None).GetAwaiter().GetResult();
+        var result = await h.Run();
+        Assert.Equal(state == ControlState.Stopping ? WorkState.Cancelled : WorkState.Planned, result.State);
+        Assert.Empty(await h.Steps(RunPipeline.Steps.ChangesetDelivered));
+        Assert.Empty(await h.Steps(RunPipeline.Steps.ChangesetEmpty));
+        Assert.Empty(await h.Steps(RunPipeline.Steps.MergedReported));
+        Assert.Empty(await h.Steps(RunPipeline.Steps.Closeout));
+        Assert.DoesNotContain(WorkState.Done, await h.Transitions());
+    }
+
+    private sealed class ScopedStops(Harness h) : IItemStops
+    {
+        public async Task<ControlResult> DraftRepositoryAsync(ItemRef item, RepoRef repository, CancellationToken ct)
+        {
+            await using var db = await h.Contexts.CreateDbContextAsync(ct);
+            return await new ItemStopper(h.Source, new WorkLedger(db, TimeProvider.System), h.Locks,
+                new Repos(h.UpRepo, h.DownRepo), h.Controls, TextWriter.Null).DraftRepositoryAsync(item.Id, repository, ct);
+        }
+
+        public async Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct)
+        {
+            await using var db = await h.Contexts.CreateDbContextAsync(ct);
+            return await new ItemStopper(h.Source, new WorkLedger(db, TimeProvider.System), h.Locks,
+                new Repos(h.UpRepo, h.DownRepo), h.Controls, TextWriter.Null).StopAsync(item.Id, ct);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Repository_Stop_does_not_cascade_through_a_multi_repo_plan_or_draft_its_other_changeset(bool primaryElsewhere)
+    {
+        var h = new Harness();
+        if (primaryElsewhere) h.Board.Story(PlanId)["description"] = $"Repo: {Down}\nRepo: {Up}\nIndependent work";
+        var ids = await h.Plan(TwoRepoAnswers.Answer([Up, Down], "Independent work",
+            TwoRepoAnswers.In(Up, PlanAnswers.Story("a", "alpha")),
+            TwoRepoAnswers.In(Down, PlanAnswers.Story("b", "beta"))));
+        await h.Step();
+        // Leave an active alpha child in the ledger; beta is still eligible for later release.
+        await using (var db = await h.Contexts.CreateDbContextAsync())
+        {
+            var ledger = new WorkLedger(db, TimeProvider.System);
+            var child = await ledger.GetOrCreateAsync("shortcut", $"sc-{ids[0]}", "alpha", Up, null, CancellationToken.None, 42);
+            await ledger.LinkPlanAsync(child, (await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-500")).Id, CancellationToken.None);
+        }
+        await h.UpRepo.OpenAsync(RepoRef.Parse(Up), ChangesetBranch, "main", "alpha delivery", "", CancellationToken.None);
+        await h.DownRepo.OpenAsync(RepoRef.Parse(Down), ChangesetBranch, "main", "beta delivery", "", CancellationToken.None);
+        var actions = new ControlActions(h.Controls, h.Contexts, new ScopedStops(h));
+        var stopped = await actions.StopAsync(ControlScope.Repository(RepoRef.Parse(Up)), "human", CancellationToken.None);
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.Contains(ChangesetBranch, h.UpRepo.Drafted);
+        Assert.Empty(h.DownRepo.Drafted);
+        Assert.Null(await h.Controls.GetAsync("item:sc-500", CancellationToken.None));
+        Assert.Equal(ControlState.Paused, (await h.Controls.GetAsync(ControlScope.Repository(RepoRef.Parse(Up)), CancellationToken.None))!.State);
+        Assert.Equal(WorkState.Cancelled, (await h.Rows(ids[0])).Last(e => e.Step is null).State);
+        Assert.Equal(WorkState.Planned, await h.Step());
+        Assert.Empty(h.DownRepo.Drafted);
+        Assert.Equal(ControlState.Running, await h.Controls.EffectiveInRepositoryAsync("sc-500", 42, Down, CancellationToken.None));
+        await h.Merge(ids[1]); // beta still goes through its ordinary gate, independently.
+        Assert.Equal(WorkState.Planned, await h.Step());
+        // A cancelled child keeps the original plan incomplete, not silently rewritten as a partial success.
+        Assert.DoesNotContain(WorkState.Done, await h.Transitions());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Scoped_changeset_drafting_refuses_a_live_run_or_a_possible_crashed_worker(bool live)
+    {
+        var h = new Harness();
+        await h.Plan();
+        await h.UpRepo.OpenAsync(RepoRef.Parse(Up), ChangesetBranch, "main", "alpha", "", CancellationToken.None);
+        await using var db = await h.Contexts.CreateDbContextAsync();
+        var ledger = new WorkLedger(db, TimeProvider.System);
+        var item = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-500");
+        await using var held = live ? await h.Locks.TryAcquireAsync(item.Id, CancellationToken.None) : null;
+        if (!live)
+            await ledger.CheckpointAsync(item, RunPipeline.Steps.WorkerStarted, null, WorkerPid.ToString(), CancellationToken.None);
+        var result = await new ScopedStops(h).DraftRepositoryAsync(new(ItemNaming.Shortcut, PlanId), RepoRef.Parse(Up), CancellationToken.None);
+        Assert.False(result.Ok);
+        Assert.Contains("repository stop NOT finished", result.Message);
+        Assert.Empty(h.UpRepo.Drafted);
+        Assert.Empty(h.DownRepo.Drafted);
+        Assert.Equal(WorkState.Planned, (await h.Rows()).Last(e => e.Step is null).State);
+        Assert.Null(await h.Controls.GetAsync("item:sc-500", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_changeset_pass_uses_its_recorded_repository_not_a_held_primary_spec_repository()
+    {
+        var h = new Harness();
+        await h.UpstreamDelivered();
+        Assert.Equal(WorkState.Review, await h.Step());
+        await h.Controls.SetAsync(ControlScope.Repository(RepoRef.Parse(Up)), ControlState.Paused, "human", CancellationToken.None);
+        Assert.Equal(WorkState.Watch, (await h.Run()).State);
+        Assert.Equal(ChangesetBranch, h.DownRepo.Merges.Last().Head);
+        Assert.Equal(ControlState.Paused, (await h.Controls.GetAsync(ControlScope.Repository(RepoRef.Parse(Up)), CancellationToken.None))!.State);
+    }
+
+    [Theory]
+    [InlineData(false, ControlState.Paused)]
+    [InlineData(false, ControlState.Stopping)]
+    [InlineData(true, ControlState.Paused)]
+    [InlineData(true, ControlState.Stopping)]
+    public async Task A_control_after_empty_evidence_is_recorded_prevents_delivery_or_final_closeout(bool atCloseout, ControlState state)
+    {
+        var h = new Harness();
+        await h.UpstreamDelivered();
+        h.DownRepo.Advance("main", [.. h.DownRepo.At(h.DownRepo.Tip(ChangesetBranch))]);
+        h.ControlReads = new ChangesetPipelineTests.EvidenceControls(h.Controls,
+            async () => atCloseout ? (await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Count == 2
+                : (await h.Steps(RunPipeline.Steps.ChangesetEmpty)).Count > 0, state, atCloseout);
+        Assert.Equal(state == ControlState.Stopping ? WorkState.Cancelled : WorkState.Planned, (await h.Run()).State);
+        Assert.Equal(atCloseout ? 2 : 1, (await h.Steps(RunPipeline.Steps.ChangesetDelivered)).Count);
+        Assert.Empty(await h.Steps(RunPipeline.Steps.MergedReported));
+        Assert.Empty(await h.Steps(RunPipeline.Steps.Closeout));
+        Assert.DoesNotContain(WorkState.Done, await h.Transitions());
+    }
+
     private static async Task<int[]> UpstreamInReview(Harness h)
     {
         var ids = await h.Plan(Independent(Up, Down));

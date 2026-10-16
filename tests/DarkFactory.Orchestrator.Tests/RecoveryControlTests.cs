@@ -86,6 +86,71 @@ public class RecoveryControlTests
     }
 
     [Fact]
+    public async Task Postgres_long_repository_scope_round_trips_pause_and_continue_without_truncation()
+    {
+        await using var database = await TempPostgresDatabase.CreateAsync("df_long_repo_control");
+        await LedgerMigrations.MigrateAsync(database.ConnectionString, Ct);
+        var f = new Fixture(LedgerDbContext.PostgresOptions(database.ConnectionString));
+        var repo = "owner/" + new string('a', 100);
+        var scope = ControlScope.Repository(RepoRef.Parse(repo));
+        await f.Item(repo: repo);
+        Assert.True((await f.Actions.PauseAsync(scope, "human", Ct)).Ok);
+        Assert.Equal(scope, (await f.Controls.GetAsync(scope, Ct))!.Scope);
+        Assert.Equal(ControlState.Paused, await f.Controls.EffectiveAsync("sc-77", 42, Ct));
+        Assert.True((await f.Actions.ContinueAsync(scope, "human", Ct)).Ok);
+        Assert.Equal(ControlState.Running, await f.Controls.EffectiveAsync("sc-77", 42, Ct));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task An_existing_item_uses_its_corrected_spec_repository_not_the_old_held_repository(bool manual)
+    {
+        var f = new Fixture();
+        await f.Item();
+        if (manual) await f.Actions.PauseAsync(ControlScope.Repository(RepoRef.Parse(A)), "human", Ct);
+        else await f.Hold();
+        var source = new FakeWorkSource(new WorkStory(77, "moved", $"Repo: {B}", "feature", "", ItemNaming.Shortcut));
+        Assert.Equal(WorkState.Review, (await f.Run(source)).State);
+        Assert.Contains("claim 77", source.Writes);
+        Assert.Equal(ControlState.Paused, await f.Controls.EffectiveInRepositoryAsync("sc-77", 42, A, Ct));
+    }
+
+    [Fact]
+    public async Task An_existing_item_detects_new_incident_evidence_in_its_corrected_repository_before_a_worker_starts()
+    {
+        var f = new Fixture();
+        await f.Item();
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            for (var n = 1; n <= 8; n++)
+            {
+                var merged = new WorkItem { Source = "shortcut", ExternalId = $"sc-{n}", Title = "merged", Repo = B,
+                    State = WorkState.Watch, CreatedAt = f.Time.GetUtcNow(), UpdatedAt = f.Time.GetUtcNow() };
+                db.WorkItems.Add(merged);
+                await db.SaveChangesAsync();
+                db.LedgerEntries.Add(new() { WorkItemId = merged.Id, State = WorkState.MergeGate, Step = RunPipeline.Steps.MergeFiles,
+                    Detail = new MergeFiles("main", ["src/a.cs"]).ToDetail(), RecordedAt = f.Time.GetUtcNow(), Outcome = StepOutcome.Passed });
+                await db.SaveChangesAsync();
+                db.LedgerEntries.Add(new() { WorkItemId = merged.Id, State = WorkState.Merge, Detail = n.ToString("x40"),
+                    RecordedAt = f.Time.GetUtcNow(), Outcome = StepOutcome.Passed });
+                await db.SaveChangesAsync();
+            }
+        }
+        var assessor = new SafeAssessor();
+        // A failed independent assessment leaves the new incident held without blocking the test on a worker.
+        assessor.Finish.SetCanceled();
+        await using var recovery = new HotFileRecovery(f.Contexts, f.Locks, new FreezeOptions(), f.Time, assessor);
+        var source = new FakeWorkSource(new WorkStory(77, "moved", $"Repo: {B}", "feature", "", ItemNaming.Shortcut));
+        Assert.Equal(WorkState.Intake, (await f.Run(source, recovery: recovery)).State);
+        Assert.True(assessor.Entered.Task.IsCompleted);
+        Assert.NotNull(await recovery.HeldAsync(B, Ct));
+        Assert.Empty(source.Writes);
+        await using var check = f.Contexts.CreateDbContext();
+        Assert.DoesNotContain(await check.LedgerEntries.ToListAsync(), e => e.Step == RunPipeline.Steps.WorkerStarted);
+    }
+
+    [Fact]
     public async Task Postgres_composes_incidents_with_manual_controls_and_an_explicit_operation_repository()
     {
         await using var database = await TempPostgresDatabase.CreateAsync("df_recovery_controls");
@@ -257,6 +322,25 @@ public class RecoveryControlTests
         Assert.Equal(ControlState.Stopping, await f.Controls.EffectiveAsync("sc-77", 42, Ct));
         Assert.Equal(ControlState.Running, await f.Controls.EffectiveAsync("sc-78", 42, Ct));
         Assert.Null(await f.Controls.GetAsync("item:sc-78", Ct));
+    }
+
+    [Fact]
+    public async Task A_Stop_during_resolved_repository_assessment_finishes_under_the_existing_run_lock()
+    {
+        var f = new Fixture();
+        await f.Item();
+        await f.Hold();
+        var assessor = new SafeAssessor();
+        await using var recovery = new HotFileRecovery(f.Contexts, f.Locks, new FreezeOptions(), f.Time, assessor);
+        var source = f.Source();
+        var running = f.Run(source, recovery: recovery);
+        await assessor.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await f.Actions.StopAsync("item:sc-77", "human", Ct);
+        assessor.Finish.SetResult();
+        Assert.Equal(WorkState.Cancelled, (await running).State);
+        Assert.Contains("state 77 Stopped", source.Writes);
+        Assert.DoesNotContain("claim 77", source.Writes);
+        Assert.Null(await f.Controls.GetAsync("item:sc-77", Ct));
     }
 
     [Fact]

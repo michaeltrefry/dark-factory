@@ -127,6 +127,10 @@ public interface IControls
     /// </summary>
     Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct);
 
+    /// <summary>Human/factory/usage/plan controls before the fresh spec resolves the operation repository.</summary>
+    Task<ControlState> EffectiveWithoutRepositoryAsync(string externalId, long? epicId, CancellationToken ct) =>
+        EffectiveAsync(externalId, epicId, ct);
+
     /// <summary>
     /// Composes the item's human/global/plan controls with the repository this operation targets. A waiting multi-repository
     /// plan uses this per child/pass, never its primary repository to hold unrelated children. Human item/epic/plan and global
@@ -203,6 +207,9 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
 {
     public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct) =>
         EffectiveCoreAsync(externalId, epicId, null, resolveRepository: true, ct);
+
+    public Task<ControlState> EffectiveWithoutRepositoryAsync(string externalId, long? epicId, CancellationToken ct) =>
+        EffectiveCoreAsync(externalId, epicId, null, resolveRepository: false, ct);
 
     public Task<ControlState> EffectiveInRepositoryAsync(string externalId, long? epicId, string repository, CancellationToken ct)
     {

@@ -1090,9 +1090,9 @@ public class WorkSourceRegistryTests
     }
 
     [Theory]
-    [InlineData("pause", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.")]
-    [InlineData("stop", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.")]
-    [InlineData("continue", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --factory, --usage or --freeze.")]
+    [InlineData("pause", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name> or --factory.")]
+    [InlineData("stop", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name> or --factory.")]
+    [InlineData("continue", "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name>, --factory, --usage or --freeze.")]
     public void A_control_with_no_scope_says_which_ids_an_item_takes(string action, string expected)
     {
         var root = FactoryCli.Build((_, _, _) => Task.FromResult(0), (_, _, _, _) => Task.FromResult(0), (_, _) => Task.FromResult(0),
