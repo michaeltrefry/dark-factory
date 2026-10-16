@@ -2474,9 +2474,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `~/.local/bin`, first on its PATH) — and only in a factory with `Worker:Swift=true`: `ClaudeWorker.AllowedToolsFor(swift)` /
   `WorkerTools.ImplementerFor(swift)` add it (`SwiftAllowedTools`, `SwiftImplementer`, wired by `FactoryRunner` from
   `options.WorkerSwift`), and only then do the implementing prompts name it (`RunPipeline.BuildsAndPassesFor(swift)`, the
-  pipeline's `swift` parameter), followed by `RunPipeline.SwiftSandboxNote` (sc-26134: the shell has no git, no raw
-  `xcodebuild`/`xcrun`/`simctl` and nothing outside the worktree; an iOS `<device>` comes from the repository's CI workflow or
-  README, or from the wrapper's own "available destinations" error — a live iOS worker had spent 9 of 26 tool calls on those
+  pipeline's `swift` parameter), followed by `RunPipeline.SwiftSandboxNote` (sc-26134: the shell is allowed no command but
+  those the prompt names — no git, no raw `xcodebuild`/`xcrun`/`simctl`, no `ls`/`cat`/`find` — so files are looked at with the
+  Read, Glob and Grep tools, which are not confined to the worktree; an iOS `<device>` comes from the repository's CI workflow or
+  README, or from xcodebuild's "available destinations" error, which the wrapper passes through — a live iOS worker had spent 9 of 26 tool calls on those
   denials; no allow rule changed). With `Worker:Swift` unset no allow rule and no prompt names the
   wrapper. NOT as before Phase 5, in every factory whatever the setting — an E7 exception, like cargo's tools (sc-25877), kept
   always-on by coordinator decision, confirmed by the owner 2026-10-15 (sc-26134): `Bash(swift build:*)` and `Bash(swift

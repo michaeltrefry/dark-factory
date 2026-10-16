@@ -281,9 +281,12 @@ public class SwiftToolchainTests
         Assert.EndsWith("the only xcodebuild command allowed). " + RunPipeline.SwiftSandboxNote, clause);
         Assert.Contains("there is no git", clause);
         Assert.Contains("no raw `xcodebuild`, `xcrun` or `simctl`", clause);
-        Assert.Contains("nothing outside this worktree can be read or listed", clause);
+        Assert.Contains("your shell is allowed no other command", clause);
+        Assert.Contains("no `ls`, `cat` or `find`", clause);
+        Assert.Contains("use the Read, Glob and Grep tools to look at files", clause);
+        Assert.DoesNotContain("outside this worktree", clause);
         Assert.Contains("take `<device>` from the repository's CI workflow or README", clause);
-        Assert.Contains("the wrapper's xcodebuild error lists the available destinations", clause);
+        Assert.Contains("xcodebuild's error, which the wrapper passes through, lists the available destinations", clause);
         Assert.False(RunPipeline.SwiftSandboxNote.EndsWith('.'), "every prompt puts its own full stop after the clause");
         Assert.DoesNotContain(RunPipeline.SwiftSandboxNote, RunPipeline.BuildsAndPassesFor(false));
 

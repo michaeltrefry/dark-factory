@@ -2625,10 +2625,11 @@ public sealed partial class RunPipeline(
     /// where a simulator's name comes from instead. Ends without a full stop: every prompt puts one after <see cref="BuildsAndPassesFor"/>.
     /// </summary>
     internal const string SwiftSandboxNote =
-        "Apart from the commands this prompt names, your shell is denied: there is no git (the orchestrator reads your changes from "
-        + "the worktree), no raw `xcodebuild`, `xcrun` or `simctl`, and nothing outside this worktree can be read or listed, so do not "
-        + "try them. For an iOS app take `<device>` from the repository's CI workflow or README; if no simulator has that name, the "
-        + "wrapper's xcodebuild error lists the available destinations to pick from";
+        "Apart from the commands this prompt names, your shell is allowed no other command: there is no git (the orchestrator reads "
+        + "your changes from the worktree), no raw `xcodebuild`, `xcrun` or `simctl`, and no `ls`, `cat` or `find`, so do not try them; "
+        + "use the Read, Glob and Grep tools to look at files. For an iOS app take `<device>` from the repository's CI workflow or "
+        + "README; if no simulator has that name, xcodebuild's error, which the wrapper passes through, lists the available "
+        + "destinations to pick from";
 
     /// <summary><see cref="BuildsAndPassesWithXcode"/> when <paramref name="swift"/> (<c>Worker:Swift</c>), else <see cref="BuildsAndPasses"/>.</summary>
     internal static string BuildsAndPassesFor(bool swift) => swift ? BuildsAndPassesWithXcode : BuildsAndPasses;
