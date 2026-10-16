@@ -84,7 +84,7 @@ public class FreezeTests
         public IControls? Controls { get; set; }
         public IControls Ledger => new LedgerControls(Contexts, Time);
         public MainCi GitHub { get; } = new();
-        public FreezeOptions Options { get; set; } = new();
+        public FreezeOptions Options { get; set; } = new() { HotFileMerges = 3 };
         public FakeWorker Worker { get; } = new(Reports(Ok));
 
         /// <summary>The configured repos main-red reads besides those of non-terminal items (null: none).</summary>
@@ -268,7 +268,7 @@ public class FreezeTests
         var h = new H();
         await Seed(h, FreezeTrigger.HotFile, holds: true);
         h.Time.Advance(TimeSpan.FromHours(23));
-        Assert.True((await new FactoryFreeze(h.Contexts, h.Ledger, new FreezeOptions(), h.Time).CheckAsync(CancellationToken.None)).Frozen);
+        Assert.True((await new FactoryFreeze(h.Contexts, h.Ledger, h.Options, h.Time).CheckAsync(CancellationToken.None)).Frozen);
 
         var later = new H();
         await Seed(later, FreezeTrigger.HotFile, holds: true);
@@ -588,7 +588,7 @@ public class FreezeTests
         h.Time.Advance(TimeSpan.FromHours(2));
         h.Options = Options(("Freeze:HotFileWindowHours", "1")).Freeze;
         Assert.Equal(FreezeStatus.Clear, await h.Freeze.CheckAsync(CancellationToken.None));
-        h.Options = Options(("Freeze:HotFileWindowHours", "3")).Freeze;
+        h.Options = Options(("Freeze:HotFileWindowHours", "3"), ("Freeze:HotFileMerges", "3")).Freeze;
         Assert.Equal(FreezeTrigger.HotFile, (await h.Freeze.CheckAsync(CancellationToken.None)).Trigger);
     }
 
@@ -596,7 +596,7 @@ public class FreezeTests
     public void Freeze_thresholds_default_and_out_of_range_values_are_refused()
     {
         Assert.Equal(new FreezeOptions(), Options().Freeze);
-        Assert.Equal((3, 3, TimeSpan.FromHours(24), 2),
+        Assert.Equal((3, 8, TimeSpan.FromHours(24), 2),
             (Options().Freeze.MaxConsecutiveFailures, Options().Freeze.HotFileMerges, Options().Freeze.HotFileWindow, Options().Freeze.CostRisingRounds));
         Assert.Throws<InvalidOperationException>(() => Options(("Freeze:MaxConsecutiveFailures", "0")).Freeze);
         Assert.Throws<InvalidOperationException>(() => Options(("Freeze:HotFileMerges", "1")).Freeze);

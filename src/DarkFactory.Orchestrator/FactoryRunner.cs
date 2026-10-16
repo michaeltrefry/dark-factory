@@ -268,7 +268,19 @@ public static class FactoryRunner
         var http = OutboundHttp.GitHubApi();
         var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
         return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp),
-            options.ConfiguredRepos, FreezeCheckFailures.Process);
+            options.ConfiguredRepos, FreezeCheckFailures.Process, CreateRecovery(options), scheduleRecovery: true);
+    }
+
+    private static Recovery.HotFileRecovery CreateRecovery(FactoryOptions options)
+    {
+        var http = OutboundHttp.GitHubApi();
+        var router = ReviewerHttp(options);
+        var sources = new WorkSourceRegistry(options);
+        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        var evidence = new Recovery.HotFileEvidence(Contexts(options), new GitHubGate(http, app), naming => sources.Of(naming));
+        return new Recovery.HotFileRecovery(Contexts(options), new PostgresRunLocks(options.LedgerConnectionString), options.Freeze,
+            TimeProvider.System, new Recovery.RouterHotFileAssessor(new RouterReviewer(router, options.RouterKey), evidence.CaptureAsync,
+                new RouterClient(router, options.RouterKey)), [http, router, sources]);
     }
 
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
@@ -293,7 +305,7 @@ public static class FactoryRunner
     /// <param name="adjustGate">Acceptance harness only: wraps the production gate stage (e.g. to push after the verdict).</param>
     /// <param name="testSandbox">Tests only: the sandbox in place of the configured one (a fake helper that is the current one for itself).</param>
     internal static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log,
-        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null)
+        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null, Recovery.HotFileRecovery? sharedRecovery = null)
     {
         // Resolve every credential before touching the ledger so a missing one fails fast.
         var routerKey = options.RouterKey;
@@ -364,6 +376,8 @@ public static class FactoryRunner
             gate = adjustGate(gate);
         }
         var controls = Controls(options);
+        await using var ownedRecovery = sharedRecovery is null ? CreateRecovery(options) : null;
+        var recovery = sharedRecovery ?? ownedRecovery!;
         var pipeline = new RunPipeline(
             source,
             ledger,
@@ -384,7 +398,8 @@ public static class FactoryRunner
             // Before every dispatch (sc-25387): a frozen factory defers the run.
             // Failed checks are counted per process (FreezeCheckFailures.Process), across runs and the intake loop's polls.
             freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub, options.ConfiguredRepos,
-                FreezeCheckFailures.Process),
+                FreezeCheckFailures.Process, recovery),
+            recovery: recovery, backgroundRecovery: sharedRecovery is not null,
             // A looping worker is interrupted at its next tool boundary and its round fails (sc-25388).
             stuck: stuck,
             maxControlReadFailures: maxControlReadFailures,
@@ -838,7 +853,7 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots
 }
 
 /// <summary>The intake loop's runner: the production pipeline over the Postgres ledger, for one work source's items.</summary>
-public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source, TextWriter log) : IItemRunner
+public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source, TextWriter log, Func<Recovery.HotFileRecovery?>? recovery = null) : IItemRunner
 {
     public async Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct)
     {
@@ -859,7 +874,7 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
         return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, FactoryRunner.Controls(options));
     }
 
-    public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);
+    public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct, null, sharedRecovery: recovery?.Invoke());
 
     public async Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct)
     {
