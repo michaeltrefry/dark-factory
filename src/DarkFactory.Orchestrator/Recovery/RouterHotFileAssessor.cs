@@ -2,11 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
-using DarkFactory.Orchestrator.GitHub;
-using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Router;
-using DarkFactory.Orchestrator.WorkSources;
-using Microsoft.EntityFrameworkCore;
 
 namespace DarkFactory.Orchestrator.Recovery;
 
@@ -18,14 +14,25 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromMinutes(10));
-        var material = await CaptureAsync(snapshot, deadline.Token);
+        var material = await CaptureAsync(snapshot, ct);
         var request = JsonSerializer.Serialize(new { version = 1, snapshot.Id, snapshot.Generation, snapshot.Repo, snapshot.EvidenceHash,
             materialHash = Hash(material), material });
         var (answer, servedClass) = await reviewer.AssessAsync(session, ReviewPrompts.For("hot-file-assessment").Text, request, deadline.Token);
         var parsed = Parse(answer, servedClass);
         // A safe answer about yesterday's tip/specs/pending heads cannot release today's repository.
-        if (parsed.Decision == "safe" && await CaptureAsync(snapshot, deadline.Token) != material)
-            parsed = parsed with { Decision = "inconclusive" };
+        if (parsed.Decision is "safe" or "unsafe")
+        {
+            try
+            {
+                if (await CaptureAsync(snapshot, ct) != material)
+                    parsed = parsed with { Decision = "inconclusive" };
+            }
+            catch (Exception) when (!ct.IsCancellationRequested)
+            {
+                // Missing context on readback is not evidence that the original capture is still current.
+                parsed = parsed with { Decision = "inconclusive" };
+            }
+        }
         SessionCost? cost = null;
         if (costs is not null)
         {
@@ -37,9 +44,8 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
 
     private async Task<string> CaptureAsync(HotFileSnapshot snapshot, CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(TimeSpan.FromMinutes(5));
-        var material = await evidence(snapshot, deadline.Token);
+        // Evidence acquisition owns its deadline and durable incomplete record; only shutdown cancels it here.
+        var material = await evidence(snapshot, ct);
         if (Encoding.UTF8.GetByteCount(material) > 2 * 1024 * 1024) throw new InvalidOperationException("Required recovery evidence exceeds 2 MiB; not assessed.");
         return material;
     }
@@ -61,75 +67,5 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         if (decision is not ("safe" or "unsafe" or "inconclusive")) throw new InvalidOperationException("Unsupported recovery decision.");
         return new(root.GetProperty("snapshot").GetString()!, root.GetProperty("generation").GetInt32(), root.GetProperty("repo").GetString()!,
             servedClass, decision, root.GetProperty("evidenceHash").GetString()!);
-    }
-}
-
-/// <summary>Acquire the concrete safe-path context using only owner-side reads. Missing material throws, never a partial safe prompt.</summary>
-public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts, IGateGitHub github,
-    Func<ItemNaming, IWorkSource> sources)
-{
-    public async Task<string> CaptureAsync(HotFileSnapshot snapshot, CancellationToken ct)
-    {
-        await using var db = await contexts.CreateDbContextAsync(ct);
-        var repo = RepoRef.Parse(snapshot.Repo);
-        var merged = new List<object>();
-        var tips = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var merge in snapshot.Merges)
-        {
-            var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.Id == merge.Item, ct);
-            var rows = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id && e.Id <= merge.Row).OrderBy(e => e.Id).ToListAsync(ct);
-            var link = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
-            var number = PullNumber(link, repo);
-            var pull = await github.GetPullAsync(repo, number, ct);
-            if (!pull.Merged || pull.BaseRef != merge.Base || pull.MergeCommitSha != merge.Commit)
-                throw new InvalidOperationException("Merged PR evidence does not match its ledger merge.");
-            var spec = await SpecAsync(item, ct);
-            if (!rows.Any(r => r.Step == RunPipeline.Steps.GatePassed && r.Detail == pull.HeadSha)
-                || !rows.Any(r => r.Step == RunPipeline.Steps.Verdict)) throw new InvalidOperationException("Required executed gate/verdict evidence is missing.");
-            var diff = await github.GetDiffAsync(repo, pull.BaseSha, pull.HeadSha, ct);
-            if (pull.ChangedFiles != DiffPaths.Parse(diff).Files) throw new InvalidOperationException("Required merged diff is incomplete.");
-            merged.Add(new { merge, spec, pull, diff, rows = rows.Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }) });
-            if (!tips.ContainsKey(merge.Base)) tips[merge.Base] = (await github.CompareAsync(repo, merge.Base, merge.Commit, ct)).BaseSha;
-        }
-        var pendingItems = (await db.WorkItems.AsNoTracking().Where(i => i.State != WorkState.Done && i.State != WorkState.Cancelled && i.State != WorkState.Watch)
-            .OrderBy(i => i.Id).ToListAsync(ct)).Where(i => RepoRef.Parse(i.Repo).Is(repo)).ToList();
-        if (pendingItems.Count > 100) throw new InvalidOperationException("Required pending-work evidence exceeds 100 items.");
-        var pending = new List<object>();
-        foreach (var item in pendingItems)
-        {
-            var rows = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);
-            var link = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
-            PullFacts? pull = null;
-            if (link is not null)
-            {
-                var number = PullNumber(link, repo);
-                pull = await github.GetPullAsync(repo, number, ct);
-                if (pull.Number != number || string.IsNullOrWhiteSpace(pull.HeadSha))
-                    throw new InvalidOperationException("Required pending PR head evidence is inconsistent.");
-            }
-            else if (item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge)
-                throw new InvalidOperationException("Required pending PR link is missing.");
-            pending.Add(new { item.Id, item.ExternalId, item.State, item.PlanItemId, item.EpicId, pull, spec = await SpecAsync(item, ct),
-                rows = rows.Select(r => new { r.Id, r.State, r.Step, r.Detail }) });
-        }
-        return JsonSerializer.Serialize(new { tips, merged, pending });
-    }
-
-    private static int PullNumber(string? link, RepoRef repo)
-    {
-        var url = link?.Split(' ', '\n').FirstOrDefault(p => p.StartsWith("https://", StringComparison.Ordinal));
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Host != "github.com")
-            throw new InvalidOperationException("Required PR link is missing.");
-        var parts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length != 4 || !RepoRef.Parse(parts[0] + "/" + parts[1]).Is(repo) || parts[2] != "pull"
-            || !int.TryParse(parts[3], out var number) || number <= 0)
-            throw new InvalidOperationException("PR link does not name the incident repository.");
-        return number;
-    }
-
-    private async Task<WorkSpec> SpecAsync(WorkItem item, CancellationToken ct)
-    {
-        var reference = ItemNaming.ParseAny(item.ExternalId) ?? throw new InvalidOperationException("Unknown evidence work source.");
-        return await sources(reference.Naming).ReadSpecAsync(reference.Id, ct);
     }
 }

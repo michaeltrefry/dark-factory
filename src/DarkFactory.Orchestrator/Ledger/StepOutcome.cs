@@ -110,6 +110,7 @@ public static class StepOutcomes
 
     private static StepOutcome OfCheckpoint(string step, string? detail) => step switch
     {
+        Recovery.RecoverySnapshot.Step => Recovery.RecoverySnapshot.FromDetail(detail) is { Complete: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.Verdict => ReviewVerdict.FromDetail(detail) is { Passed: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.FixProgress => FixProgress.FromDetail(detail) is { MadeProgress: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.GateDecision => detail?.StartsWith($"{GateOutcome.Merge} ", StringComparison.Ordinal) == true
