@@ -205,17 +205,23 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
         foreach (var repo in repos)
         {
             if (await HeldAsync(repo, ct) is null) continue;
-            lock (_tasksGate)
+            Schedule(repo, log, ct);
+        }
+    }
+
+    internal void Schedule(string repo, TextWriter log, CancellationToken ct)
+    {
+        repo = Key(repo);
+        lock (_tasksGate)
+        {
+            if (_tasks.TryGetValue(repo, out var task) && !task.IsCompleted) return;
+            _tasks[repo] = Task.Run(async () =>
             {
-                if (_tasks.TryGetValue(repo, out var task) && !task.IsCompleted) continue;
-                _tasks[repo] = Task.Run(async () =>
-                {
-                    using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct, _shutdown.Token);
-                    try { await AdvanceAsync(repo, stop.Token); }
-                    catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
-                    catch (Exception ex) { log.WriteLine($"[recovery] {repo}: {ex.GetType().Name}: {ex.Message}"); }
-                }, CancellationToken.None);
-            }
+                using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct, _shutdown.Token);
+                try { await AdvanceAsync(repo, stop.Token); }
+                catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+                catch (Exception ex) { log.WriteLine($"[recovery] {repo}: {ex.GetType().Name}: {ex.Message}"); }
+            }, CancellationToken.None);
         }
     }
 }

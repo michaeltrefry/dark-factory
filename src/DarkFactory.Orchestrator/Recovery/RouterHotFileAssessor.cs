@@ -79,12 +79,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
             var item = await db.WorkItems.AsNoTracking().SingleAsync(i => i.Id == merge.Item, ct);
             var rows = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id && e.Id <= merge.Row).OrderBy(e => e.Id).ToListAsync(ct);
             var link = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
-            // Read the URL from the pipeline's recorded link; do not adopt a PR number from model text.
-            var url = link?.Split(' ', '\n').FirstOrDefault(p => p.StartsWith("https://", StringComparison.Ordinal));
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Host != "github.com") throw new InvalidOperationException("Required merged PR link is missing.");
-            var parts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != 4 || !RepoRef.Parse(parts[0] + "/" + parts[1]).Is(repo) || parts[2] != "pull" || !int.TryParse(parts[3], out var number))
-                throw new InvalidOperationException("Merged PR link does not name the incident repository.");
+            var number = PullNumber(link, repo);
             var pull = await github.GetPullAsync(repo, number, ct);
             if (!pull.Merged || pull.BaseRef != merge.Base || pull.MergeCommitSha != merge.Commit)
                 throw new InvalidOperationException("Merged PR evidence does not match its ledger merge.");
@@ -103,10 +98,33 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         foreach (var item in pendingItems)
         {
             var rows = await db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id).OrderBy(e => e.Id).ToListAsync(ct);
-            pending.Add(new { item.Id, item.ExternalId, item.State, item.PlanItemId, item.EpicId, spec = await SpecAsync(item, ct),
+            var link = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
+            PullFacts? pull = null;
+            if (link is not null)
+            {
+                var number = PullNumber(link, repo);
+                pull = await github.GetPullAsync(repo, number, ct);
+                if (pull.Number != number || string.IsNullOrWhiteSpace(pull.HeadSha))
+                    throw new InvalidOperationException("Required pending PR head evidence is inconsistent.");
+            }
+            else if (item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge)
+                throw new InvalidOperationException("Required pending PR link is missing.");
+            pending.Add(new { item.Id, item.ExternalId, item.State, item.PlanItemId, item.EpicId, pull, spec = await SpecAsync(item, ct),
                 rows = rows.Select(r => new { r.Id, r.State, r.Step, r.Detail }) });
         }
         return JsonSerializer.Serialize(new { tips, merged, pending });
+    }
+
+    private static int PullNumber(string? link, RepoRef repo)
+    {
+        var url = link?.Split(' ', '\n').FirstOrDefault(p => p.StartsWith("https://", StringComparison.Ordinal));
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Host != "github.com")
+            throw new InvalidOperationException("Required PR link is missing.");
+        var parts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 4 || !RepoRef.Parse(parts[0] + "/" + parts[1]).Is(repo) || parts[2] != "pull"
+            || !int.TryParse(parts[3], out var number) || number <= 0)
+            throw new InvalidOperationException("PR link does not name the incident repository.");
+        return number;
     }
 
     private async Task<WorkSpec> SpecAsync(WorkItem item, CancellationToken ct)

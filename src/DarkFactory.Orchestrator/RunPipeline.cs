@@ -89,7 +89,7 @@ public sealed partial class RunPipeline(
     IReadOnlyList<RepoRef>? configuredRepos = null,
     Worker.WorkerSlots? slots = null,
     Func<CancellationToken, Task>? enterSandbox = null,
-    Recovery.HotFileRecovery? recovery = null)
+    Recovery.HotFileRecovery? recovery = null, bool backgroundRecovery = false)
 {
     /// <summary>
     /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
@@ -998,9 +998,10 @@ public sealed partial class RunPipeline(
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
         if (recovery is not null)
         {
-            await recovery.AdvanceAsync(primary.FullName, ct);
+            if (!backgroundRecovery) await recovery.AdvanceAsync(primary.FullName, ct);
             if (await recovery.HeldAsync(primary.FullName, ct) is { } incident)
             {
+                if (backgroundRecovery) recovery.Schedule(primary.FullName, log, ct);
                 var why = $"repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}";
                 log.WriteLine($"[recovery] {why}");
                 // This is NOT a factory-wide Deferred: unrelated items of this same intake lane must still run.

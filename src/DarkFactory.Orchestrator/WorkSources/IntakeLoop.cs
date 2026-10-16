@@ -1004,7 +1004,7 @@ public static class IntakeServiceCollectionExtensions
             // sc-25989). A watched source without its credential
             // fails the host's start here.
             var status = sp.GetRequiredService<IntakeStatus>();
-            var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out), status, Console.Out);
+            var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out, () => sp.GetRequiredService<Controls.FactoryFreeze>().Recovery), status, Console.Out);
             // One evaluator for the loop's life, so its main-red reads are reused within FactoryFreeze.MainRedCacheTtl; built on the
             // first poll, so a missing credential fails that poll (counted as frozen) rather than the host's start.
             Controls.FactoryFreeze? evaluator = null;

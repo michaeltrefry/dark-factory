@@ -55,14 +55,14 @@ public class HotFileRecoveryTests
                 RecordedAt = Time.GetUtcNow(), Outcome = StepOutcome.Passed });
             await db.SaveChangesAsync();
         }
-        public async Task<RunOutcome> Run(string repo, int? number = null)
+        public async Task<RunOutcome> Run(string repo, int? number = null, HotFileRecovery? recovery = null, bool background = false)
         {
             await using var db = Contexts.CreateDbContext();
             var id = number ?? (repo == Repo ? 77 : 78);
             var story = new WorkStory(id, "next item", $"Repo: {repo}\nDo the work", "feature", "", ItemNaming.Shortcut);
             var pipeline = new RunPipeline(new FakeWorkSource(story), new WorkLedger(db, Time), Locks,
                 new FakeWorkspaces(), new FakeWorker(RunPipelineTests.Reports(RunPipelineTests.Ok)), new FakePullRequests(),
-                RepoRef.Parse(repo), TextWriter.Null, recovery: Recovery, controls: new LedgerControls(Contexts, Time),
+                RepoRef.Parse(repo), TextWriter.Null, recovery: recovery ?? Recovery, backgroundRecovery: background, controls: new LedgerControls(Contexts, Time),
                 gate: new GateStage(new GatePipelineTests.FakeGateGitHub { Diff = _ => TestPolicies.Diff("docs/next.md") },
                     new GatePipelineTests.FakeReviewer(), TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)));
             return await pipeline.RunAsync(id, CancellationToken.None);
@@ -270,6 +270,84 @@ public class HotFileRecoveryTests
         Assert.Null(held.Deferred); // not a global intake deferral
         Assert.Equal(WorkState.Watch, (await f.Run("owner/beta")).State);
         f.Assessor.Wait.SetResult();
+    }
+
+    private sealed class AdmissionRunner(Fixture fixture, HotFileRecovery recovery) : IItemRunner
+    {
+        public readonly List<RunOutcome> Outcomes = [];
+        public Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<int>>([]);
+        public async Task<RunOutcome> RunAsync(int id, CancellationToken ct)
+        {
+            var result = await fixture.Run(id == 77 ? Repo : "owner/beta", id, recovery, background: true);
+            Outcomes.Add(result);
+            return result;
+        }
+    }
+
+    [Fact]
+    public async Task Intake_admission_schedules_the_first_assessment_without_holding_the_only_run_slot()
+    {
+        var f = new Fixture();
+        for (var i = 0; i < 8; i++) await f.Merge();
+        f.Assessor.Wait = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var recovery = f.Recovery;
+        var runner = new AdmissionRunner(f, recovery);
+        using var loop = new IntakeLoop([new(IntakeDispatchTests.ListingSource.Listing(77, 78), runner)],
+            new IntakeOptions(TimeSpan.FromMinutes(1), MaxConcurrentRuns: 1), f.Time,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<IntakeLoop>.Instance);
+        try
+        {
+            // No poll scheduler has run: alpha's admission must discover and schedule the incident itself.
+            await loop.PollOnceAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            while (Volatile.Read(ref f.Assessor.Calls) == 0) await Task.Delay(1, timeout.Token);
+            Assert.Equal((2, WorkState.Intake, false, WorkState.Watch, 1, false),
+                (runner.Outcomes.Count, runner.Outcomes[0].State, runner.Outcomes[0].Deferred is not null,
+                 runner.Outcomes[1].State, f.Assessor.Calls, f.Assessor.Wait.Task.IsCompleted));
+        }
+        finally { f.Assessor.Wait.TrySetResult(); }
+    }
+
+    [Theory]
+    [InlineData("stable", "safe")]
+    [InlineData("moved", "inconclusive")]
+    [InlineData("missing-link", "incomplete")]
+    [InlineData("wrong-repo", "incomplete")]
+    [InlineData("missing-head", "incomplete")]
+    public async Task Pending_PR_heads_are_required_and_a_push_without_ledger_changes_invalidates_safe(string scenario, string expected)
+    {
+        var f = new Fixture();
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var ledger = new WorkLedger(db, f.Time);
+            var item = await ledger.GetOrCreateAsync("shortcut", "sc-77", "pending", Repo, "pending", CancellationToken.None);
+            item.State = WorkState.Review;
+            await db.SaveChangesAsync();
+            if (scenario != "missing-link")
+                await ledger.CheckpointAsync(item, RunPipeline.Steps.Linked, null,
+                    $"https://github.com/{(scenario == "wrong-repo" ? "owner/beta" : Repo)}/pull/1", CancellationToken.None);
+        }
+        var github = new GatePipelineTests.FakeGateGitHub
+        {
+            Head = scenario == "missing-head" ? "" : new string('a', 40)
+        };
+        var evidence = new HotFileEvidence(f.Contexts, github, _ => new FakeWorkSource(
+            new WorkStory(77, "pending", $"Repo: {Repo}", "feature", "", ItemNaming.Shortcut)));
+        var snapshot = new HotFileSnapshot("snapshot", Repo, 1, [], "evidence");
+        var response = System.Text.Json.JsonSerializer.Serialize(new { version = 1, snapshot = "snapshot", generation = 1,
+            repo = Repo, decision = "safe", evidenceHash = "evidence" });
+        var api = new FakeApi().On("POST /v1/messages", _ =>
+        {
+            // Only GitHub changes, not the ledger or the board specification.
+            if (scenario == "moved") github.Head = new string('b', 40);
+            return SseAnswers.Response(SseAnswers.Answer(response));
+        });
+        using var http = api.Client("http://router.test/");
+        var assessor = new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "test-key"), evidence.CaptureAsync);
+        string actual;
+        try { actual = (await assessor.AssessAsync(snapshot, Guid.NewGuid().ToString(), CancellationToken.None)).Decision; }
+        catch (InvalidOperationException) { actual = "incomplete"; }
+        Assert.Equal(expected, actual);
     }
 
     [Fact]

@@ -221,6 +221,8 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
         if (recovery is not null) await recovery.DisposeAsync();
     }
 
+    internal Recovery.HotFileRecovery? Recovery => recovery;
+
     private sealed record Hit(string Trigger, string Detail);
 
     /// <summary>A check that could not run: which (<c>ledger</c>, <c>main-red owner/name@base</c>) and why.</summary>
