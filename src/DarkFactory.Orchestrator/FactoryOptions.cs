@@ -499,9 +499,32 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
-        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
+        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl, IssueClassificationMode, IssueClassificationModel);
         // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
         WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
+    }
+
+    /// <summary>Optional report classification. Advisory is not supported until its separately reviewed story lands.</summary>
+    public string IssueClassificationMode
+    {
+        get
+        {
+            var mode = config["Issues:Classification:Mode"] ?? "disabled";
+            return mode is "disabled" or "shadow" ? mode
+                : throw new InvalidOperationException("Issues:Classification:Mode must be disabled or shadow; advisory is not yet supported.");
+        }
+    }
+
+    /// <summary>The explicit SystemOne catalog id; no default model or fallback is selected by the factory.</summary>
+    public string? IssueClassificationModel
+    {
+        get
+        {
+            var model = config["Issues:Classification:Model"];
+            if (IssueClassificationMode == "disabled") { return model; }
+            return !string.IsNullOrWhiteSpace(model) && model.Length <= 128 && !model.Any(char.IsWhiteSpace) ? model
+                : throw new InvalidOperationException("Issues:Classification:Model must name an explicit SystemOne catalog model in shadow mode.");
+        }
     }
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)

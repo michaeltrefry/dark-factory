@@ -88,7 +88,8 @@ public sealed class IssueIntake(
     IntakeStatus status,
     int maxFailures,
     TimeProvider time,
-    TextWriter log)
+    TextWriter log,
+    IssueClassifier? classifier = null)
 {
     public static readonly ItemNaming Naming = ItemNaming.GitHubIssue;
 
@@ -247,6 +248,13 @@ public sealed class IssueIntake(
         var record = Latest(history);
         if (record is null || record.Version != version)
         {
+            if (classifier is not null)
+            {
+                var classification = await classifier.ClassifyAsync(item.Id, version, issue.Title, issue.Body, ct);
+                await using var classificationDb = await contexts.CreateDbContextAsync(ct);
+                classificationDb.IssueClassifications.Add(classification);
+                await classificationDb.SaveChangesAsync(ct);
+            }
             var (triaged, usagePaused) = await TriageAsync(ledger, item, repo, issue, version, ct);
             if (triaged is null)
             {

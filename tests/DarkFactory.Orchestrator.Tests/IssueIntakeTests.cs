@@ -60,6 +60,7 @@ public class IssueIntakeTests
         public FakeTimeProvider Time { get; } = new(new DateTimeOffset(2026, 10, 8, 12, 0, 0, TimeSpan.Zero));
         public FakeGitHubIssues GitHub { get; }
         public FakeTriage Triage { get; } = new();
+        public IssueClassifier? Classifier { get; set; }
         public InProcessRunLocks Locks { get; } = new();
         public IntakeStatus Status => _status ??= new IntakeStatus(Time);
         private IntakeStatus? _status;
@@ -69,7 +70,7 @@ public class IssueIntakeTests
 
         /// <summary>A fresh intake each time, as after a restart: everything it knows comes from the ledger.</summary>
         public IssueIntake Intake() =>
-            new(Source(), Watched, Contexts, Locks, Controls, Triage, Status, 3, Time, TextWriter.Null);
+            new(Source(), Watched, Contexts, Locks, Controls, Triage, Status, 3, Time, TextWriter.Null, Classifier);
 
         public GitHubIssueWorkSource Source() => new(GitHub, Contexts, Watched, Time);
 
