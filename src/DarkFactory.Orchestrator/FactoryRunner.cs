@@ -281,9 +281,11 @@ public static class FactoryRunner
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
+        using var classifierHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
+        var classifier = Issues.IssueClassifier.Create(options, classifierHttp, () => options.RouterKey);
         var intake = new Issues.IssueIntake(WorkSourceRegistry.Issues(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
-            options.MaxItemFailures, TimeProvider.System, log);
+            options.MaxItemFailures, TimeProvider.System, log, classifier);
         await intake.PollAsync(ct);
     }
 
