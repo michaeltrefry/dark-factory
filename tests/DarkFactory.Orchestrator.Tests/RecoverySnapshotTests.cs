@@ -11,9 +11,10 @@ namespace DarkFactory.Orchestrator.Tests;
 public sealed class RecoverySnapshotTests
 {
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Paged_CI_is_fetched_whole_or_a_missing_page_refuses_capture(bool missingPage)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task Paged_CI_is_fetched_whole_or_a_missing_page_refuses_capture(bool missingPage, bool missingTotal)
     {
         var api = new FakeApi()
             .On("GET /repos/owner/alpha/installation", System.Net.HttpStatusCode.OK, "{\"id\":555}")
@@ -29,14 +30,14 @@ public sealed class RecoverySnapshotTests
             {
                 var second = request.PathAndQuery.Contains("page=2", StringComparison.Ordinal);
                 return FakeApi.Json(second && missingPage ? System.Net.HttpStatusCode.ServiceUnavailable : System.Net.HttpStatusCode.OK,
-                    second && missingPage ? "{}" : $"{{\"total_count\":2,\"{field}\":[{(second ? entry.Replace("first", "second").Replace("\"id\":1", "\"id\":2") : entry)}]}}");
+                    missingTotal ? $"{{\"{field}\":[]}}" : second && missingPage ? "{}" : $"{{\"total_count\":2,\"{field}\":[{(second ? entry.Replace("first", "second").Replace("\"id\":1", "\"id\":2") : entry)}]}}");
             });
         }
         using var key = System.Security.Cryptography.RSA.Create(2048);
         using var http = api.Client("https://api.github.com/");
         var gate = new DarkFactory.Orchestrator.GitHub.GitHubGate(http,
             new DarkFactory.Orchestrator.GitHub.GitHubApp(http, "4242", key.ExportRSAPrivateKeyPem(), TimeProvider.System));
-        if (missingPage) await Assert.ThrowsAsync<InvalidOperationException>(
+        if (missingPage || missingTotal) await Assert.ThrowsAsync<InvalidOperationException>(
             () => gate.GetRecoveryCiAsync(RepoRef.Parse(Repo), "head", CancellationToken.None));
         else
         {

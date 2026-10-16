@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Gate;
@@ -262,7 +263,10 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
                 using var request = GitHubApp.Request(HttpMethod.Get, prefix + endpoint + $"?per_page={PageSize}&page={page}", "Bearer", token);
                 using var response = await http.SendAsync(request, ct);
                 await GitHubApp.EnsureSuccess(response, $"read recovery {endpoint} page {page} of {sha}", ct);
-                var body = await response.Content.ReadFromJsonAsync<TPage>(ct) ?? throw new InvalidOperationException("Missing recovery CI page.");
+                using var pageJson = await System.Text.Json.JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                if (!pageJson.RootElement.TryGetProperty("total_count", out var countField) || !countField.TryGetInt32(out _))
+                    throw new InvalidOperationException("Recovery CI page has no total_count; completeness is unknown.");
+                var body = pageJson.RootElement.Deserialize<TPage>() ?? throw new InvalidOperationException("Missing recovery CI page.");
                 var result = unpack(body);
                 if (result.Total < 0 || total is { } count && count != result.Total || result.Items is null)
                     throw new InvalidOperationException("Recovery CI page totals changed or are missing.");
