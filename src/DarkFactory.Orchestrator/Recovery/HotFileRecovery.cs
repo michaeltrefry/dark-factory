@@ -40,9 +40,25 @@ public sealed record HotFileSnapshot(string Id, string Repo, int Generation, IRe
 public sealed record HotFileAssessment(string Snapshot, int Generation, string Repo, string? ServedClass, string Decision,
     string EvidenceHash)
 {
+    public const string Step = "recovery-assessment";
+    public static HotFileAssessment? FromDetail(string? detail)
+    {
+        try { return detail is null ? null : JsonSerializer.Deserialize<HotFileAssessment>(detail); }
+        catch (JsonException) { return null; }
+    }
     public string? Material { get; init; }
     public string? MaterialHash { get; init; }
     public decimal? CostUsd { get; init; }
+    public string? Session { get; init; }
+    public string? Prompt { get; init; }
+    public string? MaterialSnapshot { get; init; }
+    public string? Problem { get; init; }
+    public IReadOnlyList<string> Citations { get; init; } = [];
+    public IReadOnlyList<RecoveryFinding> Findings { get; init; } = [];
+    public IReadOnlyList<RecoveryFinding> CorrectionFindings { get; init; } = [];
+    public IReadOnlyList<PendingRecoveryDisposition> PendingDispositions { get; init; } = [];
+    public IReadOnlyList<ToolCall> Tools { get; init; } = [];
+    public IReadOnlyList<ServedTurn> Turns { get; init; } = [];
 }
 
 public interface IHotFileAssessor
@@ -167,6 +183,14 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
                 if (snapshot.Merges.Count > 50) throw new InvalidOperationException("Required evidence exceeds 50 contributing merges.");
                 var answer = await assessor.AssessAsync(snapshot, incident.Session, ct);
                 incident.Answer = JsonSerializer.Serialize(answer);
+                // Keep each session's result even when a subsequent attempt overwrites the incident's latest answer.
+                var anchorId = snapshot.Merges.FirstOrDefault()?.Item;
+                var anchor = anchorId is { } id ? await db.WorkItems.SingleAsync(i => i.Id == id, ct)
+                    : await db.WorkItems.OrderBy(i => i.Id).FirstOrDefaultAsync(i => i.Repo.ToLower() == repo, ct);
+                if (anchor is not null)
+                    db.LedgerEntries.Add(new LedgerEntry { WorkItemId = anchor.Id, State = anchor.State,
+                        Step = HotFileAssessment.Step, Detail = incident.Answer, RecordedAt = time.GetUtcNow(),
+                        Outcome = StepOutcomes.Of(anchor.State, anchor.State, HotFileAssessment.Step, incident.Answer) });
                 var current = await EvidenceAsync(db, repo, ct);
                 // Any new merge touching a reviewed file invalidates the assessment, including overlapping evidence.
                 var paths = snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Base, File: f))).ToHashSet();

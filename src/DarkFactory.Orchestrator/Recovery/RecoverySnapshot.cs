@@ -289,7 +289,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
             });
         }
         async Task<List<LedgerEntry>> Rows(long item, long? through = null) => await db.LedgerEntries.AsNoTracking()
-            .Where(e => e.WorkItemId == item && e.Step != RecoverySnapshot.Step && (through == null || e.Id <= through))
+            .Where(e => e.WorkItemId == item && e.Step != RecoverySnapshot.Step && e.Step != HotFileAssessment.Step && (through == null || e.Id <= through))
             .OrderBy(e => e.Id).ToListAsync(token);
     }
 

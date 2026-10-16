@@ -381,15 +381,17 @@ public sealed class RecoverySnapshotTests
         var f = new Fixture(); await f.Seed();
         using var shutdown = new CancellationTokenSource();
         var captures = 0;
-        var response = JsonSerializer.Serialize(new { version = 1, snapshot = "trigger", generation = 1, repo = Repo,
-            decision = "safe", evidenceHash = "merge-hash" });
+        var captured = await f.Evidence.SnapshotAsync(f.Trigger, shutdown.Token);
+        var response = JsonSerializer.Serialize(new { version = 1, snapshot = f.Trigger.Id, generation = f.Trigger.Generation, repo = Repo,
+            decision = "safe", evidenceHash = f.Trigger.EvidenceHash, materialSnapshot = captured.Id,
+            citations = new[] { captured.Evidence[0].Id }, findings = Array.Empty<object>() });
         using var http = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(response)))
             .Client("http://router.test/");
         var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test-key"), (_, token) =>
         {
             Assert.Equal(shutdown.Token, token);
             captures++;
-            return Task.FromResult("complete pinned material");
+            return Task.FromResult(JsonSerializer.Serialize(captured));
         });
         var answer = await assessor.AssessAsync(f.Trigger, "single-deadline", shutdown.Token);
         Assert.Equal("safe", answer.Decision);

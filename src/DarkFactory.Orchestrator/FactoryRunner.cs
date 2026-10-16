@@ -278,9 +278,11 @@ public static class FactoryRunner
         var sources = new WorkSourceRegistry(options);
         var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
         var evidence = new Recovery.HotFileEvidence(Contexts(options), new GitHubGate(http, app), naming => sources.Of(naming));
+        IReviewFiles files = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
+            async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c, GitHubGate.ReadPermissions)).Token);
         return new Recovery.HotFileRecovery(Contexts(options), new PostgresRunLocks(options.LedgerConnectionString), options.Freeze,
             TimeProvider.System, new Recovery.RouterHotFileAssessor(new RouterReviewer(router, options.RouterKey), evidence.CaptureAsync,
-                new RouterClient(router, options.RouterKey)), [http, router, sources]);
+                new RouterClient(router, options.RouterKey), files), [http, router, sources]);
     }
 
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
