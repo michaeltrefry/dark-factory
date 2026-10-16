@@ -527,10 +527,14 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         }
     }
 
-    /// <summary>Total classifier HTTP deadline, including the response body; no retries (default 5 seconds).</summary>
+    /// <summary>
+    /// Total classifier HTTP deadline, including the response body; no retries (default 5 seconds). The bound is the largest
+    /// duration <see cref="System.Threading.CancellationTokenSource.CancelAfter(TimeSpan)"/> accepts — 4,294,967,294 ms, one
+    /// below <c>uint.MaxValue</c> — so an accepted setting can never throw out of the classifier as an item failure.
+    /// </summary>
     public TimeSpan IssueClassificationTimeout =>
         config.GetValue("Issues:Classification:TimeoutSeconds", 5d) is var seconds
-            && double.IsFinite(seconds) && seconds > 0 && seconds <= uint.MaxValue / 1000d
+            && double.IsFinite(seconds) && seconds > 0 && seconds <= (uint.MaxValue - 1) / 1000d
             ? TimeSpan.FromSeconds(seconds)
             : throw new InvalidOperationException("Issues:Classification:TimeoutSeconds must be finite, more than 0, and fit the request timer.");
 

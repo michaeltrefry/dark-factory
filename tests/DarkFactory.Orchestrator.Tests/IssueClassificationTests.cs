@@ -370,6 +370,37 @@ public class IssueClassificationTests
         }
     }
 
+    [Fact]
+    public void Timeout_boundary_is_the_largest_value_the_request_timer_actually_accepts()
+    {
+        // The largest whole millisecond CancelAfter accepts is uint.MaxValue - 1; one more throws ArgumentOutOfRangeException,
+        // which would escape ClassifyAsync as an item failure instead of the observable "unavailable" classification.
+        const string largest = "4294967.294"; // (uint.MaxValue - 1) / 1000
+        const string oneOver = "4294967.295"; // uint.MaxValue / 1000 — the old, wrong bound
+        var accepted = Options(("Issues:Classification:TimeoutSeconds", largest));
+        accepted.ValidateSettings();
+        Assert.Equal(TimeSpan.FromMilliseconds(uint.MaxValue - 1), accepted.IssueClassificationTimeout);
+        using (var cts = new CancellationTokenSource()) { cts.CancelAfter(accepted.IssueClassificationTimeout); } // must not throw
+
+        Assert.Contains("Issues:Classification:TimeoutSeconds",
+            Assert.Throws<InvalidOperationException>(() => Options(("Issues:Classification:TimeoutSeconds", oneOver)).ValidateSettings()).Message);
+        Assert.Contains("Issues:Classification:TimeoutSeconds",
+            Assert.Throws<InvalidOperationException>(() => Options(("Issues:Classification:TimeoutSeconds", "4294967.3")).ValidateSettings()).Message);
+    }
+
+    [Fact]
+    public void Production_classifier_client_leaves_the_http_timeout_to_the_configured_deadline()
+    {
+        // The classifier's linked deadline (Issues:Classification:TimeoutSeconds, default 5s) is the authority. The gateway's
+        // default HttpClient.Timeout is 100s, which would cut a longer configured deadline (e.g. 180s) short in production only,
+        // because tests inject their own clients.
+        var options = Options(("Issues:Classification:Mode", "shadow"), ("Issues:Classification:Model", "catalog-d3"),
+            ("Issues:Classification:TimeoutSeconds", "180"));
+        using var http = FactoryRunner.ClassifierHttp(options);
+        Assert.Equal(Timeout.InfiniteTimeSpan, http.Timeout);
+        Assert.Equal(TimeSpan.FromSeconds(180), options.IssueClassificationTimeout);
+    }
+
     internal static FactoryOptions Options(params (string Key, string Value)[] values) =>
         new(new ConfigurationBuilder().AddInMemoryCollection(values.ToDictionary(v => v.Key, v => (string?)v.Value)).Build(), new InMemorySecrets(), _ => null);
 }
