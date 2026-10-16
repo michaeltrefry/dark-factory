@@ -41,8 +41,10 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     /// <summary>When set, reading a story's spec throws this (the board is unreachable).</summary>
     public Exception? ReadSpecFails { get; set; }
 
+    public Func<int, WorkSpec>? SpecFor { get; set; }
+
     public Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct) =>
-        ReadSpecFails is { } fails ? Task.FromException<WorkSpec>(fails) : Task.FromResult(new WorkSpec(story with { Id = id }, Epic, Documents));
+        ReadSpecFails is { } fails ? Task.FromException<WorkSpec>(fails) : Task.FromResult(SpecFor?.Invoke(id) ?? new WorkSpec(story with { Id = id }, Epic, Documents));
 
     public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct)
     {

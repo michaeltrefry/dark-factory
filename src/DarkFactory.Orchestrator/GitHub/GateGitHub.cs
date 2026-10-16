@@ -31,6 +31,9 @@ public interface IGateGitHub
     /// <summary>Every check run, commit status and check suite of <paramref name="sha"/>.</summary>
     Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct);
 
+    /// <summary>Snapshot acquisition reads every CI page, or reports incomplete; ordinary gate polling is unchanged.</summary>
+    Task<CiFacts> GetRecoveryCiAsync(RepoRef repo, string sha, CancellationToken ct) => GetCiAsync(repo, sha, ct);
+
     /// <summary>
     /// The GitHub Actions workflow files of the repository's default branch (sc-25873: <see cref="CiTriggers"/> reads their
     /// triggers before a plan is spent): every <c>.yml</c>/<c>.yaml</c> file directly in <see cref="CiTriggers.Directory"/>, each with
@@ -236,6 +239,40 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
             && suites.TotalCount <= suites.CheckSuites.Count;
         return new CiFacts(sha, checks, complete,
             suites.CheckSuites.Select(s => new CheckSuiteFact(s.App?.Slug ?? "unknown", s.Status == "completed", s.Conclusion, s.LatestCheckRunsCount)).ToList());
+    }
+
+    public async Task<CiFacts> GetRecoveryCiAsync(RepoRef repo, string sha, CancellationToken ct)
+    {
+        var token = await ReadTokenAsync(repo, ct);
+        var prefix = $"repos/{repo.Owner}/{repo.Name}/commits/{sha}/";
+        var runs = await Pages<CheckRunsDto, CheckRunDto>("check-runs", p => (p.TotalCount, p.CheckRuns));
+        var statuses = await Pages<CombinedStatusDto, StatusDto>("status", p => (p.TotalCount, p.Statuses));
+        var suites = await Pages<CheckSuitesDto, CheckSuiteDto>("check-suites", p => (p.TotalCount, p.CheckSuites));
+        return new CiFacts(sha, runs.Select(r => new CheckFact(r.Name, r.Status == "completed", r.Conclusion, r.Id))
+            .Concat(statuses.Select(s => new CheckFact(s.Context, s.State != "pending", s.State == "error" ? "failure" : s.State))).ToArray(),
+            Suites: suites.Select(s => new CheckSuiteFact(s.App?.Slug ?? "unknown", s.Status == "completed", s.Conclusion, s.LatestCheckRunsCount)).ToArray());
+
+        async Task<List<TItem>> Pages<TPage, TItem>(string endpoint, Func<TPage, (int Total, List<TItem> Items)> unpack)
+        {
+            var all = new List<TItem>();
+            int? total = null;
+            // A bound is an acquisition failure, never a smaller complete list. The snapshot deadline also bounds reads.
+            for (var page = 1; page <= 50; page++)
+            {
+                using var request = GitHubApp.Request(HttpMethod.Get, prefix + endpoint + $"?per_page={PageSize}&page={page}", "Bearer", token);
+                using var response = await http.SendAsync(request, ct);
+                await GitHubApp.EnsureSuccess(response, $"read recovery {endpoint} page {page} of {sha}", ct);
+                var body = await response.Content.ReadFromJsonAsync<TPage>(ct) ?? throw new InvalidOperationException("Missing recovery CI page.");
+                var result = unpack(body);
+                if (result.Total < 0 || total is { } count && count != result.Total || result.Items is null)
+                    throw new InvalidOperationException("Recovery CI page totals changed or are missing.");
+                total = result.Total;
+                all.AddRange(result.Items);
+                if (all.Count == total) return all;
+                if (all.Count > total || result.Items.Count == 0) throw new InvalidOperationException("Recovery CI page is missing or inconsistent.");
+            }
+            throw new InvalidOperationException("Recovery CI exceeds 50 pages.");
+        }
     }
 
     public async Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct)
