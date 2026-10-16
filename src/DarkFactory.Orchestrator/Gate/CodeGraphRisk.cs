@@ -73,8 +73,10 @@ public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha,
 /// factory knows that language was not indexed before C3 (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
 /// <see cref="Missing"/>: when CodeGraph still answered data for one of the two inputs (<see cref="CodeGraphRisk.Judged"/> keeps it), the
 /// input that is missing (<c>blast radius</c> or <c>hotspot</c>); null — both are.
+/// <see cref="ByImpact"/>, <see cref="ByHotspot"/>: which answer said <c>languageIndexed: false</c> — only that tool's own misread of
+/// the file is excused by it (<see cref="CodeGraphRisk.Judged"/>, sc-26134).
 /// </summary>
-public sealed record UnindexedFile(string Path, string? Language, bool Flagged, string? Missing = null)
+public sealed record UnindexedFile(string Path, string? Language, bool Flagged, string? Missing = null, bool ByImpact = false, bool ByHotspot = false)
 {
     /// <summary>How the gate's row names it: the file and its language.</summary>
     public override string ToString() =>
@@ -101,9 +103,11 @@ public sealed record NoCodeGraphData(string Path, string Reason);
 /// another file, one without <c>found</c>, a default-branch answer naming no commit or from an overlay, a hotspot without a usable score
 /// or commit — once the default-branch read of the blast radius (tried when the head's answer is unusable) gave nothing usable either; and
 /// every file of a read made for another head. Not missing data: it blocks <c>risk-threshold</c> (the item escalates), as
-/// <see cref="UnrecognisedBlastRadius"/> does.
+/// <see cref="UnrecognisedBlastRadius"/> does — except a misread of the hotspot (<see cref="Hotspot"/>: <c>file_hotspot</c>'s answer, or a
+/// hotspot the inputs leave out), which blocks only where the policy sets <c>max_hotspot</c>: without a hotspot limit the hotspot is not
+/// judged, and the misread is only recorded in the gate row.
 /// </summary>
-public sealed record CodeGraphMisread(string Path, string Reason);
+public sealed record CodeGraphMisread(string Path, string Reason, bool Hotspot = false);
 
 /// <summary>
 /// Whether CodeGraph indexes a touched file's language (sc-26133, P5 S7; the CodeGraph side is C3, sc-26137). The contract: the
@@ -168,7 +172,7 @@ public static class LanguageCoverage
         {
             var language = (impactIndexed == false ? Name(impactLanguage) : null) ?? (hotspotIndexed == false ? Name(hotspotLanguage) : null)
                 ?? KnownUnindexed(path);
-            return new UnindexedFile(path, language, Flagged: true);
+            return new UnindexedFile(path, language, Flagged: true, ByImpact: impactIndexed == false, ByHotspot: hotspotIndexed == false);
         }
         if (impactIndexed == true || hotspotIndexed == true)
         {
@@ -289,22 +293,20 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
 
     /// <summary>
     /// The blocking reasons of <see cref="Misreads"/>, one per reason — <c>risk threshold: CodeGraph misanswered (&lt;reason&gt;):
-    /// &lt;files&gt;</c> — each reason's files, and the reasons, capped at <see cref="MaxListed"/> with how many more.
+    /// &lt;files&gt;</c> — each reason's files, and the reasons, capped at <see cref="MaxListed"/> with how many more. A hotspot misread
+    /// (<see cref="CodeGraphMisread.Hotspot"/>) blocks only when <paramref name="hotspotJudged"/> (the policy sets <c>max_hotspot</c>).
     /// </summary>
-    public IReadOnlyList<string> MisreadReasons
+    public IReadOnlyList<string> MisreadReasons(bool hotspotJudged)
     {
-        get
+        var groups = Misreads.Where(m => hotspotJudged || !m.Hotspot).GroupBy(m => m.Reason, StringComparer.Ordinal).ToList();
+        var reasons = groups.Take(MaxListed)
+            .Select(g => $"risk threshold: CodeGraph misanswered ({g.Key}): {Listed(g.Select(m => m.Path).ToList(), _ => false, p => p, ", ")}")
+            .ToList();
+        if (groups.Count > MaxListed)
         {
-            var groups = Misreads.GroupBy(m => m.Reason, StringComparer.Ordinal).ToList();
-            var reasons = groups.Take(MaxListed)
-                .Select(g => $"risk threshold: CodeGraph misanswered ({g.Key}): {Listed(g.Select(m => m.Path).ToList(), _ => false, p => p, ", ")}")
-                .ToList();
-            if (groups.Count > MaxListed)
-            {
-                reasons.Add($"risk threshold: CodeGraph misanswered … {groups.Count - MaxListed} more reason(s)");
-            }
-            return reasons;
+            reasons.Add($"risk threshold: CodeGraph misanswered … {groups.Count - MaxListed} more reason(s)");
         }
+        return reasons;
     }
     /// <summary>The blast radii CodeGraph answered that the gate does not recognise (none when <see cref="Unrecognised"/> is null).</summary>
     public IReadOnlyList<UnrecognisedBlastRadius> UnrecognisedRadii => Unrecognised ?? [];
@@ -318,7 +320,7 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
 
     /// <summary>
     /// What the gate judges, for exactly <paramref name="files"/>: the blast radii and hotspots CodeGraph answered, and every other file
-    /// with no CodeGraph data and why — <see cref="NoData"/> and any file the inputs leave out. A file whose language CodeGraph does not
+    /// with no CodeGraph data and why (<see cref="NoData"/>); a file the inputs leave out is a misread (<see cref="LeftOut"/>). A file whose language CodeGraph does not
     /// index keeps whatever data CodeGraph did answer for it (<c>found: true</c>: a critical blast radius from one tool still blocks), and
     /// only the missing part is recorded as no data, its language the reason (<see cref="AllNoData"/>).
     /// </summary>
@@ -337,20 +339,28 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
                 stillUnindexed.Add(u with { Missing = hasBlast ? "hotspot" : hasHot ? "blast radius" : null });
             }
         }
-        // An unindexed file's reason is its language (AllNoData), whatever else its answers said: CodeGraph itself said it indexes no
-        // code of that language, so an unusable answer about the file is that, not a misread.
+        // An unindexed file's reason is its language (AllNoData). A tool's own answer saying CodeGraph indexes no code of that language
+        // explains that tool's unusable answer about the file — never the other tool's, whose misread stands (sc-26134).
         var noData = NoData.Where(n => !unindexed.Contains(n.Path)).ToList();
-        var misread = Misreads.Where(m => !unindexed.Contains(m.Path)).ToList();
-        foreach (var file in files.Where(f => !unindexed.Contains(f) && misread.All(m => m.Path != f)))
+        var misread = Misreads.Where(m => !UnindexedFiles.Any(u => u.Path == m.Path && (m.Hotspot ? u.ByHotspot : u.ByImpact))).ToList();
+        foreach (var file in files.Where(f => !unindexed.Contains(f) && misread.All(m => m.Path != f) && noData.All(n => n.Path != f)))
         {
-            var blastRead = blast.Any(b => b.Path == file) || UnrecognisedRadii.Any(u => u.Path == file);
-            if (noData.All(n => n.Path != file) && (!blastRead || hot.All(h => h.Path != file)))
+            // A touched file the inputs leave out is not missing data — CodeGraph was not asked, or its answer was lost: a misread
+            // (sc-26134), as for a read made for another head.
+            if (!blast.Any(b => b.Path == file) && !UnrecognisedRadii.Any(u => u.Path == file))
             {
-                noData.Add(new NoCodeGraphData(file, "CodeGraph's inputs leave it out"));
+                misread.Add(new CodeGraphMisread(file, LeftOut));
+            }
+            else if (hot.All(h => h.Path != file))
+            {
+                misread.Add(new CodeGraphMisread(file, LeftOut, Hotspot: true));
             }
         }
         return this with { BlastRadius = blast, Hotspots = hot, NoData = noData, Unindexed = stillUnindexed, Misread = misread };
     }
+
+    /// <summary>Why a touched file the inputs leave out is a misread (<see cref="Judged"/>).</summary>
+    public const string LeftOut = "CodeGraph's inputs leave it out";
 
     /// <summary>
     /// How many files <see cref="Describe"/> lists beyond those over a limit and the worst and hottest (and how many files with no data
@@ -394,7 +404,8 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
             + string.Concat(onDefault)
             + (UnrecognisedRadii.Count == 0 ? "" : $"; unrecognised blast radius: {string.Join(", ", UnrecognisedRadii.Select(u => $"{Inert(u.Path)} {u.Shown}"))}")
             + (Misreads.Count == 0 ? "" : "; CodeGraph misanswered: " + Listed(Misreads.GroupBy(m => m.Reason, StringComparer.Ordinal).ToList(), _ => false,
-                g => $"{Inert(g.Key)}: {Listed(g.Select(m => m.Path).ToList(), _ => false, Inert, ", ")}", "; "))
+                g => $"{Inert(g.Key)}{(maxHotspot is null && g.All(m => m.Hotspot) ? " (hotspot, not judged: no max_hotspot)" : "")}: "
+                    + Listed(g.Select(m => m.Path).ToList(), _ => false, Inert, ", "), "; "))
             + $"; hotspot score (riskScore) on the default branch: {(Hotspots.Count == 0 ? "none read" : string.Join("; ", hot))}"
             + (AllNoData.Count == 0 ? "" : $"{NoDataSeparator}{NoDataText}");
     }
@@ -654,8 +665,8 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
             }
             if (Hotspot(answer, path) is { } why)
             {
-                // A reachable CodeGraph's unusable answer: a misread, which blocks (sc-26134).
-                misread.Add(new CodeGraphMisread(path, why));
+                // A reachable CodeGraph's unusable answer: a misread (sc-26134), which blocks where the policy judges hotspots.
+                misread.Add(new CodeGraphMisread(path, why, Hotspot: true));
                 continue;
             }
             var score = Score(answer, path) with { LanguageIndexed = answer.LanguageIndexed, Language = answer.Language };

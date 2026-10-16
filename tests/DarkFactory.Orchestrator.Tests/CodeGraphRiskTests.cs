@@ -289,7 +289,7 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public void CodeGraph_inputs_not_read_or_leaving_a_file_out_are_no_codegraph_data_and_inputs_read_for_another_commit_block()
+    public void CodeGraph_inputs_not_read_are_no_codegraph_data_and_inputs_read_for_another_commit_or_leaving_a_file_out_block()
     {
         var none = Evaluate(null);
         Assert.Equal(GateOutcome.Merge, none.Outcome);
@@ -302,11 +302,23 @@ public class CodeGraphRiskTests
             Assert.Single(other.Reasons));
         Assert.DoesNotContain("no CodeGraph data", other.Detail);
         var partial = Radii(BlastRadius.Low);
+        // sc-26134: a touched file the inputs leave out is a misread, never no data (it would fail open on a reader bug). A left-out
+        // blast radius blocks under any policy.
         var leftOut = Evaluate(partial with { BlastRadius = partial.BlastRadius.Take(1).ToList() });
-        Assert.Equal(GateOutcome.Merge, leftOut.Outcome);
-        Assert.Contains("no CodeGraph data: CodeGraph's inputs leave it out: src/b.cs", leftOut.Inputs);
-        Assert.Contains("no CodeGraph data: CodeGraph's inputs leave it out: src/a.cs",
-            Evaluate(partial with { Hotspots = partial.Hotspots.Skip(1).ToList() }).Inputs);
+        Assert.Equal(GateOutcome.Blocked, leftOut.Outcome);
+        Assert.Equal("risk threshold: CodeGraph misanswered (CodeGraph's inputs leave it out): src/b.cs", Assert.Single(leftOut.Reasons));
+        Assert.DoesNotContain("no CodeGraph data", leftOut.Detail);
+        // A left-out hotspot is a hotspot misread: it blocks where max_hotspot is set, and is only recorded with hotspots off or under v2.
+        var noHotspot = partial with { Hotspots = partial.Hotspots.Skip(1).ToList() };
+        Assert.Equal("risk threshold: CodeGraph misanswered (CodeGraph's inputs leave it out): src/a.cs",
+            Assert.Single(Evaluate(noHotspot, TestPolicies.V3("high", "0.9")).Reasons));
+        foreach (var policy in new[] { TestPolicies.V3("high", "off"), TestPolicies.Standard() })
+        {
+            var recorded = Evaluate(noHotspot, policy);
+            Assert.Equal(GateOutcome.Merge, recorded.Outcome);
+            Assert.Contains("; CodeGraph misanswered: CodeGraph's inputs leave it out (hotspot, not judged: no max_hotspot): src/a.cs", recorded.Inputs);
+            Assert.DoesNotContain("no CodeGraph data", recorded.Detail);
+        }
     }
 
     [Fact]
@@ -587,11 +599,15 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, [SwiftFile], CancellationToken.None);
 
-        // The reader records the unusable hotspot answer as a misread; the gate drops it, since CodeGraph said it indexes no Swift.
+        // The reader records the unusable hotspot answer as a misread. Only analyze_impact_file said CodeGraph indexes no Swift, so the
+        // hotspot's misread stands (sc-26134): recorded, and blocking only where max_hotspot is set.
         Assert.StartsWith("file_hotspot (repo_not_found)", Assert.Single(risk.Misreads).Reason);
-        Assert.Equal(new UnindexedFile(SwiftFile, "Swift", true), Assert.Single(risk.UnindexedFiles));
+        Assert.Equal(new UnindexedFile(SwiftFile, "Swift", true, ByImpact: true), Assert.Single(risk.UnindexedFiles));
+        Assert.StartsWith("risk threshold: CodeGraph misanswered (file_hotspot (repo_not_found)",
+            Assert.Single(Evaluate(risk, TestPolicies.V3("high", "0.9"), TestPolicies.Diff(SwiftFile)).Reasons));
         var decision = Evaluate(risk, diff: TestPolicies.Diff(SwiftFile));
         Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains("CodeGraph misanswered: file_hotspot (repo_not_found)", decision.Inputs);
         // The language is the reason the gate records for the file (its blast radius and hotspot mean nothing there).
         Assert.Contains($"no CodeGraph data: its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
     }
@@ -608,7 +624,7 @@ public class CodeGraphRiskTests
         var again = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.kt"], CancellationToken.None, cache);
 
         Assert.Single(server.Calls, c => c.Tool == "file_hotspot");
-        Assert.Equal(new UnindexedFile("src/a.kt", "kotlin", true), Assert.Single(again.UnindexedFiles));
+        Assert.Equal(new UnindexedFile("src/a.kt", "kotlin", true, ByHotspot: true), Assert.Single(again.UnindexedFiles));
     }
 
     // ---- the reader: CodeGraph's answers (C7 contract) ----
@@ -728,12 +744,52 @@ public class CodeGraphRiskTests
         Assert.Equal("src/a.cs", misread.Path);
         Assert.Contains(why, misread.Reason);
         Assert.Equal(1, risk.BlastRadius.Count + risk.Hotspots.Count);
-        var decision = Evaluate(risk, diff: TestPolicies.Diff("src/a.cs"));
-        Assert.Equal(GateOutcome.Blocked, decision.Outcome);
-        Assert.StartsWith("risk threshold: CodeGraph misanswered (", Assert.Single(decision.Reasons));
-        Assert.Contains(why, decision.Reasons[0]);
-        Assert.Contains("; CodeGraph misanswered: ", decision.Inputs);
-        Assert.DoesNotContain("no CodeGraph data", decision.Detail);
+        var hotspot = kind.StartsWith("hotspot-", StringComparison.Ordinal);
+        Assert.Equal(hotspot, misread.Hotspot);
+        var diff = TestPolicies.Diff("src/a.cs");
+        // A blast-radius misread blocks under any policy; a hotspot misread only where the policy sets max_hotspot (sc-26134).
+        foreach (var (policy, judgesHotspots) in new[] { (TestPolicies.Standard(), false), (TestPolicies.V3("high", "off"), false), (TestPolicies.V3("high", "0.9"), true) })
+        {
+            var decision = Evaluate(risk, policy, diff);
+            Assert.Contains("; CodeGraph misanswered: ", decision.Inputs);
+            Assert.Contains(why, decision.Inputs);
+            Assert.DoesNotContain("no CodeGraph data", decision.Detail);
+            if (hotspot && !judgesHotspots)
+            {
+                Assert.Equal(GateOutcome.Merge, decision.Outcome);
+                Assert.Contains("(hotspot, not judged: no max_hotspot)", decision.Inputs);
+                continue;
+            }
+            Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+            Assert.StartsWith("risk threshold: CodeGraph misanswered (", Assert.Single(decision.Reasons));
+            Assert.Contains(why, decision.Reasons[0]);
+            Assert.DoesNotContain("not judged", decision.Inputs);
+        }
+    }
+
+    [Fact]
+    public void A_language_flag_excuses_only_the_misread_of_the_tool_whose_answer_carried_it()
+    {
+        // sc-26134: languageIndexed: false in file_hotspot's answer does not excuse analyze_impact_file's misread, nor the other way round.
+        CodeGraphRisk Risk(bool hotspotMisread, bool byImpact, bool byHotspot) => new(Head, [], [], [],
+            Unindexed: [new UnindexedFile(SwiftFile, "Swift", true, ByImpact: byImpact, ByHotspot: byHotspot)],
+            Misread: [new CodeGraphMisread(SwiftFile, "boom", hotspotMisread)]);
+        var diff = TestPolicies.Diff(SwiftFile);
+        var limit = TestPolicies.V3("high", "0.9");
+
+        var impactKept = Evaluate(Risk(hotspotMisread: false, byImpact: false, byHotspot: true), limit, diff);
+        Assert.Equal("risk threshold: CodeGraph misanswered (boom): " + SwiftFile, Assert.Single(impactKept.Reasons));
+        var hotspotKept = Evaluate(Risk(hotspotMisread: true, byImpact: true, byHotspot: false), limit, diff);
+        Assert.Equal("risk threshold: CodeGraph misanswered (boom): " + SwiftFile, Assert.Single(hotspotKept.Reasons));
+
+        // The same tool's own flag explains its unusable answer: no data, its language the reason.
+        foreach (var excused in new[] { Risk(false, true, false), Risk(true, false, true) })
+        {
+            var decision = Evaluate(excused, limit, diff);
+            Assert.Equal(GateOutcome.Merge, decision.Outcome);
+            Assert.DoesNotContain("misanswered", decision.Detail);
+            Assert.Contains($"its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
+        }
     }
 
     private static FakeMcpServer UnusableServer(string kind) =>

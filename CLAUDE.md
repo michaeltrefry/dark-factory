@@ -2923,7 +2923,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `CodeGraph is not configured (no CodeGraph token: …)`), down after the retries below, refusing over HTTP (403
   `tool_not_entitled`, another 4xx), the whole read cut off at the backstop below; the REPOSITORY NOT INDEXED (`search_projects`
   names no project for it); the file's LANGUAGE NOT INDEXED (below); and C4's typed `notIndexed` for the head whose default-branch
-  read then finds nothing either (itself `notIndexed`, or unreachable); a file the inputs leave out is recorded so too. Everything
+  read then finds nothing either (itself `notIndexed`, or unreachable). Everything
   else a REACHABLE CodeGraph answers that cannot be used is a MISREAD, never no data (sc-26134, coordinator decision on the
   feature-end review): it BLOCKS `risk-threshold` like an unrecognised blast radius, and the item escalates
   (`CodeGraphMisread`, `CodeGraphRisk.Misread`; the reason ``risk threshold: CodeGraph misanswered (<why>): <files>`` per reason,
@@ -2934,9 +2934,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   CodeGraph unreachable for it) is the file a misread, both reasons recorded (``blast radius: <why not at the head>; on the default
   branch: <why>``); with no head read (no ready overlay), a default-branch answer that is unusable for any reason but the typed
   `notIndexed` or CodeGraph unreachable; any unusable `file_hotspot` answer (an error, no commit, not from the default branch,
-  another file, no `found`, no or an invalid `riskScore`); and every file of inputs read for another head (`MergeGate`'s
-  `Judged`: `CodeGraphRisk.AllMisread`). A file whose language CodeGraph says it does not index is no data, not a misread,
-  whatever its unusable answers were (`CodeGraphRisk.Judged`). There is no wait for a misread to clear: the gate reads CodeGraph
+  another file, no `found`, no or an invalid `riskScore`) — a HOTSPOT misread (`CodeGraphMisread.Hotspot`), which blocks only
+  where the policy sets `max_hotspot`: with `max_hotspot: off` or a version 2 policy the hotspot is not judged, so its misread is
+  only recorded in the gate row (``…: <why> (hotspot, not judged: no max_hotspot): <files>``) and the gate decides on the rest
+  (`CodeGraphRisk.MisreadReasons(hotspotJudged)`); a touched file the inputs leave out (`CodeGraphRisk.LeftOut`: its blast radius
+  — a misread under any policy — or only its hotspot — a hotspot misread), never no data, so a reader bug cannot fail open; and
+  every file of inputs read for another head (`MergeGate`'s `Judged`: `CodeGraphRisk.AllMisread`). Blast-radius misreads always
+  block. A file whose language CodeGraph says it does not index is no data; a tool's own `languageIndexed: false` explains that
+  tool's unusable answer about the file, never the other tool's, whose misread stands (`UnindexedFile.ByImpact`/`ByHotspot`,
+  `CodeGraphRisk.Judged`). There is no wait for a misread to clear: the gate reads CodeGraph
   once per evaluation (below) and escalates; the owner's re-run reads it again. A transient failure is NOT missing data either
   (sc-26254 review): (1) a blast radius CodeGraph
   answers for a found file is parsed in any case (`BlastRadii.TryParseAnswer`; the policy's own `max_blast_radius` stays lowercase
