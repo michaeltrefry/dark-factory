@@ -281,7 +281,7 @@ public static class FactoryRunner
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
-        using var classifierHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
+        using var classifierHttp = ClassifierHttp(options);
         var classifier = Issues.IssueClassifier.Create(options, classifierHttp, () => options.RouterKey);
         var intake = new Issues.IssueIntake(WorkSourceRegistry.Issues(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
@@ -448,6 +448,14 @@ public static class FactoryRunner
 
     /// <summary>The reviewers' router client: one reviewer call may take <c>Review:TimeoutMinutes</c>.</summary>
     internal static HttpClient ReviewerHttp(FactoryOptions options) => OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
+
+    /// <summary>
+    /// The issue classifier's router client: <c>Issues:Classification:TimeoutSeconds</c> is the deadline, carried by the
+    /// classifier's own linked token on every request and body read, so the client's HTTP timeout is disabled — the gateway's
+    /// 100 s default would cut a longer configured deadline short in production only (tests inject their own clients).
+    /// </summary>
+    internal static HttpClient ClassifierHttp(FactoryOptions options) =>
+        OutboundHttp.RouterApi(options.RouterBaseUrl, Timeout.InfiniteTimeSpan);
 
     /// <summary>
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
