@@ -268,7 +268,19 @@ public static class FactoryRunner
         var http = OutboundHttp.GitHubApi();
         var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
         return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp),
-            options.ConfiguredRepos, FreezeCheckFailures.Process);
+            options.ConfiguredRepos, FreezeCheckFailures.Process, CreateRecovery(options), scheduleRecovery: true);
+    }
+
+    private static Recovery.HotFileRecovery CreateRecovery(FactoryOptions options)
+    {
+        var http = OutboundHttp.GitHubApi();
+        var router = ReviewerHttp(options);
+        var sources = new WorkSourceRegistry(options);
+        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        var evidence = new Recovery.HotFileEvidence(Contexts(options), new GitHubGate(http, app), naming => sources.Of(naming));
+        return new Recovery.HotFileRecovery(Contexts(options), new PostgresRunLocks(options.LedgerConnectionString), options.Freeze,
+            TimeProvider.System, new Recovery.RouterHotFileAssessor(new RouterReviewer(router, options.RouterKey), evidence.CaptureAsync,
+                new RouterClient(router, options.RouterKey)), [http, router, sources]);
     }
 
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
@@ -364,6 +376,7 @@ public static class FactoryRunner
             gate = adjustGate(gate);
         }
         var controls = Controls(options);
+        await using var recovery = CreateRecovery(options);
         var pipeline = new RunPipeline(
             source,
             ledger,
@@ -384,7 +397,8 @@ public static class FactoryRunner
             // Before every dispatch (sc-25387): a frozen factory defers the run.
             // Failed checks are counted per process (FreezeCheckFailures.Process), across runs and the intake loop's polls.
             freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub, options.ConfiguredRepos,
-                FreezeCheckFailures.Process),
+                FreezeCheckFailures.Process, recovery),
+            recovery: recovery,
             // A looping worker is interrupted at its next tool boundary and its round fails (sc-25388).
             stuck: stuck,
             maxControlReadFailures: maxControlReadFailures,

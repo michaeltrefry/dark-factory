@@ -88,7 +88,8 @@ public sealed partial class RunPipeline(
     Plans.IPlanRunner? planner = null,
     IReadOnlyList<RepoRef>? configuredRepos = null,
     Worker.WorkerSlots? slots = null,
-    Func<CancellationToken, Task>? enterSandbox = null)
+    Func<CancellationToken, Task>? enterSandbox = null,
+    Recovery.HotFileRecovery? recovery = null)
 {
     /// <summary>
     /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
@@ -995,6 +996,17 @@ public sealed partial class RunPipeline(
         }
         // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
+        if (recovery is not null)
+        {
+            await recovery.AdvanceAsync(primary.FullName, ct);
+            if (await recovery.HeldAsync(primary.FullName, ct) is { } incident)
+            {
+                var why = $"repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}";
+                log.WriteLine($"[recovery] {why}");
+                // This is NOT a factory-wide Deferred: unrelated items of this same intake lane must still run.
+                return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, why);
+            }
+        }
         var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, primary.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);

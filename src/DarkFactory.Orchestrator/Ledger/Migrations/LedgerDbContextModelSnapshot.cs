@@ -374,6 +374,71 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("worker_sessions", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.HotFileIncident", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Answer")
+                        .HasColumnType("text");
+
+                    b.Property<int>("Attempts")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Error")
+                        .HasColumnType("text");
+
+                    b.Property<string>("EvidenceHash")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int>("Generation")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Prompt")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Repo")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTimeOffset?>("ResolvedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Session")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Snapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Repo", "Generation")
+                        .IsUnique();
+
+                    b.ToTable("hot_file_incidents", (string)null);
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.LedgerEntry", b =>
                 {
                     b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)

@@ -172,6 +172,16 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         return confirmation with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns };
     }
 
+    /// <summary>A fresh read-only assessment of supplied pinned evidence; no execution or external tools are offered.</summary>
+    internal async Task<(StreamedAnswer Answer, string? Class)> AssessAsync(string session, string system, string evidence, CancellationToken ct)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(http.Timeout == Timeout.InfiniteTimeSpan ? TimeSpan.FromMinutes(10) : http.Timeout);
+        var (answer, servedClass, _) = await TurnWithRetriesAsync(session, system,
+            [new { role = "user", content = PromptFence.Block("recovery-evidence", evidence) }], [], true, deadline.Token);
+        return (answer, servedClass);
+    }
+
     private const string AfterCap = "No usable final answer after the turn cap";
 
     /// <summary>The model may call a tool or answer (the Messages API's default, sent explicitly).</summary>
@@ -346,17 +356,21 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", routerKey);
         message.Headers.Add("anthropic-version", "2023-06-01");
         message.Headers.Add(ModelClass.Header, ReviewModels.Class);
-        message.Content = JsonContent.Create(new
+        var requestBody = new Dictionary<string, object>
         {
-            model = ModelClass.RequestModel,
-            max_tokens = MaxTokens,
-            system,
-            messages,
-            tools = definitions,
-            tool_choice = final ? NoTool : AnyOrNoTool,
+            ["model"] = ModelClass.RequestModel,
+            ["max_tokens"] = MaxTokens,
+            ["system"] = system,
+            ["messages"] = messages,
             // Streamed: the router cancels a call that has sent its client nothing for 10 s, and a review takes longer.
-            stream = true,
-        });
+            ["stream"] = true,
+        };
+        if (definitions.Count > 0)
+        {
+            requestBody["tools"] = definitions;
+            requestBody["tool_choice"] = final ? NoTool : AnyOrNoTool;
+        }
+        message.Content = JsonContent.Create(requestBody);
         // The whole session, streams included, is bounded by the caller's deadline (Review:TimeoutMinutes): HttpClient's own
         // timeout ends at the response headers, and the answer streams after them.
         using var response = await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, deadline);

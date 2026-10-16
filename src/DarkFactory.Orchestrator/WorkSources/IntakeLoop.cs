@@ -994,6 +994,7 @@ public static class IntakeServiceCollectionExtensions
         services.AddHostedService(sp => sp.GetRequiredService<Router.UsageMonitor>());
         // Every source the host reaches comes from this one registry (sc-25982): the loop's lanes, the dashboard's controls and Stop.
         services.AddSingleton(_ => new WorkSourceRegistry(options));
+        services.AddSingleton(_ => FactoryRunner.CreateFreeze(options));
         // The dashboard's Stop finishes a stop itself when no run holds the item, on the item's own source.
         services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<WorkSourceRegistry>(), Console.Out));
         services.AddHostedService(sp =>
@@ -1011,7 +1012,7 @@ public static class IntakeServiceCollectionExtensions
                 lanes, sp.GetRequiredService<IntakeOptions>(),
                 sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
                 sp.GetRequiredService<Router.UsageMonitor>(), status,
-                ct => (evaluator ??= FactoryRunner.CreateFreeze(options)).CheckAsync(ct));
+                ct => (evaluator ??= sp.GetRequiredService<Controls.FactoryFreeze>()).CheckAsync(ct));
         });
         return services;
     }

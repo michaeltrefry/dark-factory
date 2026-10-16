@@ -245,9 +245,18 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<SessionEvent> SessionEvents => Set<SessionEvent>();
     public DbSet<Control> Controls => Set<Control>();
     public DbSet<SessionTaint> SessionTaints => Set<SessionTaint>();
+    public DbSet<Recovery.HotFileIncident> HotFileIncidents => Set<Recovery.HotFileIncident>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<Recovery.HotFileIncident>(e =>
+        {
+            e.ToTable("hot_file_incidents");
+            e.Property(x => x.Repo).HasMaxLength(200);
+            e.Property(x => x.State).HasMaxLength(32);
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => new { x.Repo, x.Generation }).IsUnique();
+        });
         modelBuilder.Entity<WorkItem>(e =>
         {
             e.ToTable("work_items");
