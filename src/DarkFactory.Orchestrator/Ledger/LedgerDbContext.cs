@@ -304,7 +304,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
         {
             e.ToTable("controls");
             e.HasKey(x => x.Scope);
-            e.Property(x => x.Scope).HasMaxLength(64);
+            e.Property(x => x.Scope).HasColumnType("text");
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.ChangedBy).HasMaxLength(128);
             e.Property(x => x.Reason).HasMaxLength(64);

@@ -484,7 +484,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   cascade runs on the plan item's own source (its stories are that source's). The dashboard's controls use the same registry.
   An invalid scope's message names every source's item scope (`item:sc-<id>, item:gh-<key> or item:kb-<n>`).
   Tests (`WorkSourceRegistryTests`) build their options from explicit settings with no keychain and no process environment
-  (`FactoryOptions`' `environment` parameter, tests only), so none is skipped on a machine whose shell carries a source's token. `IItemStops` has one member, `StopAsync(ItemRef)`. Epic scopes
+  (`FactoryOptions`' `environment` parameter, tests only), so none is skipped on a machine whose shell carries a source's token. `IItemStops` stops one item with `StopAsync(ItemRef)` and drafts a retained coordinator's selected-repository changesets with `DraftRepositoryAsync`. Epic scopes
   carry their source (sc-25985, under Controls below): `--epic N` is a Shortcut epic, `--epic kb-N` a Kanban epic, each reaching
   only its own source's items, and an item whose epic the ledger lacks is looked up
   on its own board (`ControlActions`' `sources`), one not configured being reported as unknown.
@@ -884,6 +884,17 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the last page's last `updated_at`). A request GitHub refuses for good (`GitHubRequestException.Permanent`: a 4xx that is not
   a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
   issue is taken up again when it next changes.
+- Repository manual controls (sc-26337): `pause|continue|stop --repo owner/name` uses the canonical case-insensitive
+  `repo:owner/name` scope, persisted as untruncated text separately from automatic incidents. A repository Stop leaves a
+  human Pause until explicit human Continue, cancels the repository's active items, and drafts only that repository's
+  changeset PRs. It does NOT turn a multi-repository coordinator into an unrestricted plan Stop: the coordinator stays
+  nonterminal so independent children in other repositories can continue; cancelled children keep the original plan
+  incomplete, and their dependents are not released. Unstarted work and retained coordinator delivery in the stopped
+  repository remain held by its manual Pause. Continue lifts that Pause only, never resurrects cancelled items or clears
+  an incident. Scoped drafting takes the coordinator's run lock; an active run or possible crashed worker leaves Stop
+  explicitly unfinished, the repository paused, and names the required retry rather than drafting underneath it. Item,
+  epic and factory Stops retain their existing full-cascade semantics. Dispatch resolves a fresh spec and any recorded
+  changeset pass before evaluating repository recovery, while human/global/plan controls and Stop take precedence.
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
   `epic:kb-<key>` | `item:sc-<id>` | `item:gh-<key>` | `item:kb-<key>`; `WorkItem.EpicId` maps items to epics, within the item's
   own source — epic scopes, sc-25985, at the end of this bullet; a plan item's `item:` scope also holds its stories, through

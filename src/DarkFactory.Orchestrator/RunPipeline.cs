@@ -933,7 +933,7 @@ public sealed partial class RunPipeline(
     {
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
-        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
+        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveWithoutRepositoryAsync(known.ExternalId, known.EpicId, ct);
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -951,6 +951,8 @@ public sealed partial class RunPipeline(
         }
         if (known is not null)
         {
+            // Repository controls are checked only after the fresh spec and the ledger resolve the operation repository.
+            if (knownControl == ControlState.Stopping) return await StopIdleAsync(known, storyId, ct);
             if (knownControl == ControlState.Paused)
             {
                 log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");
@@ -996,17 +998,10 @@ public sealed partial class RunPipeline(
         }
         // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
-        if (recovery is not null)
+        if (known is null && await RepositoryControlAsync(Naming.Format(storyId), spec.Epic?.Id, primary.FullName, ct) != ControlState.Running)
         {
-            if (!backgroundRecovery) await recovery.AdvanceAsync(primary.FullName, ct);
-            if (await recovery.HeldAsync(primary.FullName, ct) is { } incident)
-            {
-                if (backgroundRecovery) recovery.Schedule(primary.FullName, log, ct);
-                var why = $"repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}";
-                log.WriteLine($"[recovery] {why}");
-                // This is NOT a factory-wide Deferred: unrelated items of this same intake lane must still run.
-                return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, why);
-            }
+            // A repository hold is not a factory-wide Deferred: the next item in this lane may target another repository.
+            return new RunOutcome(0, WorkState.Intake, null, null, $"repository {primary} held by hot-file recovery or a control");
         }
         var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, primary.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
@@ -1025,6 +1020,14 @@ public sealed partial class RunPipeline(
         var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
+        if (known is not null && item.State != WorkState.Planned && !Lifecycle.IsTerminal(item.State))
+        {
+            var resolvedControl = await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct);
+            if (resolvedControl == ControlState.Stopping) return await StopIdleLockedAsync(item, storyId, ct);
+            if (resolvedControl == ControlState.Paused)
+                return await OutcomeAsync(item, PausedMessage(item.ExternalId), ct);
+        }
+
         // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created. Looked up
         // until the item is first claimed: a plan's story is linked before its claim (WithoutPlanAsync refuses one that is not),
         // so an item that was ever claimed without a link is no plan's story and is not looked up on every later run.
@@ -1848,7 +1851,25 @@ public sealed partial class RunPipeline(
         }
     }
 
-    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control; `factory continue` resumes it.";
+    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control or repository recovery; only human Continue lifts a manual pause.";
+
+    private async Task<ControlState> RepositoryControlAsync(string externalId, long? epicId, string repository, CancellationToken ct)
+    {
+        var held = false;
+        if (recovery is not null)
+        {
+            if (!backgroundRecovery) await recovery.AdvanceAsync(repository, ct);
+            if (await recovery.HeldAsync(repository, ct) is { } incident)
+            {
+                held = true;
+                if (backgroundRecovery) recovery.Schedule(repository, log, ct);
+                log.WriteLine($"[recovery] repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}");
+            }
+        }
+        // Read AFTER assessment: a Pause/Stop may have landed while it ran. Never synthesize Running from a safe answer.
+        var state = await _controls.EffectiveInRepositoryAsync(externalId, epicId, repository, ct);
+        return state == ControlState.Running && held ? ControlState.Paused : state;
+    }
 
     private async Task ThrowIfControlledAsync(WorkItem item, CancellationToken ct)
     {
@@ -1872,6 +1893,8 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[frozen] {item.ExternalId}: {frozen.Message}");
             throw new ControlRequestedException(ControlState.Paused) { Frozen = frozen };
         }
+        // Detection can have persisted a repository incident during the evaluation above, and a human control may have moved.
+        await ThrowIfControlledAsync(item, ct);
     }
 
     /// <summary>The freeze evaluator's answer, its notes (what it passed over, e.g. a base branch GitHub no longer has) logged.</summary>
@@ -1926,8 +1949,8 @@ public sealed partial class RunPipeline(
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
         List<string> scopes = ItemNaming.EpicOf(item.ExternalId, item.EpicId) is { } epic
-            ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
-            : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+            ? [ControlScope.Factory, ControlScope.Repository(RepoRef.Parse(item.Repo)), ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
+            : [ControlScope.Factory, ControlScope.Repository(RepoRef.Parse(item.Repo)), ControlScope.Item(item.ExternalId)];
         if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)
         {
             scopes.Add(ControlScope.Item(planItem.ExternalId));
@@ -1957,6 +1980,12 @@ public sealed partial class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        return await StopIdleLockedAsync(item, storyId, ct);
+    }
+
+    /// <summary>The idle stop when this flow already holds the item's run lock.</summary>
+    private async Task<RunOutcome> StopIdleLockedAsync(WorkItem item, int storyId, CancellationToken ct)
+    {
         var repo = RepoRef.Parse(item.Repo);
         Workspace? workspace = null;
         if (!Lifecycle.IsTerminal(item.State))

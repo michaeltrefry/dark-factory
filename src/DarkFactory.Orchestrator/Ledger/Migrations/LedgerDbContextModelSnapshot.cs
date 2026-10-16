@@ -25,8 +25,7 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.Control", b =>
                 {
                     b.Property<string>("Scope")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
+                        .HasColumnType("text");
 
                     b.Property<TimeSpan?>("Backoff")
                         .HasColumnType("interval");
