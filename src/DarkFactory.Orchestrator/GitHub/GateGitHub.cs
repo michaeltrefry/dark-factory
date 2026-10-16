@@ -246,16 +246,17 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
     {
         var token = await ReadTokenAsync(repo, ct);
         var prefix = $"repos/{repo.Owner}/{repo.Name}/commits/{sha}/";
-        var runs = await Pages<CheckRunsDto, CheckRunDto>("check-runs", p => (p.TotalCount, p.CheckRuns));
-        var statuses = await Pages<CombinedStatusDto, StatusDto>("status", p => (p.TotalCount, p.Statuses));
-        var suites = await Pages<CheckSuitesDto, CheckSuiteDto>("check-suites", p => (p.TotalCount, p.CheckSuites));
+        var runs = await Pages<CheckRunsDto, CheckRunDto>("check-runs", p => (p.TotalCount, p.CheckRuns), r => r.Id);
+        var statuses = await Pages<CombinedStatusDto, StatusDto>("status", p => (p.TotalCount, p.Statuses), s => s.Id);
+        var suites = await Pages<CheckSuitesDto, CheckSuiteDto>("check-suites", p => (p.TotalCount, p.CheckSuites), s => s.Id);
         return new CiFacts(sha, runs.Select(r => new CheckFact(r.Name, r.Status == "completed", r.Conclusion, r.Id))
             .Concat(statuses.Select(s => new CheckFact(s.Context, s.State != "pending", s.State == "error" ? "failure" : s.State))).ToArray(),
             Suites: suites.Select(s => new CheckSuiteFact(s.App?.Slug ?? "unknown", s.Status == "completed", s.Conclusion, s.LatestCheckRunsCount)).ToArray());
 
-        async Task<List<TItem>> Pages<TPage, TItem>(string endpoint, Func<TPage, (int Total, List<TItem> Items)> unpack)
+        async Task<List<TItem>> Pages<TPage, TItem>(string endpoint, Func<TPage, (int Total, List<TItem> Items)> unpack, Func<TItem, long?> identity)
         {
             var all = new List<TItem>();
+            var identities = new HashSet<long>();
             int? total = null;
             // A bound is an acquisition failure, never a smaller complete list. The snapshot deadline also bounds reads.
             for (var page = 1; page <= 50; page++)
@@ -271,6 +272,9 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
                 if (result.Total < 0 || total is { } count && count != result.Total || result.Items is null)
                     throw new InvalidOperationException("Recovery CI page totals changed or are missing.");
                 total = result.Total;
+                foreach (var item in result.Items)
+                    if (identity(item) is not { } id || id <= 0 || !identities.Add(id))
+                        throw new InvalidOperationException("Recovery CI page has a missing or duplicate stable identity.");
                 all.AddRange(result.Items);
                 if (all.Count == total) return all;
                 if (all.Count > total || result.Items.Count == 0) throw new InvalidOperationException("Recovery CI page is missing or inconsistent.");
@@ -456,7 +460,8 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("status")] string? Status,
         [property: JsonPropertyName("conclusion")] string? Conclusion,
         [property: JsonPropertyName("latest_check_runs_count")] int LatestCheckRunsCount,
-        [property: JsonPropertyName("app")] AppDto? App);
+        [property: JsonPropertyName("app")] AppDto? App,
+        [property: JsonPropertyName("id")] long? Id = null);
 
     private sealed record AppDto([property: JsonPropertyName("slug")] string? Slug);
 
@@ -466,7 +471,8 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
 
     private sealed record StatusDto(
         [property: JsonPropertyName("context")] string Context,
-        [property: JsonPropertyName("state")] string State);
+        [property: JsonPropertyName("state")] string State,
+        [property: JsonPropertyName("id")] long? Id = null);
 
     private sealed record ContentEntryDto(
         [property: JsonPropertyName("name")] string Name,

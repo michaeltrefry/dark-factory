@@ -14,7 +14,7 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromMinutes(10));
-        var material = await CaptureAsync(snapshot, deadline.Token);
+        var material = await CaptureAsync(snapshot, ct);
         var request = JsonSerializer.Serialize(new { version = 1, snapshot.Id, snapshot.Generation, snapshot.Repo, snapshot.EvidenceHash,
             materialHash = Hash(material), material });
         var (answer, servedClass) = await reviewer.AssessAsync(session, ReviewPrompts.For("hot-file-assessment").Text, request, deadline.Token);
@@ -24,7 +24,7 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         {
             try
             {
-                if (await CaptureAsync(snapshot, deadline.Token) != material)
+                if (await CaptureAsync(snapshot, ct) != material)
                     parsed = parsed with { Decision = "inconclusive" };
             }
             catch (Exception) when (!ct.IsCancellationRequested)
@@ -44,9 +44,8 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
 
     private async Task<string> CaptureAsync(HotFileSnapshot snapshot, CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(TimeSpan.FromMinutes(5));
-        var material = await evidence(snapshot, deadline.Token);
+        // Evidence acquisition owns its deadline and durable incomplete record; only shutdown cancels it here.
+        var material = await evidence(snapshot, ct);
         if (Encoding.UTF8.GetByteCount(material) > 2 * 1024 * 1024) throw new InvalidOperationException("Required recovery evidence exceeds 2 MiB; not assessed.");
         return material;
     }

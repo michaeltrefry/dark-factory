@@ -4,6 +4,7 @@ using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Plans;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
@@ -41,7 +42,7 @@ public sealed record RecoverySnapshot(string Id, string IncidentSnapshot, string
 /// never an omitted prerequisite. Acquisition itself writes only append-only evidence, never controls or work state.
 /// </summary>
 public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts, IGateGitHub github,
-    Func<ItemNaming, IWorkSource> sources)
+    Func<ItemNaming, IWorkSource> sources, TimeSpan? acquisitionTimeout = null, TimeProvider? time = null)
 {
     public async Task<string> CaptureAsync(HotFileSnapshot trigger, CancellationToken ct)
     {
@@ -49,17 +50,20 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         var material = JsonSerializer.Serialize(snapshot);
         // Store BEFORE the router call, not only in the answer after a session returns. A crash cannot lose its input.
         var anchor = trigger.Merges.FirstOrDefault()?.Item;
-        await using var db = await contexts.CreateDbContextAsync(ct);
+        using var persistence = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        persistence.CancelAfter(TimeSpan.FromSeconds(30));
+        var persist = persistence.Token;
+        await using var db = await contexts.CreateDbContextAsync(persist);
         anchor ??= await db.WorkItems.OrderBy(i => i.Id).Where(i => i.Repo.ToLower() == trigger.Repo.ToLower())
-            .Select(i => (long?)i.Id).FirstOrDefaultAsync(ct);
+            .Select(i => (long?)i.Id).FirstOrDefaultAsync(persist);
         if (anchor is { } itemId && !await db.LedgerEntries.AnyAsync(e => e.WorkItemId == itemId
-                && e.Step == RecoverySnapshot.Step && e.Detail == material, ct))
+                && e.Step == RecoverySnapshot.Step && e.Detail == material, persist))
         {
-            var state = (await db.WorkItems.SingleAsync(i => i.Id == itemId, ct)).State;
+            var state = (await db.WorkItems.SingleAsync(i => i.Id == itemId, persist)).State;
             db.LedgerEntries.Add(new LedgerEntry { WorkItemId = itemId, State = state,
                 Step = RecoverySnapshot.Step, Detail = material, RecordedAt = DateTimeOffset.UtcNow,
                 Outcome = StepOutcomes.Of(state, state, RecoverySnapshot.Step, material) });
-            await db.SaveChangesAsync(ct);
+            await db.SaveChangesAsync(persist);
         }
         if (!snapshot.Complete) throw new InvalidOperationException("Incomplete recovery snapshot: "
             + string.Join("; ", snapshot.Missing.Select(m => $"{m.Category}: {m.Reason}")));
@@ -68,15 +72,15 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
 
     public async Task<RecoverySnapshot> SnapshotAsync(HotFileSnapshot trigger, CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(TimeSpan.FromMinutes(5));
+        using var acquisition = new CancellationTokenSource(acquisitionTimeout ?? TimeSpan.FromMinutes(5), time ?? TimeProvider.System);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, acquisition.Token);
         var token = deadline.Token;
         var evidence = new List<RecoveryEvidence>();
         var missing = new List<MissingRecoveryEvidence>();
         var tips = new SortedDictionary<string, string>(StringComparer.Ordinal);
         var repo = RepoRef.Parse(trigger.Repo);
         var budget = 0;
-        await using var db = await contexts.CreateDbContextAsync(token);
+        await using var db = await contexts.CreateDbContextAsync(ct);
         try
         {
             if (trigger.Merges.Count > RecoverySnapshot.MaxMerges)
@@ -121,8 +125,46 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                     });
                 });
             }
-            var items = (await db.WorkItems.AsNoTracking().Where(i => i.State != WorkState.Done && i.State != WorkState.Cancelled && i.State != WorkState.Watch)
-                .OrderBy(i => i.Id).ToListAsync(token)).Where(i => RepoRef.Parse(i.Repo).Is(repo)).ToList();
+            var known = await db.WorkItems.AsNoTracking().OrderBy(i => i.Id).ToListAsync(token);
+            var items = known.Where(i => Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
+            // Backlog/released children have no item row until intake sees them. A parent may currently be in another repo.
+            var plans = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RunPipeline.Steps.PlanStories)
+                .OrderBy(e => e.Id).ToListAsync(token);
+            foreach (var recorded in plans.GroupBy(e => e.WorkItemId).Select(g => g.Last()))
+            {
+                await Read("plan", async () =>
+                {
+                    var parent = known.Single(i => i.Id == recorded.WorkItemId);
+                    var rows = await Rows(parent.Id);
+                    var plan = Plans.Plan.FromDetail(rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Plan)?.Detail);
+                    var children = (recorded.Detail ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (children.Length != plan.Stories.Count || children.Distinct().Count() != children.Length)
+                        throw new InvalidOperationException("Recorded plan children do not match their requirements.");
+                    var relevant = false;
+                    for (var index = 0; index < children.Length; index++)
+                    {
+                        var child = known.SingleOrDefault(i => i.ExternalId == children[index]);
+                        if (!RepoRef.Parse(Plans.Plan.RepoOf(plan.Stories[index], RepoRef.Parse(parent.Repo))).Is(repo)) continue;
+                        relevant = true;
+                        if (child is not null) continue;
+                        var reference = ItemNaming.ParseAny(children[index]) ?? throw new InvalidOperationException("Unknown planned child identity.");
+                        if (reference.Naming != Reference(parent).Naming) throw new InvalidOperationException("Plan child source mismatch.");
+                        if (items.Count > RecoverySnapshot.MaxPending) break;
+                        items.Add(new WorkItem { ExternalId = children[index], Source = parent.Source, Repo = trigger.Repo,
+                            Title = plan.Stories[index].Title, State = WorkState.Intake, PlanItemId = parent.Id });
+                    }
+                    if (relevant || Changeset.Of(rows, repo) is not null)
+                    {
+                        if (Pending(parent) && !items.Any(i => i.ExternalId == parent.ExternalId)) items.Add(parent);
+                        if (items.Count > RecoverySnapshot.MaxPending) return;
+                        await Spec(parent);
+                        await PlanRecord(parent, rows);
+                        await ChangesetHeads(parent, rows);
+                    }
+                });
+                if (items.Count > RecoverySnapshot.MaxPending) break;
+            }
+            items = items.DistinctBy(i => i.ExternalId).OrderBy(i => i.ExternalId, StringComparer.Ordinal).ToList();
             if (items.Count > RecoverySnapshot.MaxPending) Missing("pending-work", $"More than {RecoverySnapshot.MaxPending} pending items.");
             else foreach (var item in items)
             {
@@ -131,32 +173,43 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                 await Read("pending", async () =>
                 {
                     var rows = await Rows(item.Id);
-                    var link = rows.LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
+                    var attempt = CodingAttempt(rows);
+                    var effective = item.State == WorkState.Paused
+                        ? TransitionContext.From(rows.Where(r => r.Step is null).Select(r => r.State).ToList()).PausedFrom : item.State;
+                    // A previous PR cannot represent retained edits in this coding attempt; do not inspect worker files.
+                    if (effective is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing
+                        && attempt.Any(r => r.Step == RunPipeline.Steps.WorkerStarted)
+                        && (attempt.LastOrDefault(r => r.Step == RunPipeline.Steps.Pushed)?.Id ?? 0)
+                            < attempt.Last(r => r.Step == RunPipeline.Steps.WorkerStarted).Id)
+                        throw new InvalidOperationException("Unpublished coding work has no reproducible pending head.");
+                    await ChangesetHeads(item, rows);
+                    var itemRepo = RepoRef.Parse(item.Repo);
+                    var link = (effective == WorkState.Implement ? attempt : rows).LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
                     PullFacts? pull = null;
                     if (link is not null)
                     {
-                        var number = PullNumber(link, repo);
-                        pull = await github.GetPullAsync(repo, number, token);
+                        var number = PullNumber(link, itemRepo);
+                        pull = await github.GetPullAsync(itemRepo, number, token);
                         if (pull.Number != number || string.IsNullOrWhiteSpace(pull.HeadSha)) throw new InvalidOperationException("Missing/wrong pending PR head.");
                     }
                     else if (item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge)
                         throw new InvalidOperationException("Missing pending PR link.");
                     string? head = pull?.HeadSha;
-                    var pushed = rows.LastOrDefault(r => r.Step == RunPipeline.Steps.Pushed)?.Detail;
+                    var pushed = attempt.LastOrDefault(r => r.Step == RunPipeline.Steps.Pushed)?.Detail;
                     if (pull is null && pushed is not null)
                     {
                         // Initial Implement's pushed checkpoint names the branch; fix rounds may record a commit.
                         // Resolve the remote branch in either case, never treat the checkpoint text as an immutable head.
                         var pendingRef = Reference(item);
                         var branch = pushed.StartsWith("factory/", StringComparison.Ordinal) ? pushed : pendingRef.Naming.BranchName(pendingRef.Id);
-                        head = (await github.CompareAsync(repo, branch, branch, token)).BaseSha;
+                        head = (await github.CompareAsync(itemRepo, branch, branch, token)).BaseSha;
                         if (string.IsNullOrWhiteSpace(head)) throw new InvalidOperationException("Missing pending branch tip.");
                     }
-                    else if (pull is null && item.State == WorkState.Implement && rows.Any(r => r.Step == RunPipeline.Steps.WorkerStarted))
+                    else if (pull is null && effective == WorkState.Implement && attempt.Any(r => r.Step == RunPipeline.Steps.WorkerStarted))
                         throw new InvalidOperationException("Unpublished coding work has no reproducible pending head.");
                     var reference = Reference(item);
                     var blockers = await sources(reference.Naming).BlockersAsync(reference.Id, token);
-                    Add("pending", $"pending:{item.Id}", $"ledger:{item.Id}@{item.Version}; {item.ExternalId}", pull?.HeadSha,
+                    Add("pending", $"pending:{EvidenceKey(item)}", $"ledger:{item.Id}@{item.Version}; {item.ExternalId}", head,
                         new { item.Id, item.ExternalId, item.State, item.Version, item.PlanItemId, item.EpicId, pull, blockers,
                             head, headState = head is null ? "not-pushed" : "published",
                             rows = Results(rows) });
@@ -196,12 +249,12 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         }
         async Task Spec(WorkItem item) => await Read("spec", async () =>
         {
-            if (evidence.Any(e => e.Id == $"spec:{item.Id}")) return;
+            if (evidence.Any(e => e.Id == $"spec:{EvidenceKey(item)}")) return;
             var reference = Reference(item);
             var spec = await sources(reference.Naming).ReadSpecAsync(reference.Id, token);
             if (spec.Story.Ref != item.ExternalId || item.EpicId is { } epic && spec.Epic?.Id != epic)
                 throw new InvalidOperationException($"{item.ExternalId}: spec/epic identity mismatch.");
-            Add("spec", $"spec:{item.Id}", $"{item.ExternalId}; {spec.Story.AppUrl}; epic and whole documents", null, spec);
+            Add("spec", $"spec:{EvidenceKey(item)}", $"{item.ExternalId}; {spec.Story.AppUrl}; epic and whole documents", null, spec);
         });
         async Task Plan(WorkItem item)
         {
@@ -212,14 +265,53 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                 var parent = await db.WorkItems.AsNoTracking().SingleAsync(p => p.Id == parentId, token);
                 await Spec(parent);
                 var rows = await Rows(parentId);
-                if (!rows.Any(r => r.Step == "plan")) throw new InvalidOperationException("Parent plan requirements missing.");
-                Add("plan", $"plan:{parentId}", $"ledger:{parentId}@{parent.Version}; {parent.ExternalId}", null,
-                    new { parent.Id, parent.ExternalId, parent.Version, rows = Results(rows) });
+                await PlanRecord(parent, rows);
+                await ChangesetHeads(parent, rows);
+            });
+        }
+        Task PlanRecord(WorkItem parent, List<LedgerEntry> rows)
+        {
+            if (!rows.Any(r => r.Step == "plan")) throw new InvalidOperationException("Parent plan requirements missing.");
+            Add("plan", $"plan:{parent.Id}", $"ledger:{parent.Id}@{parent.Version}; {parent.ExternalId}", null,
+                new { parent.Id, parent.ExternalId, parent.Version, rows = Results(rows) });
+            return Task.CompletedTask;
+        }
+        async Task ChangesetHeads(WorkItem parent, List<LedgerEntry> rows)
+        {
+            var changeset = Changeset.Of(rows, repo);
+            if (changeset is null || evidence.Any(e => e.Id == $"changeset:{parent.Id}")) return;
+            await Read("changeset-head", async () =>
+            {
+                var head = (await github.CompareAsync(repo, changeset.Branch, changeset.Branch, token)).BaseSha;
+                if (string.IsNullOrWhiteSpace(head)) throw new InvalidOperationException("Missing changeset remote tip.");
+                Add("changeset-head", $"changeset:{parent.Id}", $"{trigger.Repo}; remote:{changeset.Branch}", head,
+                    new { changeset, head });
             });
         }
         async Task<List<LedgerEntry>> Rows(long item, long? through = null) => await db.LedgerEntries.AsNoTracking()
             .Where(e => e.WorkItemId == item && e.Step != RecoverySnapshot.Step && (through == null || e.Id <= through))
             .OrderBy(e => e.Id).ToListAsync(token);
+    }
+
+    private static bool Pending(WorkItem item) => item.State is not (WorkState.Done or WorkState.Cancelled or WorkState.Watch);
+    private static string EvidenceKey(WorkItem item) => item.Id == 0 ? item.ExternalId : item.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    private static List<LedgerEntry> CodingAttempt(List<LedgerEntry> rows)
+    {
+        var start = 0;
+        WorkState? previous = null;
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            if (row.Step is null)
+            {
+                if (row.State is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing or WorkState.Plan
+                    && previous != WorkState.Paused) start = i;
+                previous = row.State;
+            }
+            else if (row.Step == RunPipeline.Steps.WorktreeLost) start = i;
+            else if (row.Step == RunPipeline.Steps.StuckRetry) start = i + 1;
+        }
+        return rows.Skip(start).ToList();
     }
 
     private static object Results(IEnumerable<LedgerEntry> rows) => rows.Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }).ToArray();
