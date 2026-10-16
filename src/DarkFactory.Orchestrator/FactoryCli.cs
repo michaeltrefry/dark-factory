@@ -193,10 +193,21 @@ public static class FactoryCli
                 return null;
             },
         };
+        var repository = new Option<string?>("--repo")
+        {
+            Description = "One repository's human control (owner/name); Continue does not resolve an automatic recovery hold",
+            CustomParser = result =>
+            {
+                var name = result.Tokens.Single().Value.ToLowerInvariant();
+                if (Controls.ControlScope.RepositoryOf("repo:" + name) is not null) return "repo:" + name;
+                result.AddError("Expected --repo owner/name.");
+                return null;
+            },
+        };
         var factory = new Option<bool>("--factory") { Description = "The whole factory" };
         var usage = new Option<bool>("--usage") { Description = "The factory's usage pause (plans exhausted): lift it before its reset time" };
         var freeze = new Option<bool>("--freeze") { Description = "The factory's automatic freeze: clear it (only later events can freeze it again)" };
-        var command = new Command(action, description) { item, epic, factory };
+        var command = new Command(action, description) { item, epic, repository, factory };
         if (action == "continue")
         {
             command.Options.Add(usage);
@@ -205,19 +216,20 @@ public static class FactoryCli
         command.Validators.Add(result =>
         {
             var given = new[] { result.GetResult(item) is not null, result.GetResult(epic) is not null, result.GetResult(factory) is not null, result.GetResult(usage) is not null,
-                    result.GetResult(freeze) is not null }
+                    result.GetResult(freeze) is not null, result.GetResult(repository) is not null }
                 .Count(x => x);
             if (given != 1)
             {
                 result.AddError(action == "continue"
-                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --factory, --usage or --freeze."
-                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.");
+                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name>, --factory, --usage or --freeze."
+                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name> or --factory.");
             }
         });
         command.SetAction((parse, ct) =>
         {
             var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(story.ToString())
                 : parse.GetValue(epic) is { } named ? Controls.ControlScope.Epic(named)
+                : parse.GetValue(repository) is { } repoScope ? repoScope
                 : parse.GetValue(usage) ? Controls.ControlScope.Usage
                 : parse.GetValue(freeze) ? Controls.ControlScope.Freeze
                 : Controls.ControlScope.Factory;

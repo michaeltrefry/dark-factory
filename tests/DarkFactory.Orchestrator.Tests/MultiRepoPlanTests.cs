@@ -621,6 +621,37 @@ public class MultiRepoPipelineTests
 
     private static int ChangesetPulls(BranchRepo repo) => repo.Opened.Count(o => o.Head == ChangesetBranch);
 
+    [Fact]
+    public async Task Repository_controls_follow_the_changeset_pass_not_the_plans_primary_repository()
+    {
+        var h = new Harness();
+        await h.UpstreamDelivered();
+        await h.Controls.SetAsync(ControlScope.Repository(RepoRef.Parse(Up)), ControlState.Paused, "human", CancellationToken.None);
+        // The completed upstream stays paused. The next pass is downstream and must not inherit that repo control.
+        Assert.Equal(WorkState.Review, (await h.Run()).State);
+        Assert.Equal(Down, (await h.Item()).Repo);
+        var pulls = ChangesetPulls(h.DownRepo);
+        await h.Controls.SetAsync(ControlScope.Repository(RepoRef.Parse(Down)), ControlState.Paused, "human", CancellationToken.None);
+        Assert.Equal(WorkState.Review, (await h.Run()).State);
+        Assert.Equal(pulls, ChangesetPulls(h.DownRepo));
+        await h.Controls.SetAsync(ControlScope.Repository(RepoRef.Parse(Down)), ControlState.Running, "human", CancellationToken.None);
+        Assert.Equal(WorkState.Watch, (await h.Run()).State);
+        Assert.Equal(ControlState.Paused, (await h.Controls.GetAsync(ControlScope.Repository(RepoRef.Parse(Up)), CancellationToken.None))!.State);
+    }
+
+    [Fact]
+    public async Task A_repository_pause_holds_changeset_delivery_without_opening_its_PR()
+    {
+        var h = new Harness();
+        await h.UpstreamDelivered();
+        await h.Controls.SetAsync(ControlScope.Repository(RepoRef.Parse(Down)), ControlState.Paused, "human", CancellationToken.None);
+        Assert.Equal(WorkState.Planned, (await h.Run()).State);
+        Assert.Equal(0, ChangesetPulls(h.DownRepo));
+        await h.Controls.SetAsync(ControlScope.Repository(RepoRef.Parse(Down)), ControlState.Running, "human", CancellationToken.None);
+        Assert.Equal(WorkState.Review, (await h.Run()).State);
+        Assert.Equal(1, ChangesetPulls(h.DownRepo));
+    }
+
     // ---- the CI-trigger check, in every repository of the plan (sc-25873) ----
 
     private const string CiFile = ".github/workflows/ci.yml";

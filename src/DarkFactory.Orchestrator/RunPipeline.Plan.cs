@@ -453,6 +453,14 @@ public sealed partial class RunPipeline
                 log.WriteLine($"[{item.State}] {item.ExternalId} is {control} by a control; releasing nothing more");
                 break;
             }
+            var targetRepo = repos?.RepoOf(story) ?? primary.FullName;
+            if (await RepositoryControlAsync(story, item.EpicId, targetRepo, ct) != ControlState.Running)
+            {
+                log.WriteLine($"[{item.State}] {story}: repository {targetRepo} or its item control holds release");
+                continue; // Another repository's eligible child can still be released.
+            }
+            // Recovery may have awaited an assessment; a new parent Pause/Stop still wins at the write boundary.
+            if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running) break;
             var moved = await source.MakeReadyAsync(IdOf(story), ct);
             if (moved == ReadyResult.Archived)
             {
@@ -586,6 +594,8 @@ public sealed partial class RunPipeline
         List<LedgerEntry> since, bool several, CancellationToken ct)
     {
         var repo = RepoRef.Parse(changeset.Repo);
+        if (await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct) != ControlState.Running)
+            return await OutcomeAsync(item, $"repository {repo} held; its changeset is not delivered", ct);
         var empty = several ? null : since.LastOrDefault(e => e.Step == Steps.ChangesetEmpty)?.Detail;
         var how = ChangesetDelivery.Empty;
         // A changeset pull request of this plan that someone merged by hand (an escalated one, say): the changeset is delivered.
@@ -616,7 +626,7 @@ public sealed partial class RunPipeline
         {
             return await ClosePlanAsync(item, storyId, stories, known, since, empty, ct);
         }
-        if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var control)
+        if (await _controls.EffectiveInRepositoryAsync(item.ExternalId, item.EpicId, repo.FullName, ct) is not ControlState.Running and var control)
         {
             log.WriteLine($"[{item.State}] {item.ExternalId} is {control} by a control; its changeset pull request is not opened");
             return await OutcomeAsync(item, null, ct);

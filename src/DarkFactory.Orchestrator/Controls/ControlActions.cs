@@ -127,8 +127,10 @@ public sealed class ControlActions(
             // The factory scope stops every source's items; an epic scope only those of the epic's own source (the same number
             // is another epic in another source).
             var (epicSource, epicNumber) = (epic?.Naming.Source, epic?.Id);
+            var repository = ControlScope.RepositoryOf(scope)?.Key;
             var items = await db.WorkItems.AsNoTracking()
                 .Where(i => i.State != WorkState.Done && i.State != WorkState.Cancelled
+                    && (repository == null || i.Repo.ToLower() == repository)
                     && (epicSource == null || (i.Source == epicSource && i.EpicId == epicNumber)))
                 .OrderBy(i => i.Id)
                 .Select(i => new { i.Source, i.ExternalId })

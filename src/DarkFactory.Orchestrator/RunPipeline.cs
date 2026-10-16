@@ -951,6 +951,10 @@ public sealed partial class RunPipeline(
         }
         if (known is not null)
         {
+            // A waiting plan coordinates each repository independently; a gate pass uses its recorded pass repository.
+            if (known.State != WorkState.Planned && !Lifecycle.IsTerminal(known.State))
+                knownControl = await RepositoryControlAsync(known.ExternalId, known.EpicId, known.Repo, ct);
+            if (knownControl == ControlState.Stopping) return await StopIdleAsync(known, storyId, ct);
             if (knownControl == ControlState.Paused)
             {
                 log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");
@@ -996,17 +1000,10 @@ public sealed partial class RunPipeline(
         }
         // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
-        if (recovery is not null)
+        if (known is null && await RepositoryControlAsync(Naming.Format(storyId), spec.Epic?.Id, primary.FullName, ct) != ControlState.Running)
         {
-            if (!backgroundRecovery) await recovery.AdvanceAsync(primary.FullName, ct);
-            if (await recovery.HeldAsync(primary.FullName, ct) is { } incident)
-            {
-                if (backgroundRecovery) recovery.Schedule(primary.FullName, log, ct);
-                var why = $"repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}";
-                log.WriteLine($"[recovery] {why}");
-                // This is NOT a factory-wide Deferred: unrelated items of this same intake lane must still run.
-                return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, why);
-            }
+            // A repository hold is not a factory-wide Deferred: the next item in this lane may target another repository.
+            return new RunOutcome(0, WorkState.Intake, null, null, $"repository {primary} held by hot-file recovery or a control");
         }
         var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, primary.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
@@ -1848,7 +1845,25 @@ public sealed partial class RunPipeline(
         }
     }
 
-    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control; `factory continue` resumes it.";
+    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control or repository recovery; only human Continue lifts a manual pause.";
+
+    private async Task<ControlState> RepositoryControlAsync(string externalId, long? epicId, string repository, CancellationToken ct)
+    {
+        var held = false;
+        if (recovery is not null)
+        {
+            if (!backgroundRecovery) await recovery.AdvanceAsync(repository, ct);
+            if (await recovery.HeldAsync(repository, ct) is { } incident)
+            {
+                held = true;
+                if (backgroundRecovery) recovery.Schedule(repository, log, ct);
+                log.WriteLine($"[recovery] repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}");
+            }
+        }
+        // Read AFTER assessment: a Pause/Stop may have landed while it ran. Never synthesize Running from a safe answer.
+        var state = await _controls.EffectiveInRepositoryAsync(externalId, epicId, repository, ct);
+        return state == ControlState.Running && held ? ControlState.Paused : state;
+    }
 
     private async Task ThrowIfControlledAsync(WorkItem item, CancellationToken ct)
     {
@@ -1872,6 +1887,8 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[frozen] {item.ExternalId}: {frozen.Message}");
             throw new ControlRequestedException(ControlState.Paused) { Frozen = frozen };
         }
+        // Detection can have persisted a repository incident during the evaluation above, and a human control may have moved.
+        await ThrowIfControlledAsync(item, ct);
     }
 
     /// <summary>The freeze evaluator's answer, its notes (what it passed over, e.g. a base branch GitHub no longer has) logged.</summary>
@@ -1926,8 +1943,8 @@ public sealed partial class RunPipeline(
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
         List<string> scopes = ItemNaming.EpicOf(item.ExternalId, item.EpicId) is { } epic
-            ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
-            : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+            ? [ControlScope.Factory, ControlScope.Repository(RepoRef.Parse(item.Repo)), ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
+            : [ControlScope.Factory, ControlScope.Repository(RepoRef.Parse(item.Repo)), ControlScope.Item(item.ExternalId)];
         if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)
         {
             scopes.Add(ControlScope.Item(planItem.ExternalId));

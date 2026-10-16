@@ -25,7 +25,8 @@ public enum ControlState
 
 /// <summary>
 /// Control scopes: <c>factory</c>, <c>usage</c>, <c>freeze</c>, an epic's — <c>epic:&lt;id&gt;</c> for a Shortcut epic, <c>epic:kb-&lt;key&gt;</c>
-/// for a Kanban epic (sc-25985) — or an item's: <c>item:sc-&lt;id&gt;</c>, <c>item:gh-&lt;key&gt;</c>, <c>item:kb-&lt;key&gt;</c>.
+/// for a Kanban epic (sc-25985) — a human repository scope <c>repo:owner/name</c>, or an item's:
+/// <c>item:sc-&lt;id&gt;</c>, <c>item:gh-&lt;key&gt;</c>, <c>item:kb-&lt;key&gt;</c>.
 /// </summary>
 public static class ControlScope
 {
@@ -74,8 +75,21 @@ public static class ControlScope
             ? epic
             : null;
 
+    /// <summary>A human repository control, separate from automatic recovery incidents.</summary>
+    public static string Repository(RepoRef repo) => "repo:" + repo.Key;
+
+    public static RepoRef? RepositoryOf(string scope)
+    {
+        if (!scope.StartsWith("repo:", StringComparison.Ordinal)) return null;
+        var name = scope[5..];
+        // Scope keys must be canonical and usable in every consumer, not merely splittable by RepoRef.Parse.
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-z0-9_-][a-z0-9_.-]*/[a-z0-9_-][a-z0-9_.-]*$")) return null;
+        var repo = RepoRef.Parse(name);
+        return Repository(repo) == scope ? repo : null;
+    }
+
     /// <summary>Whether <paramref name="scope"/> is a well-formed scope.</summary>
-    public static bool IsValid(string scope) => scope == Factory || scope == Usage || scope == Freeze || ItemOf(scope) is not null || EpicOf(scope) is not null;
+    public static bool IsValid(string scope) => scope == Factory || scope == Usage || scope == Freeze || ItemOf(scope) is not null || EpicOf(scope) is not null || RepositoryOf(scope) is not null;
 }
 
 /// <summary>The factory-wide usage pause (<see cref="ControlScope.Usage"/>): its reasons and backoff.</summary>
@@ -112,6 +126,20 @@ public interface IControls
     /// paused while the plan item is, and being stopped while the plan item is unless the factory already merged it.
     /// </summary>
     Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct);
+
+    /// <summary>
+    /// Composes the item's human/global/plan controls with the repository this operation targets. A waiting multi-repository
+    /// plan uses this per child/pass, never its primary repository to hold unrelated children. Human item/epic/plan and global
+    /// controls still apply. No incident grant or manual-control bypass is implied.
+    /// </summary>
+    async Task<ControlState> EffectiveInRepositoryAsync(string externalId, long? epicId, string repository, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        var state = await EffectiveAsync(externalId, epicId, ct);
+        if (state != ControlState.Running) return state;
+        return (await GetAsync(ControlScope.Repository(RepoRef.Parse(repository)), ct)) is { State: ControlState.Paused }
+            ? ControlState.Paused : state;
+    }
 
     /// <summary>Every scope's control row.</summary>
     Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct);
@@ -173,10 +201,21 @@ public sealed class NoControls : IControls
 /// </summary>
 public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, TimeProvider time) : IControls
 {
-    public async Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
+    public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct) =>
+        EffectiveCoreAsync(externalId, epicId, null, resolveRepository: true, ct);
+
+    public Task<ControlState> EffectiveInRepositoryAsync(string externalId, long? epicId, string repository, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(repository);
+        return EffectiveCoreAsync(externalId, epicId, repository, resolveRepository: false, ct);
+    }
+
+    private async Task<ControlState> EffectiveCoreAsync(string externalId, long? epicId, string? repository, bool resolveRepository, CancellationToken ct)
     {
         var own = ControlScope.Item(externalId);
         var scopes = new List<string> { ControlScope.Factory, ControlScope.Usage, ControlScope.Freeze, own };
+        var repoKey = repository is null ? null : RepoRef.Parse(repository).Key;
+        if (repoKey is not null) scopes.Add(ControlScope.Repository(RepoRef.Parse(repoKey)));
         // The epic of the item's own source (sc-25985): a Kanban item is held to `epic:kb-<key>`, never to the Shortcut epic whose
         // number its epic's key happens to be. One more scope in the one query.
         if (ItemNaming.EpicOf(externalId, epicId) is { } epic)
@@ -191,7 +230,21 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
         var source = ItemNaming.ParseAny(externalId)?.Naming.Source;
         var planScopes = db.WorkItems.Where(s => s.Source == source && s.ExternalId == externalId && s.PlanItemId != null)
             .Join(db.WorkItems, s => s.PlanItemId, p => (long?)p.Id, (s, p) => ControlScope.ItemPrefix + p.ExternalId);
-        var rows = await db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope) || planScopes.Contains(c.Scope)).ToListAsync(ct);
+        // Resolve repository scope inside the same query as human/plan controls. Planned coordinates children separately;
+        // during a gate pass WorkItem.Repo names that pass. No extra per-second repository or incident round trip.
+        var repositories = db.WorkItems.Where(i => i.Source == source && i.ExternalId == externalId && i.State != WorkState.Planned)
+            .Select(i => i.Repo.ToLower());
+        var repositoryScopes = repositories.Select(r => "repo:" + r);
+        var manual = db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope) || planScopes.Contains(c.Scope)
+                || (resolveRepository && repositoryScopes.Contains(c.Scope)))
+            .Select(c => new { c.Scope, Stopping = c.State == ControlState.Stopping, Paused = c.State == ControlState.Paused, c.ResumeAt });
+        var automatic = db.HotFileIncidents.AsNoTracking().Where(i => i.State != "Resolved"
+                && (resolveRepository ? repositories.Contains(i.Repo) : repoKey != null && i.Repo == repoKey))
+            .Select(i => new { Scope = "recovery", Stopping = false, Paused = true, ResumeAt = (DateTimeOffset?)null });
+        // These are read-only effective reasons, never persisted control rows and never a synthetic Running authorization.
+        var rows = (await manual.Concat(automatic).ToListAsync(ct))
+            .Select(r => new Control { Scope = r.Scope, State = r.Stopping ? ControlState.Stopping : r.Paused ? ControlState.Paused : ControlState.Running,
+                ResumeAt = r.ResumeAt, ChangedBy = "" }).ToList();
         var now = time.GetUtcNow();
         if (rows.Any(r => r.State == ControlState.Stopping && r.Scope == own))
         {
@@ -205,7 +258,9 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
         {
             return ControlState.Stopping;
         }
-        return rows.Any(r => r.PausesAt(now)) ? ControlState.Paused : ControlState.Running;
+        // Stop wins even during recovery. Safe resolution changes only incident rows; it never replaces human controls.
+        if (rows.Any(r => r.PausesAt(now))) return ControlState.Paused;
+        return ControlState.Running;
     }
 
     public async Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct)
@@ -315,11 +370,11 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         if (!ControlScope.IsValid(scope))
         {
-            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key> or item:kb-<n>).", nameof(scope));
+            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, repo:<owner/name>, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key> or item:kb-<n>).", nameof(scope));
         }
         if (state == ControlState.Stopping && ControlScope.ItemOf(scope) is null)
         {
-            throw new ArgumentException("Only an item is stopped through its control; stop an epic or the factory item by item.", nameof(state));
+            throw new ArgumentException("Only an item is stopped through its control; stop a repository, epic or the factory item by item.", nameof(state));
         }
         for (var attempt = 1; ; attempt++)
         {
