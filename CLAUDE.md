@@ -230,10 +230,12 @@ it replaced the Weave router fork at `localhost:8080`, sc-26197).
   missing (the convention since Phase 1, kept): skipped is not passed.
   Phase 5's P5-AT1–AT7 (sc-26134, docs/acceptance.md "Phase 5"; `SwiftAcceptanceTests`, `SwiftRealRunTests`, helpers
   `SwiftLive.cs`, the non-live `SwiftLiveTests`): a LensWorks change with a new Swift Testing test merged by a real
-  implementer and panel; seeded SwiftPM (XCTest) and iOS (unit and UI test on a simulator) changes merged; the gate refusing
-  a Swift change merged recording `no CodeGraph data` while CodeGraph does not index Swift (P5-AT5a), and merged on CodeGraph's
-  data of it once it does (P5-AT5b); a Swift test already passing on the base rejected;
-  and a read-only check of the real ledger after a real LensWorks epic and iOS change. Each needs `Worker:Swift=true` and its
+  implementer and panel; seeded SwiftPM (XCTest) and iOS (unit and UI test on a simulator) changes merged; a Swift change
+  merged with the gate recording `no CodeGraph data` for its Swift files while CodeGraph does not index Swift (P5-AT5a), and the
+  same change merged on CodeGraph's data of each Swift file read at the PR head once it does (P5-AT5b, checked by the pure
+  `SwiftLive.BlastRadiusAtHeadProblem`); a Swift test already passing on the base rejected;
+  and a read-only check of the real ledger after a real LensWorks epic and iOS change (each listed item's last verdict a pass of
+  the real high-class panel for the head the gate passed, `SwiftLive.PanelProblem`). Each needs `Worker:Swift=true` and its
   `FACTORY_E2E_P5_*` variable; none depends on CodeGraph (sc-26254) but P5-AT5a (skips once CodeGraph indexes Swift) and P5-AT5b
   (skips until it does: C3, sc-26137). The seeds the target
   repositories hold once are `tests/DarkFactory.AcceptanceTests/Seeds/` (a SwiftPM package, an iOS app).
@@ -2316,7 +2318,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   error and not a step failure) AND the PR changes `.factory/prepare.yaml`, the base is prepared with the HEAD's recipe (its
   artifacts and its steps) and the new-tests result's reason — so the gate's `new-tests` row — says so ("base prepared with the
   head's recipe: the base's own recipe could not be fetched: …"); without it, every PR of such a repository would be an `error`,
-  the one fixing the recipe included, and only a human could break the deadlock. Then in EVERY strategy's runs
+  the one fixing the recipe included, and only a human could break the deadlock. Residual of decision A, accepted (sc-26134,
+  behaviour unchanged): the base is then built and its new tests run with the HEAD's recipe — the PR's own, reviewed only by the
+  panel of this PR (`.factory/` calls the security review in) — so its steps, not the base's, prepare the base run whose result
+  the check judges ("a new test fails on the base"); a head recipe whose steps break the base would make the base's tests fail and
+  so pass that half of the check. Said in the `new-tests` row's reason every time it applies. Then in EVERY strategy's runs
   (xUnit, cargo, SwiftPM, Xcode macOS and iOS: `NewTestsCheck.RunAsync`'s `prepared`, `PrepareSteps.Before`) the commit's own
   steps run after the strategy's toolchain probes and before its restore — the base runs and their retries the base's (the
   overlay applies only test files, and never anything under `.factory/`, whatever a strategy counts as a test file:
@@ -2350,11 +2356,21 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   worker planted at that name is replaced, never followed). Each request id is answered exactly once: passes over a spool never
   overlap (`PrepareSpoolSession.PollOnceAsync` waits for the pass before it, so a pass returns only once every complete request
   it saw is answered), and a pass that throws is logged and the next one still runs (sc-26134). A session's spool is answered with a fetch at most
-  `WorkerPrepare.MaxRequestsPerSession` (20) times; every later request is answered `error` at once. A failed fetch is answered
+  `WorkerPrepare.MaxRequestsPerSession` (20) times; every later request is answered `error` at once. And what one session's
+  requests may add to the cache is bounded (sc-26134; `WorkerPrepare.MaxSessionBytes`, a code constant, 40 GiB = twice the
+  largest artifact a recipe may declare, unpacked): before anything is fetched, a request counts the declared limits —
+  `max_bytes`, plus `max_unpacked_bytes` for an archive — of each artifact it names that the cache does not hold yet (an entry
+  already there costs nothing); one that would take the session past the budget is refused whole (`error`, why, and the same as a
+  failed `artifact-fetch` row), nothing fetched. A failed fetch is answered
   with `ArtifactFetchException.WorkerMessage` — for a hash mismatch "… does not match the pinned sha256 <pinned>", never the
   served bytes' hash — while the full reason is an `artifact-fetch` `failed: …` checkpoint. The spool's downloads and failures
   are checkpointed once the session ends (the session's own stream writes the ledger meanwhile); the spool is removed with the
-  session. Start-up and every run's start with `Worker:Prepare` read the installed `factory-prepare` and refuse a missing or stale
+  session. Stale spools (sc-26134): sessions overlap (several runs, and a `factory run` beside `factory work`, share the spool
+  root), so a dead process's leftovers are found by a lock, never by "no other session exists": each session holds an exclusive
+  lock on `<spool root>/<guid>.lock` (owner-only `0600`, `FileShare.None` — an `flock`, freed by the OS when its holder dies) from
+  BEFORE its directory is made until AFTER it is removed, and every `OpenAsync` first sweeps the root (`WorkerPrepare.SweepStale`):
+  a spool directory or lock file whose lock it can take is a dead process's and is removed (directory, then lock file); one whose
+  lock is held is a live session's and is left alone. Start-up and every run's start with `Worker:Prepare` read the installed `factory-prepare` and refuse a missing or stale
   one (`PrepareTool.EnsureCurrentAsync`, factory-wide). Taint, said plainly: a worker's `factory-prepare` runs the recipe in its
   worktree as it is then — the worker's own, UNREVIEWED edit, at whatever URLs and hashes it names — and the steps' output (and
   so whatever those artifacts make them print) reaches the session. The session is not tainted for it: accepted, the residual
@@ -2363,20 +2379,25 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   accepted: (a) a step, like `cargo build`'s build script, runs repository code as the sandbox user, which can reach the network
   — nothing in the recipe's schema contains that (no program list is kept, above); (b) a worker that edits the recipe can make
   `factory-prepare` run any program as itself — no more than its build's own code could; and since it can add files to its spool it could forge an answer for its own `factory-prepare`, which
-  again runs only as itself; (c) the cache has no size bound or eviction (each entry is at most `max_unpacked_bytes`); remove
-  `<WorkRoot>/artifact-cache` by hand to reclaim it; (d) a worker's prefetch and spool downloads run inside its worker phase (the
+  again runs only as itself; (c) the cache has no total size bound or eviction (each entry is at most `max_unpacked_bytes`): one
+  session's requests are bounded by `MaxSessionBytes`, but a worker's own recipe edit can still fill up to that much per session,
+  across sessions (and the prefetch before each session fetches whatever the worktree's recipe — possibly a worker's committed,
+  unreviewed edit of an earlier session of the same item — declares, at most one recipe's limits: 16 artifacts of `max_bytes` plus
+  `max_unpacked_bytes` each), and nothing evicts it; remove `<WorkRoot>/artifact-cache` by hand to reclaim it; (d) a worker's prefetch and spool downloads run inside its worker phase (the
   worktree exists only there); the gate's run outside it; (e) a Bash call has its own timeout (at most 10 minutes), so a very
   long recipe needs the worker to give it one; (f) a `.partial-*` store still unpacking after `ArtifactFetcher.DefaultTimeout`
   could be swept by another process's first use, failing that store (an error, fetched again next time). Tests:
   `PrepareRecipeTests`/`ArtifactAddressTests` (schema, refusals, SSRF rules, the connect order), `ArtifactFetchTests` (fake
   server: hash, size, redirects, ports, DNS to a private address, archives, a changed, partial or unreadable entry, the
-  verification memo, the sweep; on macOS the real ACLs with the role account `nobody`, nested directories included),
+  verification memo, the sweep; on macOS the real ACLs with the role account `nobody`, nested directories included; the
+  production transport `ArtifactTransport.Handler` refusing a private address in its connect callback, no proxy, no redirect),
   `PrepareGateTests` (every strategy runs each commit's own recipe; E7 without one, with one read of the changes; failures;
   decision A both ways; the stage's timeout; a cache root that cannot be set up; nothing of `.factory/` overlaid; the pipeline's
   `artifact-fetch` row), `PrepareRealRunTests` (the owner's real SwiftPM build
   of a package that needs the artifact, served by a local HTTP server through injected resolver and transport seams — the
   production rules unchanged), `WorkerPrepareTests` (the real script over a real spool, the pipeline's prefetch and spool —
-  also with no recipe —, the answer's wording and the ledger's full reason, the request cap, `.factory` swapped for a link
+  also with no recipe —, the answer's wording and the ledger's full reason, the request cap, the session byte budget, the sweep of
+  a dead process's spools beside a live one, `.factory` swapped for a link
   between the check and the read, tools, `PrepareTool`), `SetupScriptTests`, `FactoryOptionsTests`. Setup: re-run `sudo scripts/setup-worker-user.sh [--slots n]`
   to install `factory-prepare` before setting `Worker__Prepare=true`.
 - Untrusted-input taint (E4, sc-25386, `Worker/Taint.cs`): a worker session that has read untrusted content is tainted — a
@@ -2437,7 +2458,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   unchanged: `/opt/homebrew/bin` or `/usr/local/bin`) — where it is not, the commands fail and the worker is where it was before.
   The result goes back through review, CI and the gate. Swift (sc-26127): `Bash(swift build:*)` and `Bash(swift test:*)`
   (`ClaudeWorker.SwiftTools`), with the same residuals — the manifest, plugins and macros are code SwiftPM runs, and a build
-  resolves dependencies over the network; `swift run`, `swift package`, `swift repl` and `swift <script>` are denied.
+  resolves dependencies over the network; `swift run`, `swift package`, `swift repl` and `swift <script>` are denied. Named
+  plainly (sc-26134), what follows the prefix is the worker's, as for cargo's (a): `--disable-sandbox` (SwiftPM then runs the
+  manifest and plugins outside its own macOS sandbox — still as the sandbox user, in the launch helper's sandbox),
+  `--scratch-path`/`--cache-path` (and `--config-path`, `--security-path`) outside the worktree (SwiftPM writes build products
+  and caches there — anywhere the sandbox user may write: its own home, its own slot's other worktrees, never another slot's),
+  `-Xswiftc`/`-Xcc`/`-Xlinker` and `-Xxcbuild` (flags passed straight to the compiler, the C compiler, the linker or the XCBuild
+  build system, e.g. a plugin or load path) — accepted, the residual of (b): code and tools the repository supplies, as the
+  sandbox user with no credential but the router key, all of it back through review, CI and the gate.
   Triage and the planner gain none of this: `WorkerTools.ReadOnly` has no
   allow rule but its read rule and denies `Bash` by name.
   Swift toolchain (Phase 5, sc-26130; `scripts/factory-xcodebuild`, `Worker/SwiftToolchain.cs`): the only xcodebuild command a
@@ -2464,7 +2492,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (the test actions only; ids may hold `:` and `()`, e.g. Swift Testing's `f(x:)`), `-parallel-testing-enabled NO` (exactly that
   value; the test actions only), `-resultBundlePath <relative>.xcresult` (the same path rule; e.g. the gate's
   `.factory-test-results-<guid>/r.xcresult`) and `-quiet`; and one read-only query, `-list` (a worker needs a scheme's name; it
-  builds nothing — `-showdestinations` is not offered). It refuses (exit 64, nothing run) every other action (`archive`,
+  builds nothing — `-showdestinations` is not offered). Beyond E2's `build`/`test`, three forms are accepted on purpose
+  (sc-26134, stated so): `test-without-building` (runs the products of an earlier `build-for-testing` of the same working directory
+  — its per-worktree DerivedData — the gate's two-step run), `-list` (read-only, above) and the `clean-derived-data` form below
+  (removes only that working directory's own DerivedData, under the user's own home); none signs, archives, exports or reaches a
+  device. It refuses (exit 64, nothing run) every other action (`archive`,
   `-exportArchive`, `analyze`, `clean`, …), every `NAME=value` build-setting override (signing, team, profiles, flags, output
   directories), `-xcconfig`, `-xctestrun`, `-testPlan`, `-allowProvisioningUpdates` and every other account/signing/export flag,
   `-derivedDataPath`/`-clonedSourcePackagesDirPath`/`-skipMacroValidation`/`-skipPackagePluginValidation` (it sets them itself),
@@ -2884,14 +2916,35 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   neither commit is unreadable. A hotspot answer is reused by the read after an overlay requested again while the ready overlay's
   base is its index commit (`HotspotCache`, keyed by `indexCommitSha` — the commit the lookup names). "The hotspot score" is
   CodeGraph's `riskScore`. CodeGraph is optional (sc-26254, owner decision 2026-10-15: "The factory should be able to work with or
-  without CodeGraph"): its inputs are used when available, and every touched file it gives no usable input for is recorded as
-  having NO CODEGRAPH DATA, with why (`NoCodeGraphData`, `CodeGraphRisk.NoData`), and judged on its other inputs (changed lines and
-  files, fix rounds, the changeset limits) — never pending, never blocked for it. What is left as no data — the owner's decision
-  (2026-10-15), stated as the residual: CodeGraph UNAVAILABLE — not configured (no token: `GateStage.Risk` null, `CodeGraph is not
-  configured (no CodeGraph token: …)`), down after the retries below, refusing (HTTP 403 `tool_not_entitled`, another 4xx), the
-  repository or the file's language not indexed (below), or BOTH the head-overlay read and the default-branch read of a file's blast
-  radius failing — and, per file and tool, an error answer, an answer for another commit or another file, inputs read for another
-  head or leaving a file out. A misread or a transient failure is NOT missing data (sc-26254 review): (1) a blast radius CodeGraph
+  without CodeGraph"; epic E5 as amended): its inputs are used when available, and a touched file CodeGraph gives no input for,
+  for one of the amendment's causes only, is recorded as having NO CODEGRAPH DATA, with why (`NoCodeGraphData`,
+  `CodeGraphRisk.NoData`), and judged on its other inputs (changed lines and files, fix rounds, the changeset limits) — never
+  pending, never blocked for it. Those causes: CodeGraph MISSING OR UNREACHABLE — not configured (no token: `GateStage.Risk` null,
+  `CodeGraph is not configured (no CodeGraph token: …)`), down after the retries below, refusing over HTTP (403
+  `tool_not_entitled`, another 4xx), the whole read cut off at the backstop below; the REPOSITORY NOT INDEXED (`search_projects`
+  names no project for it); the file's LANGUAGE NOT INDEXED (below); and C4's typed `notIndexed` for the head whose default-branch
+  read then finds nothing either (itself `notIndexed`, or unreachable). Everything
+  else a REACHABLE CodeGraph answers that cannot be used is a MISREAD, never no data (sc-26134, coordinator decision on the
+  feature-end review): it BLOCKS `risk-threshold` like an unrecognised blast radius, and the item escalates
+  (`CodeGraphMisread`, `CodeGraphRisk.Misread`; the reason ``risk threshold: CodeGraph misanswered (<why>): <files>`` per reason,
+  `CodeGraphRisk.MisreadReasons`, and the gate row's ``; CodeGraph misanswered: <why>: <files>``). A misread: per file, an
+  `analyze_impact_file` answer for the head that is an error other than the typed `notIndexed`, names another commit or another
+  file, or has no `found` — after which that file's blast radius is read from the default branch (as for no ready overlay, (3)
+  below), and only if that read is unusable too (an error, `notIndexed`, no commit, from an overlay, another file, no `found`, or
+  CodeGraph unreachable for it) is the file a misread, both reasons recorded (``blast radius: <why not at the head>; on the default
+  branch: <why>``); with no head read (no ready overlay), a default-branch answer that is unusable for any reason but the typed
+  `notIndexed` or CodeGraph unreachable; any unusable `file_hotspot` answer (an error, no commit, not from the default branch,
+  another file, no `found`, no or an invalid `riskScore`) — a HOTSPOT misread (`CodeGraphMisread.Hotspot`), which blocks only
+  where the policy sets `max_hotspot`: with `max_hotspot: off` or a version 2 policy the hotspot is not judged, so its misread is
+  only recorded in the gate row (``…: <why> (hotspot, not judged: no max_hotspot): <files>``) and the gate decides on the rest
+  (`CodeGraphRisk.MisreadReasons(hotspotJudged)`); a touched file the inputs leave out (`CodeGraphRisk.LeftOut`: its blast radius
+  — a misread under any policy — or only its hotspot — a hotspot misread), never no data, so a reader bug cannot fail open; and
+  every file of inputs read for another head (`MergeGate`'s `Judged`: `CodeGraphRisk.AllMisread`). Blast-radius misreads always
+  block. A file whose language CodeGraph says it does not index is no data; a tool's own `languageIndexed: false` explains that
+  tool's unusable answer about the file, never the other tool's, whose misread stands (`UnindexedFile.ByImpact`/`ByHotspot`,
+  `CodeGraphRisk.Judged`). There is no wait for a misread to clear: the gate reads CodeGraph
+  once per evaluation (below) and escalates; the owner's re-run reads it again. A transient failure is NOT missing data either
+  (sc-26254 review): (1) a blast radius CodeGraph
   answers for a found file is parsed in any case (`BlastRadii.TryParseAnswer`; the policy's own `max_blast_radius` stays lowercase
   only), and one the gate does not recognise BLOCKS (`UnrecognisedBlastRadius`, `CodeGraphRisk.Unrecognised`: "risk threshold:
   CodeGraph answered an unrecognised blast radius `<value>` for <file>", the value shown only as a plain word); (2) a call that
@@ -2903,8 +2956,10 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `sha`, an answer that names its commit and comes from `source: default-branch` only, recorded with that commit
   (`FileBlastRadius.DefaultBranchCommit`) and labelled ``codegraph blast radius on the default branch as of <sha>, not the PR
   head``, and held to the same floor and `max_blast_radius` (a failure says `blast radius on the default branch as of <sha>, not
-  the PR head, over …`); only if that read fails too is the file without data, both reasons recorded (``blast radius: <why not
-  at the head>; on the default branch: <why>``); (4) a file whose language CodeGraph does not index keeps whatever data CodeGraph
+  the PR head, over …`); the same default-branch read stands in, for that file alone, for a head answer that is a misread (above);
+  only if the default-branch read is `notIndexed` or cannot be made, after a head that was `notIndexed` or not ready, is the file
+  without data, both reasons recorded (``blast radius: <why not at the head>; on the default branch: <why>``) — any other unusable
+  default-branch answer is a misread; (4) a file whose language CodeGraph does not index keeps whatever data CodeGraph
   did answer for it (`found: true`: a critical from one tool still blocks), only the missing part recorded (``hotspot: its
   language …`` / ``blast radius: its language …``; `CodeGraphRisk.Judged`, `UnindexedFile.Missing`). The reader
   (`CodeGraphRiskReader`) goes on past an unusable answer to the next file; a call that cannot be made at all (after its retries,
@@ -2947,7 +3002,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   ``no CodeGraph data: <reason>: <file>, …`` per reason, each reason's files and the reasons capped likewise
   (`CodeGraphRisk.NoDataText`) — so one row stays inside the reports' budget; a Merge's reason adds `no CodeGraph data for N of M
   file(s), judged on size and fix rounds`. The reports (PR body, closeout, escalation comment: `LedgerReport`) show a `gate`
-  row's no-data list on its own, after the row's clipped text (`CodeGraphRisk.NoDataMark`, at most 2,000 characters), found by a
+  row's no-data list on its own, after the row's clipped text up to it (so it is said once, sc-26134; `CodeGraphRisk.NoDataMark`,
+  at most 2,000 characters), found by a
   separator no other text of the row can hold (`CodeGraphRisk.Separator`, U+241E: every path, reason and CodeGraph text of the
   row, the decision's reasons included, goes through `CodeGraphRisk.Inert`), so CodeGraph's text cannot move the split; a failure's
   reason names each file over the limit with its blast radius (or hotspot score), so the escalation comment and the PR report (both

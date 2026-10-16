@@ -123,10 +123,14 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
     {
         Directory.CreateDirectory(spoolRoot);
         await WorkerSandbox.ResetAsync(spoolRoot, sandbox is null ? UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute : SpoolRootMode, ct);
-        var directory = Path.Combine(spoolRoot, Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(directory);
+        SweepStale(spoolRoot, log);
+        var id = Guid.NewGuid().ToString("N");
+        // The session's lock is taken before its directory exists, so a sweep never finds a live session's directory unlocked.
+        var held = TryLock(spoolRoot, id) ?? throw new IOException($"the new request spool's lock {LockOf(spoolRoot, id)} is held by another process");
+        var directory = Path.Combine(spoolRoot, id);
         try
         {
+            Directory.CreateDirectory(directory);
             if (sandbox is null)
             {
                 await WorkerSandbox.ResetAsync(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, ct);
@@ -138,10 +142,91 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
         }
         catch
         {
-            Directory.Delete(directory, recursive: true);
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+            Release(spoolRoot, id, held);
             throw;
         }
-        return new PrepareSpoolSession(this, directory, worktree, onDownloaded, onFailed, log);
+        return new PrepareSpoolSession(this, directory, worktree, onDownloaded, onFailed, log, held);
+    }
+
+    private static readonly Regex SpoolId = new("^[0-9a-f]{32}$", RegexOptions.CultureInvariant);
+
+    /// <summary>A session's lock file, beside its directory in the spool root: <c>&lt;id&gt;.lock</c>, the owner's alone (0600).</summary>
+    internal static string LockOf(string root, string id) => Path.Combine(root, $"{id}.lock");
+
+    /// <summary>
+    /// The session <paramref name="id"/>'s lock, held (an exclusive <c>flock</c>: <c>FileShare.None</c> on Unix, between processes and
+    /// within one), or null when another holder has it — a live session.
+    /// </summary>
+    internal static FileStream? TryLock(string root, string id)
+    {
+        var options = new FileStreamOptions { Mode = FileMode.OpenOrCreate, Access = FileAccess.ReadWrite, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows())
+        {
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+        try
+        {
+            return new FileStream(LockOf(root, id), options);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Removes a held lock's file, then lets the lock go.</summary>
+    internal static void Release(string root, string id, FileStream held)
+    {
+        try
+        {
+            File.Delete(LockOf(root, id));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Left behind: the next sweep removes an unheld lock file.
+        }
+        held.Dispose();
+    }
+
+    /// <summary>
+    /// Removes what a process that died left in the spool root (sc-26134): every session directory whose lock no live session holds
+    /// (a live session takes its lock before it makes its directory and lets it go only after removing it), and every lock file no one
+    /// holds whose directory is gone. Sessions overlap — several runs, and a <c>factory run</c> beside <c>factory work</c>, share the
+    /// root — so nothing is removed from "no other session exists". A directory that cannot be removed is logged and left for the next sweep.
+    /// </summary>
+    internal static void SweepStale(string root, TextWriter log)
+    {
+        var ids = Directory.EnumerateFileSystemEntries(root).Select(Path.GetFileName).OfType<string>()
+            .Select(n => n.EndsWith(".lock", StringComparison.Ordinal) ? n[..^".lock".Length] : n)
+            .Where(n => SpoolId.IsMatch(n)).Distinct(StringComparer.Ordinal).ToList();
+        foreach (var id in ids)
+        {
+            if (TryLock(root, id) is not { } held)
+            {
+                continue; // a live session's
+            }
+            var directory = Path.Combine(root, id);
+            try
+            {
+                if (Directory.Exists(directory))
+                {
+                    // The owner's directory: the worker could only add files to it, and links are removed, not followed.
+                    Directory.Delete(directory, recursive: true);
+                    log.WriteLine($"[prepare] removed the request spool {directory}, which a process that died left");
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                log.WriteLine($"[prepare] could not remove the stale request spool {directory}: {ex.Message}");
+                held.Dispose();
+                continue;
+            }
+            Release(root, id, held);
+        }
     }
 
     /// <summary>
@@ -158,18 +243,49 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
     public const int MaxRequestsPerSession = 20;
 
     /// <summary>
+    /// The most one session's requests may add to the never-evicted artifact cache (sc-26134), counted at each artifact's declared
+    /// limits — <c>max_bytes</c>, plus <c>max_unpacked_bytes</c> for an archive — for every artifact a request names that the cache
+    /// does not hold yet, before anything is downloaded: room for the largest artifact a recipe may declare, unpacked, twice (a
+    /// re-pin). A request that would pass it is refused whole, nothing fetched.
+    /// </summary>
+    public const long MaxSessionBytes = 2 * (PrepareRecipe.MaxArtifactBytes + PrepareRecipe.MaxUnpackedLimit);
+
+    /// <summary>
+    /// What a request of <paramref name="recipe"/> may add to the cache: the declared limits of its artifacts the cache does not hold
+    /// yet (<see cref="MaxSessionBytes"/>).
+    /// </summary>
+    internal long Cost(PrepareRecipe recipe) => recipe.Artifacts
+        .Where(a => !Directory.Exists(fetcher.Cache.EntryOf(a)) && !File.Exists(fetcher.Cache.EntryOf(a)))
+        .Sum(a => a.MaxBytes + (a.Unpack == ArtifactUnpack.None ? 0 : a.MaxUnpackedBytes));
+
+    /// <summary>
     /// Answers one request of a session in <paramref name="worktree"/>: <c>ok</c> and the worker plan
     /// (<see cref="PrepareSteps.WorkerPlan"/>), or <c>error</c> and why — NUL-terminated fields. A fetch that fails is answered with
     /// <see cref="ArtifactFetchException.WorkerMessage"/> (never the served bytes' hash); the full message goes to
-    /// <paramref name="onFailed"/> (the ledger).
+    /// <paramref name="onFailed"/> (the ledger). <paramref name="budget"/>: what the session's earlier requests counted against
+    /// <see cref="MaxSessionBytes"/>; a request that would pass it is refused before anything is fetched.
     /// </summary>
     internal async Task<string> AnswerAsync(string worktree, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded, CancellationToken ct,
-        Action<string>? onFailed = null)
+        Action<string>? onFailed = null, SessionBudget? budget = null)
     {
         var (recipe, error) = ReadRecipe(worktree);
         if (recipe is null)
         {
             return Error(error ?? $"there is no {PrepareRecipe.Path} in the worktree");
+        }
+        if (budget is not null)
+        {
+            var cost = Cost(recipe);
+            if (budget.Spent + cost > MaxSessionBytes)
+            {
+                var why = $"the artifacts this recipe names that are not cached yet may take {cost} bytes (max_bytes, plus max_unpacked_bytes "
+                    + $"for an archive), and this session's requests have already counted {budget.Spent}: more than the {MaxSessionBytes} bytes "
+                    + "a session may add to the artifact cache, so nothing was fetched";
+                onFailed?.Invoke(why);
+                log.WriteLine($"[prepare] a session's request was refused: {why}");
+                return Error(why);
+            }
+            budget.Spent += cost;
         }
         try
         {
@@ -239,12 +355,19 @@ public sealed class WorkerPrepare(ArtifactFetcher fetcher, string spoolRoot, Tex
     }
 }
 
+/// <summary>What one session's requests have counted against <see cref="WorkerPrepare.MaxSessionBytes"/>.</summary>
+internal sealed class SessionBudget
+{
+    public long Spent { get; set; }
+}
+
 /// <summary>A worker session's request spool (<see cref="WorkerPrepare.OpenAsync"/>), polled until disposed; its directory is then removed.</summary>
 public sealed class PrepareSpoolSession : IAsyncDisposable
 {
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _loop;
     private readonly HashSet<string> _handled = new(StringComparer.Ordinal);
+    private readonly SessionBudget _budget = new();
     private readonly SemaphoreSlim _polling = new(1, 1);
     private readonly WorkerPrepare _prepare;
     private readonly string _worktree;
@@ -252,10 +375,12 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
     private readonly Action<string>? _onFailed;
     private readonly TextWriter _log;
 
+    private readonly FileStream _held;
+
     internal PrepareSpoolSession(WorkerPrepare prepare, string directory, string worktree, Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded,
-        Action<string>? onFailed, TextWriter log)
+        Action<string>? onFailed, TextWriter log, FileStream held)
     {
-        (_prepare, Directory, _worktree, _onDownloaded, _onFailed, _log) = (prepare, directory, worktree, onDownloaded, onFailed, log);
+        (_prepare, Directory, _worktree, _onDownloaded, _onFailed, _log, _held) = (prepare, directory, worktree, onDownloaded, onFailed, log, held);
         _loop = prepare.PollsInBackground ? Task.Run(LoopAsync) : Task.CompletedTask;
     }
 
@@ -339,7 +464,7 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
                 else
                 {
                     Fetched++;
-                    answer = await _prepare.AnswerAsync(_worktree, _onDownloaded, ct, _onFailed);
+                    answer = await _prepare.AnswerAsync(_worktree, _onDownloaded, ct, _onFailed, _budget);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -383,6 +508,8 @@ public sealed class PrepareSpoolSession : IAsyncDisposable
         {
             _log.WriteLine($"[prepare] could not remove the request spool {Directory}: {ex.Message}");
         }
+        // Its lock goes last: a directory left above is then the next sweep's to remove.
+        WorkerPrepare.Release(Path.GetDirectoryName(Directory)!, Path.GetFileName(Directory), _held);
         _stop.Dispose();
         _polling.Dispose();
     }

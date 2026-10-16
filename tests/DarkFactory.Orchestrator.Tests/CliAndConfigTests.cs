@@ -210,6 +210,30 @@ public class FactoryOptionsTests
     }
 
     [Fact]
+    public void Worker_swift_defaults_to_off_is_read_validated_and_refused_without_a_sandbox_user()
+    {
+        // Off by default (E7); which toolchain each slot's sandbox then carries is SwiftToolchainTests' (it reads the slot pool).
+        var off = Options([]);
+        Assert.False(off.WorkerSwift);
+        off.ValidateSettings();
+
+        var on = Options(new() { ["Worker:Swift"] = "true", ["Worker:Slots"] = "2" });
+        Assert.True(on.WorkerSwift);
+        on.ValidateSettings();
+        Assert.True(Options(new() { ["Worker:Swift"] = "True" }).WorkerSwift);
+        Assert.False(Options(new() { ["Worker:Swift"] = "false" }).WorkerSwift);
+
+        foreach (var refused in new[] { "yes", "1", "", "on" })
+        {
+            Assert.Contains("Worker:Swift must be 'true' or 'false'",
+                Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Swift"] = refused }).ValidateSettings()).Message);
+        }
+        Assert.Contains("Worker:Swift is true, but Worker:RunAs=none",
+            Assert.Throws<InvalidOperationException>(() => Options(new() { ["Worker:Swift"] = "true", ["Worker:RunAs"] = "none" }).ValidateSettings()).Message);
+        Options(new() { ["Worker:Swift"] = "false", ["Worker:RunAs"] = "none" }).ValidateSettings();
+    }
+
+    [Fact]
     public void Defaults_point_at_local_router_sandbox_and_compose_postgres()
     {
         var options = Options([]);

@@ -436,21 +436,24 @@ public static class MergeGate
 
     /// <summary>
     /// CodeGraph's inputs as <c>risk-threshold</c> judges them for <paramref name="files"/> (sc-26254: the factory works with or without
-    /// CodeGraph): none read (no CodeGraph configured) or read for another commit → every file has no CodeGraph data, with why;
-    /// otherwise <see cref="CodeGraphRisk.Judged"/> — CodeGraph's answers where it gave them, and every other file (no usable answer, a
-    /// language CodeGraph does not index, left out) with no CodeGraph data.
+    /// CodeGraph): none read (no CodeGraph configured) → every file has no CodeGraph data, with why; read for another commit → every file
+    /// is a misread, which blocks (sc-26134: a read for another head is not missing data); otherwise <see cref="CodeGraphRisk.Judged"/> —
+    /// CodeGraph's answers where it gave them, its misreads, and every other file (no data for the amendment's causes, a language
+    /// CodeGraph does not index) with no CodeGraph data; a file the inputs leave out is a misread.
     /// </summary>
     private static CodeGraphRisk Judged(string head, IReadOnlyList<string> files, CodeGraphRisk? risk) =>
         risk is null ? CodeGraphRisk.None(head, files, $"CodeGraph is not configured (no CodeGraph token: {CodeGraphTokenSources})")
         : !string.Equals(risk.HeadSha, head, StringComparison.OrdinalIgnoreCase)
-            ? CodeGraphRisk.None(head, files, $"CodeGraph's inputs were read for {Ci.Short(risk.HeadSha)}, not the head")
+            ? CodeGraphRisk.AllMisread(head, files, $"CodeGraph's inputs were read for {Ci.Short(risk.HeadSha)}, not the head")
             : risk.Judged(files);
 
     /// <summary>
     /// <c>risk-threshold</c>'s CodeGraph inputs (sc-25709): each touched file's blast radius at exactly the head must be within
     /// <paramref name="limit"/> (<see cref="BlastRadiusLimit"/>), and, when the policy sets <c>max_hotspot</c>, each file's hotspot score
     /// (CodeGraph's riskScore, on the default branch) within it. A file with no CodeGraph data (<see cref="CodeGraphRisk.NoData"/>) is
-    /// not judged by them — never pending, never blocked for it (sc-26254); the gate row records why.
+    /// not judged by them — never pending, never blocked for it (sc-26254); the gate row records why. A file CodeGraph misanswered
+    /// (<see cref="CodeGraphRisk.Misread"/>, an unrecognised blast radius) blocks (sc-26134); a hotspot misread only when
+    /// <c>max_hotspot</c> is set.
     /// </summary>
     private static void CodeGraphReasons(RiskThreshold threshold, BlastRadius? limit, string by, string head, CodeGraphRisk risk, List<string> reasons)
     {
@@ -464,6 +467,9 @@ public static class MergeGate
         }
         // A blast radius CodeGraph answered that the gate does not recognise is a misread, not missing data: it blocks.
         reasons.AddRange(risk.UnrecognisedRadii.Select(u => u.Reason));
+        // So is any other answer a reachable CodeGraph gave that cannot be used (sc-26134) — a hotspot's only where the policy sets
+        // max_hotspot: with hotspots off (or a version 2 policy) the hotspot is not judged and its misread is only recorded in the row.
+        reasons.AddRange(risk.MisreadReasons(threshold.MaxHotspot is not null));
         if (threshold.MaxHotspot is { } maxHotspot)
         {
             var hot = risk.Hotspots.Where(f => f.Score > maxHotspot).OrderByDescending(f => f.Score).ToList();

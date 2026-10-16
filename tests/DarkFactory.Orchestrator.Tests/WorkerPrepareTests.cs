@@ -384,6 +384,91 @@ public sealed class WorkerPrepareTests : IDisposable
     }
 
     [Fact]
+    public async Task Opening_a_spool_removes_what_a_dead_process_left_and_never_a_live_sessions()
+    {
+        // sc-26134: a crashed process leaves prepare-spool/<id> behind; sessions overlap, so only one whose lock no one holds is stale.
+        var worktree = Worktree("version: 1\nsteps: [{name: a, argv: [/usr/bin/true]}]\n");
+        var prepare = PolledByHand();
+        var root = WorkerPrepare.SpoolRootOf(_root);
+        await using var live = await prepare.OpenAsync(worktree, null, null, CancellationToken.None);
+        Assert.True(File.Exists(WorkerPrepare.LockOf(root, Path.GetFileName(live.Directory))));
+        var dead = Directory.CreateDirectory(Path.Combine(root, Guid.NewGuid().ToString("N"))).FullName; // no lock file: died before or after it
+        File.WriteAllText(Path.Combine(dead, "request-1"), "left");
+        var deadLocked = Directory.CreateDirectory(Path.Combine(root, Guid.NewGuid().ToString("N"))).FullName;
+        File.WriteAllText(WorkerPrepare.LockOf(root, Path.GetFileName(deadLocked)), ""); // its lock file, held by no one
+        var orphanLock = WorkerPrepare.LockOf(root, Guid.NewGuid().ToString("N"));
+        File.WriteAllText(orphanLock, "");
+        var other = Path.Combine(root, "not-a-spool");
+        Directory.CreateDirectory(other);
+
+        var second = await prepare.OpenAsync(worktree, null, null, CancellationToken.None);
+
+        Assert.False(Directory.Exists(dead));
+        Assert.False(Directory.Exists(deadLocked));
+        Assert.False(File.Exists(WorkerPrepare.LockOf(root, Path.GetFileName(deadLocked))));
+        Assert.False(File.Exists(orphanLock));
+        Assert.True(Directory.Exists(other)); // not named like a spool: not the sweep's
+        // The live session's directory and lock are untouched, and it still answers.
+        Assert.True(Directory.Exists(live.Directory));
+        Assert.True(File.Exists(WorkerPrepare.LockOf(root, Path.GetFileName(live.Directory))));
+        File.WriteAllText(Path.Combine(live.Directory, "request-ok"), $"{WorkerPrepare.RequestHeader}\n{worktree}\n{WorkerPrepare.RequestEnd}\n");
+        await live.PollOnceAsync(CancellationToken.None);
+        Assert.Equal(1, live.Answered);
+
+        // A session's end removes its directory and its lock file.
+        await second.DisposeAsync();
+        Assert.False(Directory.Exists(second.Directory));
+        Assert.False(File.Exists(WorkerPrepare.LockOf(root, Path.GetFileName(second.Directory))));
+    }
+
+    [Fact]
+    public async Task A_sessions_requests_may_add_at_most_the_session_budget_to_the_cache_counted_at_declared_limits()
+    {
+        // sc-26134: the cache is never evicted, so what one session's own recipe may make it fetch is bounded, before any download.
+        const long Max = PrepareRecipe.MaxArtifactBytes;
+        Assert.Equal(40L * 1024 * 1024 * 1024, WorkerPrepare.MaxSessionBytes);
+        string Recipe(int from, int count) => "version: 1\nartifacts: [" + string.Join(", ", Enumerable.Range(from, count).Select(i =>
+        {
+            var body = System.Text.Encoding.UTF8.GetBytes($"artifact {i}\n");
+            _server.Serve($"https://files.example/a{i}.txt", body);
+            return $"{{name: a{i}, url: 'https://files.example/a{i}.txt', sha256: {ArtifactFetchTests.Sha256(body)}, max_bytes: {Max}}}";
+        })) + "]\nsteps: [{name: s, argv: [/usr/bin/true]}]\n";
+        var refusedRecipe = Worktree(Recipe(0, 11)); // 11 × 4 GiB declared: more than a session may add
+        var failures = new List<string>();
+        await using (var session = await PolledByHand().OpenAsync(refusedRecipe, null, null, CancellationToken.None, failures.Add))
+        {
+            File.WriteAllText(Path.Combine(session.Directory, "request-1"), $"{WorkerPrepare.RequestHeader}\n{refusedRecipe}\n{WorkerPrepare.RequestEnd}\n");
+            await session.PollOnceAsync(CancellationToken.None);
+            var answer = File.ReadAllText(Path.Combine(session.Directory, "response-1"));
+            Assert.StartsWith($"error\0the artifacts this recipe names that are not cached yet may take {11 * Max} bytes", answer);
+            Assert.Contains($"more than the {WorkerPrepare.MaxSessionBytes} bytes a session may add to the artifact cache, so nothing was fetched", answer);
+            Assert.Empty(_server.Requests);
+            Assert.Single(failures);
+        }
+
+        // 10 × 4 GiB is exactly the budget: fetched. The next request naming one more uncached artifact is refused; one naming only
+        // cached artifacts costs nothing and is answered.
+        var full = Worktree(Recipe(0, 10));
+        await using (var session = await PolledByHand().OpenAsync(full, null, null, CancellationToken.None))
+        {
+            File.WriteAllText(Path.Combine(session.Directory, "request-1"), $"{WorkerPrepare.RequestHeader}\n{full}\n{WorkerPrepare.RequestEnd}\n");
+            await session.PollOnceAsync(CancellationToken.None);
+            Assert.StartsWith("ok\0", File.ReadAllText(Path.Combine(session.Directory, "response-1")));
+            File.WriteAllText(Path.Combine(full, PrepareRecipe.Path), Recipe(10, 1));
+            File.WriteAllText(Path.Combine(session.Directory, "request-2"), $"{WorkerPrepare.RequestHeader}\n{full}\n{WorkerPrepare.RequestEnd}\n");
+            await session.PollOnceAsync(CancellationToken.None);
+            Assert.Contains($"may take {Max} bytes", File.ReadAllText(Path.Combine(session.Directory, "response-2")));
+            Assert.Contains($"have already counted {10 * Max}", File.ReadAllText(Path.Combine(session.Directory, "response-2")));
+            File.WriteAllText(Path.Combine(full, PrepareRecipe.Path), Recipe(0, 10));
+            File.WriteAllText(Path.Combine(session.Directory, "request-3"), $"{WorkerPrepare.RequestHeader}\n{full}\n{WorkerPrepare.RequestEnd}\n");
+            await session.PollOnceAsync(CancellationToken.None);
+            Assert.StartsWith("ok\0", File.ReadAllText(Path.Combine(session.Directory, "response-3")));
+        }
+        Assert.DoesNotContain(_server.Requests, r => r.AbsolutePath == "/a10.txt");
+        Assert.Equal(10, _server.Requests.Count); // the refused requests fetched nothing, the cached ones were not fetched again
+    }
+
+    [Fact]
     public void A_dot_factory_swapped_for_a_link_between_the_check_and_the_read_is_never_followed()
     {
         var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;

@@ -267,6 +267,67 @@ public class SwiftLiveTests
     }
 
     [Fact]
+    public void P5_AT7_needs_each_items_last_verdict_a_pass_of_the_high_class_panel_for_the_merged_head()
+    {
+        const string Head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        RoleReview Review(string role, string? served = "high") => new(role, "claude-opus-5-5", served, "s", "p", [], "ok");
+        List<LedgerEntry> History(ReviewVerdict? verdict, string? passed = Head)
+        {
+            var rows = new List<LedgerEntry>();
+            if (verdict is not null)
+            {
+                rows.Add(new LedgerEntry { State = WorkState.Review, Step = RunPipeline.Steps.Verdict, Detail = verdict.ToDetail(), Outcome = StepOutcome.Passed });
+            }
+            if (passed is not null)
+            {
+                rows.Add(new LedgerEntry { State = WorkState.MergeGate, Step = RunPipeline.Steps.GatePassed, Detail = passed, Outcome = StepOutcome.Passed });
+            }
+            return rows;
+        }
+        var full = ReviewPanel.Decide(Head, [], ReviewRoles.All.Select(r => Review(r)).ToList());
+        Assert.True(full.Passed);
+
+        Assert.Null(SwiftLive.PanelProblem(History(full)));
+        Assert.Equal("no review verdict", SwiftLive.PanelProblem(History(null)));
+        Assert.Contains("did not pass", SwiftLive.PanelProblem(History(full with { Verdict = ReviewVerdict.Fail })));
+        Assert.Contains("not the head the gate passed", SwiftLive.PanelProblem(History(full, passed: new string('b', 40))));
+        Assert.Contains("not the head the gate passed", SwiftLive.PanelProblem(History(full, passed: null)));
+        Assert.Contains("has no review", SwiftLive.PanelProblem(History(full with { Reviews = [] })));
+        Assert.Contains("on class mid", SwiftLive.PanelProblem(History(full with { Reviews = [.. full.Reviews.Skip(1), Review(ReviewRoles.All[0], "mid")] })));
+        Assert.Contains("on class (none)", SwiftLive.PanelProblem(History(full with { Reviews = [.. full.Reviews.Skip(1), Review(ReviewRoles.All[0], null)] })));
+    }
+
+    [Fact]
+    public void P5_AT5b_needs_the_swift_files_blast_radius_read_at_the_head_with_data()
+    {
+        const string File = "Packages/DfE2eSwift/Sources/DfE2eSwift/DfE2eSwift.swift";
+        const string Head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const string Index = "cccccccccccccccccccccccccccccccccccccccc";
+        // The row as the gate writes it: its reasons (which may name the file) before the inputs (CodeGraphRisk.Describe).
+        string Row(CodeGraphRisk risk) => $"Merge {Head[..12]}: risk within threshold (worst blast radius low ({File})) | {risk.Describe()}";
+        var hot = new FileHotspot(File, 0.1, true, Index);
+        var other = new FileBlastRadius("Sources/Other.swift", BlastRadius.Low, true);
+
+        Assert.Null(SwiftLive.BlastRadiusAtHeadProblem(Row(new CodeGraphRisk(Head, [other, new FileBlastRadius(File, BlastRadius.Low, true)], [hot], [])), File));
+        // Found false at the head: listed, but CodeGraph had no data for it.
+        Assert.Contains("had no data", SwiftLive.BlastRadiusAtHeadProblem(
+            Row(new CodeGraphRisk(Head, [new FileBlastRadius(File, BlastRadius.None, false)], [hot], [])), File));
+        // Read on the default branch only (no overlay of the head): not the head's list.
+        Assert.Contains("is not in the blast radius read at the head", SwiftLive.BlastRadiusAtHeadProblem(
+            Row(new CodeGraphRisk(Head, [other, new FileBlastRadius("Sources/Old.swift", BlastRadius.Low, true, Index),
+                new FileBlastRadius(File, BlastRadius.Low, true, Index)], [hot], [])), File));
+        // Named only in the hotspots, or only as having no CodeGraph data.
+        Assert.Contains("is not in the blast radius read at the head", SwiftLive.BlastRadiusAtHeadProblem(Row(new CodeGraphRisk(Head, [other], [hot], [])), File));
+        Assert.Contains("is not in the blast radius read at the head", SwiftLive.BlastRadiusAtHeadProblem(
+            Row(new CodeGraphRisk(Head, [other], [], [new NoCodeGraphData(File, "unreachable")])), File));
+        // At the head with data, but its hotspot recorded as no CodeGraph data.
+        Assert.Contains("records no CodeGraph data", SwiftLive.BlastRadiusAtHeadProblem(
+            Row(new CodeGraphRisk(Head, [new FileBlastRadius(File, BlastRadius.Low, true)], [], [new NoCodeGraphData(File, "file_hotspot not asked")])), File));
+        // No CodeGraph inputs at all.
+        Assert.Contains("has no CodeGraph inputs", SwiftLive.BlastRadiusAtHeadProblem($"Merge {Head[..12]}: fine", File));
+    }
+
+    [Fact]
     public void The_live_checks_name_the_gates_own_words_for_an_unindexed_language()
     {
         var risk = new CodeGraphRisk("head1", [], [], [], Unindexed: [new UnindexedFile("a.swift", "Swift", Flagged: true)]);

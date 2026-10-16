@@ -73,8 +73,10 @@ public sealed record HotspotAnswer(bool IsError, string Text, string? CommitSha,
 /// factory knows that language was not indexed before C3 (<see cref="LanguageCoverage.UnindexedBeforeC3"/>).
 /// <see cref="Missing"/>: when CodeGraph still answered data for one of the two inputs (<see cref="CodeGraphRisk.Judged"/> keeps it), the
 /// input that is missing (<c>blast radius</c> or <c>hotspot</c>); null — both are.
+/// <see cref="ByImpact"/>, <see cref="ByHotspot"/>: which answer said <c>languageIndexed: false</c> — only that tool's own misread of
+/// the file is excused by it (<see cref="CodeGraphRisk.Judged"/>, sc-26134).
 /// </summary>
-public sealed record UnindexedFile(string Path, string? Language, bool Flagged, string? Missing = null)
+public sealed record UnindexedFile(string Path, string? Language, bool Flagged, string? Missing = null, bool ByImpact = false, bool ByHotspot = false)
 {
     /// <summary>How the gate's row names it: the file and its language.</summary>
     public override string ToString() =>
@@ -86,11 +88,26 @@ public sealed record UnindexedFile(string Path, string? Language, bool Flagged, 
 }
 
 /// <summary>
-/// A touched file for which CodeGraph gave the gate no usable input (sc-26254), and why: CodeGraph not configured, unreachable or
-/// refusing, the repository not indexed, no ready overlay of the head, an answer for another commit or file, an unreadable answer, or
-/// a language CodeGraph does not index. <c>risk-threshold</c> then decides on the file's other inputs; the reason is recorded.
+/// A touched file for which CodeGraph gave the gate no input (sc-26254, E5 as amended), and why — only the amendment's causes:
+/// CodeGraph not configured, unreachable or refusing (a call that cannot be made, an HTTP 4xx such as 403 <c>tool_not_entitled</c>, the
+/// whole read cut off at <c>Gate:CiTimeoutMinutes</c>), the repository not indexed, a language CodeGraph does not index, or C4's typed
+/// <c>notIndexed</c> answer whose default-branch read then finds nothing either (itself not indexed, or unreachable). <c>risk-threshold</c>
+/// then decides on the file's other inputs; the reason is recorded. An answer a reachable CodeGraph gives that cannot be used is a misread
+/// (<see cref="CodeGraphMisread"/>), never this.
 /// </summary>
 public sealed record NoCodeGraphData(string Path, string Reason);
+
+/// <summary>
+/// A touched file a reachable CodeGraph misanswered (sc-26134): an answer the gate cannot use that is none of
+/// <see cref="NoCodeGraphData"/>'s causes — an error answer that is not C4's typed <c>notIndexed</c>, an answer for another commit or
+/// another file, one without <c>found</c>, a default-branch answer naming no commit or from an overlay, a hotspot without a usable score
+/// or commit — once the default-branch read of the blast radius (tried when the head's answer is unusable) gave nothing usable either; and
+/// every file of a read made for another head. Not missing data: it blocks <c>risk-threshold</c> (the item escalates), as
+/// <see cref="UnrecognisedBlastRadius"/> does — except a misread of the hotspot (<see cref="Hotspot"/>: <c>file_hotspot</c>'s answer, or a
+/// hotspot the inputs leave out), which blocks only where the policy sets <c>max_hotspot</c>: without a hotspot limit the hotspot is not
+/// judged, and the misread is only recorded in the gate row.
+/// </summary>
+public sealed record CodeGraphMisread(string Path, string Reason, bool Hotspot = false);
 
 /// <summary>
 /// Whether CodeGraph indexes a touched file's language (sc-26133, P5 S7; the CodeGraph side is C3, sc-26137). The contract: the
@@ -155,7 +172,7 @@ public static class LanguageCoverage
         {
             var language = (impactIndexed == false ? Name(impactLanguage) : null) ?? (hotspotIndexed == false ? Name(hotspotLanguage) : null)
                 ?? KnownUnindexed(path);
-            return new UnindexedFile(path, language, Flagged: true);
+            return new UnindexedFile(path, language, Flagged: true, ByImpact: impactIndexed == false, ByHotspot: hotspotIndexed == false);
         }
         if (impactIndexed == true || hotspotIndexed == true)
         {
@@ -252,19 +269,45 @@ public sealed record FileHotspot(string Path, double Score, bool Found, string C
 /// CodeGraph's inputs to <c>risk-threshold</c> for one evaluation (sc-25709), read fresh: each touched file's blast radius for exactly
 /// <see cref="HeadSha"/> (E3) and its hotspot score on the default branch, each recorded with the commit CodeGraph named (the
 /// default-branch exception of E3). <see cref="NoData"/> (sc-26254): the touched files CodeGraph gave no usable input for, and why
-/// (CodeGraph unreachable or refusing, the repository not indexed, no ready overlay of the head, an answer for another commit or file,
-/// or an unreadable one; a file may be named once per tool) — the gate decides on the file's other inputs and records the reason.
+/// (<see cref="NoCodeGraphData"/>: CodeGraph unreachable or refusing, the repository or the file's language not indexed, C4's
+/// <c>notIndexed</c> with nothing on the default branch either; a file may be named once per tool) — the gate decides on the file's
+/// other inputs and records the reason.
 /// <see cref="OverlayUnusable"/>: CodeGraph answered that it has no usable overlay of the head (C4's <c>notIndexed</c>, e.g. a ready
 /// overlay gone stale once the default branch moved past its base), so a recorded ready overlay must not be reused: the gate requests
 /// the overlay again once. <see cref="Unindexed"/>: the touched files whose language CodeGraph does not index
 /// (<see cref="LanguageCoverage"/>, sc-26133): their blast radius and hotspot are not used, and each is recorded as having no
 /// CodeGraph data (<see cref="Judged"/>). <see cref="Unrecognised"/>: blast radii CodeGraph answered for a file it has data for that the gate does not
-/// recognise — they block (sc-26254: a misread is not missing data).
+/// recognise — they block (sc-26254: a misread is not missing data). <see cref="Misread"/>: the files a reachable CodeGraph misanswered
+/// (<see cref="CodeGraphMisread"/>, sc-26134) — they block too.
 /// </summary>
 public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius> BlastRadius, IReadOnlyList<FileHotspot> Hotspots,
     IReadOnlyList<NoCodeGraphData> NoData, bool OverlayUnusable = false, IReadOnlyList<UnindexedFile>? Unindexed = null,
-    IReadOnlyList<UnrecognisedBlastRadius>? Unrecognised = null)
+    IReadOnlyList<UnrecognisedBlastRadius>? Unrecognised = null, IReadOnlyList<CodeGraphMisread>? Misread = null)
 {
+    /// <summary>The files CodeGraph misanswered (none when <see cref="Misread"/> is null).</summary>
+    public IReadOnlyList<CodeGraphMisread> Misreads => Misread ?? [];
+
+    /// <summary>Every one of <paramref name="files"/> misread at <paramref name="headSha"/> for the one <paramref name="reason"/>.</summary>
+    public static CodeGraphRisk AllMisread(string headSha, IEnumerable<string> files, string reason) =>
+        new(headSha, [], [], [], Misread: files.Select(f => new CodeGraphMisread(f, reason)).ToList());
+
+    /// <summary>
+    /// The blocking reasons of <see cref="Misreads"/>, one per reason — <c>risk threshold: CodeGraph misanswered (&lt;reason&gt;):
+    /// &lt;files&gt;</c> — each reason's files, and the reasons, capped at <see cref="MaxListed"/> with how many more. A hotspot misread
+    /// (<see cref="CodeGraphMisread.Hotspot"/>) blocks only when <paramref name="hotspotJudged"/> (the policy sets <c>max_hotspot</c>).
+    /// </summary>
+    public IReadOnlyList<string> MisreadReasons(bool hotspotJudged)
+    {
+        var groups = Misreads.Where(m => hotspotJudged || !m.Hotspot).GroupBy(m => m.Reason, StringComparer.Ordinal).ToList();
+        var reasons = groups.Take(MaxListed)
+            .Select(g => $"risk threshold: CodeGraph misanswered ({g.Key}): {Listed(g.Select(m => m.Path).ToList(), _ => false, p => p, ", ")}")
+            .ToList();
+        if (groups.Count > MaxListed)
+        {
+            reasons.Add($"risk threshold: CodeGraph misanswered … {groups.Count - MaxListed} more reason(s)");
+        }
+        return reasons;
+    }
     /// <summary>The blast radii CodeGraph answered that the gate does not recognise (none when <see cref="Unrecognised"/> is null).</summary>
     public IReadOnlyList<UnrecognisedBlastRadius> UnrecognisedRadii => Unrecognised ?? [];
 
@@ -277,7 +320,7 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
 
     /// <summary>
     /// What the gate judges, for exactly <paramref name="files"/>: the blast radii and hotspots CodeGraph answered, and every other file
-    /// with no CodeGraph data and why — <see cref="NoData"/> and any file the inputs leave out. A file whose language CodeGraph does not
+    /// with no CodeGraph data and why (<see cref="NoData"/>); a file the inputs leave out is a misread (<see cref="LeftOut"/>). A file whose language CodeGraph does not
     /// index keeps whatever data CodeGraph did answer for it (<c>found: true</c>: a critical blast radius from one tool still blocks), and
     /// only the missing part is recorded as no data, its language the reason (<see cref="AllNoData"/>).
     /// </summary>
@@ -296,18 +339,28 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
                 stillUnindexed.Add(u with { Missing = hasBlast ? "hotspot" : hasHot ? "blast radius" : null });
             }
         }
-        // An unindexed file's reason is its language (AllNoData), whatever else its answers said.
+        // An unindexed file's reason is its language (AllNoData). A tool's own answer saying CodeGraph indexes no code of that language
+        // explains that tool's unusable answer about the file — never the other tool's, whose misread stands (sc-26134).
         var noData = NoData.Where(n => !unindexed.Contains(n.Path)).ToList();
-        foreach (var file in files.Where(f => !unindexed.Contains(f)))
+        var misread = Misreads.Where(m => !UnindexedFiles.Any(u => u.Path == m.Path && (m.Hotspot ? u.ByHotspot : u.ByImpact))).ToList();
+        foreach (var file in files.Where(f => !unindexed.Contains(f) && misread.All(m => m.Path != f) && noData.All(n => n.Path != f)))
         {
-            var blastRead = blast.Any(b => b.Path == file) || UnrecognisedRadii.Any(u => u.Path == file);
-            if (noData.All(n => n.Path != file) && (!blastRead || hot.All(h => h.Path != file)))
+            // A touched file the inputs leave out is not missing data — CodeGraph was not asked, or its answer was lost: a misread
+            // (sc-26134), as for a read made for another head.
+            if (!blast.Any(b => b.Path == file) && !UnrecognisedRadii.Any(u => u.Path == file))
             {
-                noData.Add(new NoCodeGraphData(file, "CodeGraph's inputs leave it out"));
+                misread.Add(new CodeGraphMisread(file, LeftOut));
+            }
+            else if (hot.All(h => h.Path != file))
+            {
+                misread.Add(new CodeGraphMisread(file, LeftOut, Hotspot: true));
             }
         }
-        return this with { BlastRadius = blast, Hotspots = hot, NoData = noData, Unindexed = stillUnindexed };
+        return this with { BlastRadius = blast, Hotspots = hot, NoData = noData, Unindexed = stillUnindexed, Misread = misread };
     }
+
+    /// <summary>Why a touched file the inputs leave out is a misread (<see cref="Judged"/>).</summary>
+    public const string LeftOut = "CodeGraph's inputs leave it out";
 
     /// <summary>
     /// How many files <see cref="Describe"/> lists beyond those over a limit and the worst and hottest (and how many files with no data
@@ -350,6 +403,9 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
         return $"codegraph blast radius at {Inert(HeadSha)}: {(atHead.Count == 0 ? "none read" : BlastList(atHead))}"
             + string.Concat(onDefault)
             + (UnrecognisedRadii.Count == 0 ? "" : $"; unrecognised blast radius: {string.Join(", ", UnrecognisedRadii.Select(u => $"{Inert(u.Path)} {u.Shown}"))}")
+            + (Misreads.Count == 0 ? "" : "; CodeGraph misanswered: " + Listed(Misreads.GroupBy(m => m.Reason, StringComparer.Ordinal).ToList(), _ => false,
+                g => $"{Inert(g.Key)}{(maxHotspot is null && g.All(m => m.Hotspot) ? " (hotspot, not judged: no max_hotspot)" : "")}: "
+                    + Listed(g.Select(m => m.Path).ToList(), _ => false, Inert, ", "), "; "))
             + $"; hotspot score (riskScore) on the default branch: {(Hotspots.Count == 0 ? "none read" : string.Join("; ", hot))}"
             + (AllNoData.Count == 0 ? "" : $"{NoDataSeparator}{NoDataText}");
     }
@@ -425,9 +481,13 @@ public sealed class HotspotCache
 /// and <c>depth</c> = <see cref="ImpactDepth"/> when CodeGraph's overlay of the head is ready (<see cref="Overlays"/>, waited for by the
 /// pipeline, bounded by <c>CodeGraph:OverlayTimeoutMinutes</c>) — otherwise, or once CodeGraph answers C4's <c>notIndexed</c> for the
 /// head, without <c>sha</c>: the default-branch index's blast radius, recorded with its commit and labelled not the PR head, held to the
-/// same limits (sc-26254) — then per file <c>file_hotspot</c> (default branch only). Whatever it cannot read is recorded per file
-/// (<see cref="CodeGraphRisk.NoData"/>, sc-26254) and the read goes on: a file's answer that cannot be used (an error answer, another
-/// commit or file, an unreadable one) concerns that file only; a call that cannot be made at all — CodeGraph unreachable, a 5xx, a
+/// same limits (sc-26254); a head answer for one file that cannot be used and is not that <c>notIndexed</c> (an error answer, another
+/// commit or file, no <c>found</c>) has that file's blast radius read from the default branch the same way (sc-26134) — then per file
+/// <c>file_hotspot</c> (default branch only). What CodeGraph cannot give for the amendment's causes (unreachable or refusing, the
+/// repository not indexed, <c>notIndexed</c> with nothing on the default branch either; the language, judged after both answers) is
+/// recorded per file as no data (<see cref="CodeGraphRisk.NoData"/>, sc-26254); an answer a reachable CodeGraph gives that cannot be
+/// used, once the default-branch read did not replace it, is a misread (<see cref="CodeGraphRisk.Misread"/>, sc-26134), which blocks.
+/// Either way the read goes on: an unusable answer concerns that file only; a call that cannot be made at all — CodeGraph unreachable, a 5xx, a
 /// timeout, each tried <see cref="Attempts"/> times with the <see cref="Backoff"/> between — ends that tool's calls, its remaining files
 /// recorded with the same reason, so an unreachable CodeGraph costs one call (and its retries) per tool, not one per file. A typed answer
 /// (an error code, an HTTP 4xx such as 403 <c>tool_not_entitled</c>) is not retried. A blast radius CodeGraph answers for a found file
@@ -469,6 +529,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         var scores = new List<FileHotspot>();
         var unindexed = new List<UnindexedFile>();
         var unrecognised = new List<UnrecognisedBlastRadius>();
+        var misread = new List<CodeGraphMisread>();
         var overlayUnusable = false;
         var (project, unreachable) = await Call(() => codeGraph.FindProjectAsync(repo, ct), "search_projects", ct);
         if (unreachable is not null)
@@ -496,7 +557,9 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                 continue;
             }
             ImpactFileAnswer? answer = null;
-            string? why = null;
+            // The head's answer for this file when it could not be used and is not C4's typed notIndexed: a misread, unless the
+            // default-branch read below gives usable data (sc-26134).
+            string? headMisread = null;
             if (notAtHead is null)
             {
                 var (atHead, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct),
@@ -507,7 +570,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                     ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
                     continue;
                 }
-                why = Impact(atHead, head) ?? (SamePath(atHead.Path, path) ? null
+                var why = Impact(atHead, head) ?? (SamePath(atHead.Path, path) ? null
                     : OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, atHead.Path, path));
                 if (atHead.NotIndexed is not null)
                 {
@@ -516,33 +579,57 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
                     overlayUnusable = true;
                     notAtHead = why;
                 }
+                else if (why is not null)
+                {
+                    // This file's head answer cannot be used: its default-branch blast radius is read instead, for this file only.
+                    headMisread = why;
+                }
                 else
                 {
-                    answer = why is null ? atHead : null;
+                    answer = atHead;
                 }
             }
-            if (notAtHead is not null)
+            if (answer is null)
             {
+                var before = headMisread ?? notAtHead;
                 var (onDefault, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, null, ImpactDepth, ct),
                     CodeGraphMcpClient.AnalyzeImpactFileTool, ct);
                 if (onDefault is null)
                 {
-                    noData.Add(new NoCodeGraphData(path, $"blast radius: {notAtHead}; on the default branch: {failed}"));
+                    // CodeGraph cannot be asked any more: no data — unless the head already misanswered this file, which stays a misread.
+                    var reason = $"blast radius: {before}; on the default branch: {failed}";
+                    if (headMisread is null)
+                    {
+                        noData.Add(new NoCodeGraphData(path, reason));
+                    }
+                    else
+                    {
+                        misread.Add(new CodeGraphMisread(path, reason));
+                    }
                     ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
                     continue;
                 }
-                why = DefaultBranchImpact(onDefault) ?? (SamePath(onDefault.Path, path) ? null
+                var unusable = DefaultBranchImpact(onDefault) ?? (SamePath(onDefault.Path, path) ? null
                     : OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, onDefault.Path, path));
-                why = why is null ? null : $"blast radius: {notAtHead}; on the default branch: {why}";
-                answer = why is null ? onDefault : null;
-            }
-            if (answer is null)
-            {
-                noData.Add(new NoCodeGraphData(path, why!));
-                continue;
+                if (unusable is not null)
+                {
+                    // Only C4's typed notIndexed on the default branch, after no head answer was misread, is no data; any other unusable
+                    // answer of a reachable CodeGraph is a misread, and it blocks (sc-26134).
+                    var reason = $"blast radius: {before}; on the default branch: {unusable}";
+                    if (headMisread is null && onDefault.NotIndexed is not null)
+                    {
+                        noData.Add(new NoCodeGraphData(path, reason));
+                    }
+                    else
+                    {
+                        misread.Add(new CodeGraphMisread(path, reason));
+                    }
+                    continue;
+                }
+                answer = onDefault;
             }
             impacts[path] = answer;
-            var commit = notAtHead is null ? null : answer.CommitSha;
+            var commit = notAtHead is null && headMisread is null ? null : answer.CommitSha;
             if (answer.Found == true && !BlastRadii.TryParseAnswer(answer.BlastRadius, out _))
             {
                 // A misread, not missing data: CodeGraph has data for the file and the gate cannot tell how bad it is.
@@ -578,7 +665,8 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
             }
             if (Hotspot(answer, path) is { } why)
             {
-                noData.Add(new NoCodeGraphData(path, why));
+                // A reachable CodeGraph's unusable answer: a misread (sc-26134), which blocks where the policy judges hotspots.
+                misread.Add(new CodeGraphMisread(path, why, Hotspot: true));
                 continue;
             }
             var score = Score(answer, path) with { LanguageIndexed = answer.LanguageIndexed, Language = answer.Language };
@@ -600,7 +688,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
             LanguageCoverage.Add(unindexed, LanguageCoverage.Of(path, impact?.LanguageIndexed, impact?.Language, score?.LanguageIndexed,
                 score?.Language, impact is null ? true : impact.Found));
         }
-        return new CodeGraphRisk(headSha, blast, scores, noData, overlayUnusable, unindexed, unrecognised);
+        return new CodeGraphRisk(headSha, blast, scores, noData, overlayUnusable, unindexed, unrecognised, misread);
     }
 
     /// <summary>

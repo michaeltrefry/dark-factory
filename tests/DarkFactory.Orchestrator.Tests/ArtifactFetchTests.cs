@@ -65,6 +65,27 @@ public sealed class ArtifactFetchTests : IDisposable
     private readonly FakeArtifactServer _server = new();
     private readonly FakeResolver _resolver = new() { ["files.example"] = ["93.184.216.34"], ["other.example"] = ["2606:4700::1111"], ["internal.example"] = ["10.0.0.9"] };
 
+    [Fact]
+    public async Task The_production_transport_checks_the_hosts_addresses_again_at_connect_and_follows_no_proxy_or_redirect()
+    {
+        // sc-26134: the transport OutboundHttp.ArtifactDownload builds. Its connect callback resolves the host again and refuses a
+        // private address before any socket is opened (DNS rebinding after the downloader's own check), so nothing is connected here.
+        var resolver = new FakeResolver { ["rebound.example"] = ["127.0.0.1"] };
+        using var handler = Gateway.ArtifactTransport.Handler(resolver);
+        Assert.False(handler.AllowAutoRedirect);
+        Assert.False(handler.UseProxy);
+        Assert.False(handler.UseCookies);
+        Assert.Equal(DecompressionMethods.None, handler.AutomaticDecompression);
+        Assert.NotNull(handler.ConnectCallback);
+        using var client = new HttpClient(handler, disposeHandler: false);
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetAsync("https://rebound.example/a.txt"));
+
+        var refused = Assert.IsType<Gateway.ArtifactAddressException>(ex.InnerException);
+        Assert.Contains("127.0.0.1", refused.Message);
+        Assert.Equal(["rebound.example"], resolver.Asked);
+    }
+
     public void Dispose()
     {
         try

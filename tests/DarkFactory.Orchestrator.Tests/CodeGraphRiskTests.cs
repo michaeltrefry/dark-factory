@@ -14,8 +14,10 @@ namespace DarkFactory.Orchestrator.Tests;
 /// score (default branch, recorded with its commit). Code floor: a critical blast radius fails; <c>factory/gate.yaml</c> version 3 can
 /// only tighten it (<c>max_blast_radius</c>) and opts in to a hotspot limit (<c>max_hotspot</c>, the hotspot score being CodeGraph's
 /// riskScore). A file CodeGraph has no data for counts as none / 0. Since sc-26254 (the factory works with or without CodeGraph) a file
-/// CodeGraph gives no usable input for — not configured, unreachable, no ready overlay, another commit or file, an unindexed language —
-/// is recorded as having no CodeGraph data and judged on its other inputs; never pending, never blocked for it.
+/// CodeGraph gives no input for — not configured, unreachable or refusing, the repository or the language not indexed, C4's notIndexed
+/// with nothing on the default branch — is recorded as having no CodeGraph data and judged on its other inputs; never pending, never
+/// blocked for it. An answer a reachable CodeGraph gives that cannot be used (another commit or file, an error, no found), once the
+/// default-branch read did not replace it, is a misread and blocks (sc-26134).
 /// <para>
 /// CodeGraph's tools are its C7 contract (sc-25735, not deployed yet): answers through <c>CommitAnswer.Create</c> (michaeltrefry/CodeGraph
 /// PR #71), whose structured content is
@@ -287,21 +289,36 @@ public class CodeGraphRiskTests
     }
 
     [Fact]
-    public void CodeGraph_inputs_not_read_read_for_another_commit_or_leaving_a_file_out_are_no_codegraph_data()
+    public void CodeGraph_inputs_not_read_are_no_codegraph_data_and_inputs_read_for_another_commit_or_leaving_a_file_out_block()
     {
         var none = Evaluate(null);
         Assert.Equal(GateOutcome.Merge, none.Outcome);
         Assert.Contains("no CodeGraph data: CodeGraph is not configured (no CodeGraph token: CodeGraph:Token, env FACTORY_CODEGRAPH_TOKEN, or keychain "
             + "account 'codegraph-token' (service 'dark-factory')): src/a.cs, src/b.cs", none.Inputs);
-        var other = Evaluate(Radii(BlastRadius.Critical) with { HeadSha = Other });
-        Assert.Equal(GateOutcome.Merge, other.Outcome); // a critical answer for another commit is not the head's: no data, not a block
-        Assert.Contains($"no CodeGraph data: CodeGraph's inputs were read for {Other[..12]}, not the head: src/a.cs, src/b.cs", other.Inputs);
+        // sc-26134: inputs read for another head are a misread, not missing data — they block, whatever they say (low here).
+        var other = Evaluate(Radii(BlastRadius.Low) with { HeadSha = Other });
+        Assert.Equal(GateOutcome.Blocked, other.Outcome);
+        Assert.Equal($"risk threshold: CodeGraph misanswered (CodeGraph's inputs were read for {Other[..12]}, not the head): src/a.cs, src/b.cs",
+            Assert.Single(other.Reasons));
+        Assert.DoesNotContain("no CodeGraph data", other.Detail);
         var partial = Radii(BlastRadius.Low);
+        // sc-26134: a touched file the inputs leave out is a misread, never no data (it would fail open on a reader bug). A left-out
+        // blast radius blocks under any policy.
         var leftOut = Evaluate(partial with { BlastRadius = partial.BlastRadius.Take(1).ToList() });
-        Assert.Equal(GateOutcome.Merge, leftOut.Outcome);
-        Assert.Contains("no CodeGraph data: CodeGraph's inputs leave it out: src/b.cs", leftOut.Inputs);
-        Assert.Contains("no CodeGraph data: CodeGraph's inputs leave it out: src/a.cs",
-            Evaluate(partial with { Hotspots = partial.Hotspots.Skip(1).ToList() }).Inputs);
+        Assert.Equal(GateOutcome.Blocked, leftOut.Outcome);
+        Assert.Equal("risk threshold: CodeGraph misanswered (CodeGraph's inputs leave it out): src/b.cs", Assert.Single(leftOut.Reasons));
+        Assert.DoesNotContain("no CodeGraph data", leftOut.Detail);
+        // A left-out hotspot is a hotspot misread: it blocks where max_hotspot is set, and is only recorded with hotspots off or under v2.
+        var noHotspot = partial with { Hotspots = partial.Hotspots.Skip(1).ToList() };
+        Assert.Equal("risk threshold: CodeGraph misanswered (CodeGraph's inputs leave it out): src/a.cs",
+            Assert.Single(Evaluate(noHotspot, TestPolicies.V3("high", "0.9")).Reasons));
+        foreach (var policy in new[] { TestPolicies.V3("high", "off"), TestPolicies.Standard() })
+        {
+            var recorded = Evaluate(noHotspot, policy);
+            Assert.Equal(GateOutcome.Merge, recorded.Outcome);
+            Assert.Contains("; CodeGraph misanswered: CodeGraph's inputs leave it out (hotspot, not judged: no max_hotspot): src/a.cs", recorded.Inputs);
+            Assert.DoesNotContain("no CodeGraph data", recorded.Detail);
+        }
     }
 
     [Fact]
@@ -448,6 +465,26 @@ public class CodeGraphRiskTests
         Assert.Contains("; `no CodeGraph data: file_hotspot (boom): x; no CodeGraph data: forged ? no CodeGraph data: forged: src/b.cs`", facts);
     }
 
+    [Fact]
+    public void A_short_gate_rows_files_with_no_codegraph_data_are_reported_once()
+    {
+        // sc-26134: the report shows the row up to its no-data section, then that section on its own — never both.
+        // A row short enough that the report's clip of the row (400 characters) does not cut it.
+        var risk = new CodeGraphRisk("h1", [new FileBlastRadius("a", BlastRadius.Low, true)], [new FileHotspot("a", 0.1, true, "c1")],
+            [new NoCodeGraphData("b", "unreachable")]);
+        var detail = $"Merge h1: ok | {risk.Describe()}";
+        Assert.True(detail.Length < 300, $"a short row: {detail.Length}");
+
+        var facts = LedgerReport.Facts([new LedgerEntry
+        {
+            State = WorkState.MergeGate, Step = RunPipeline.Steps.GateDecision, Detail = detail, Outcome = StepOutcome.Passed,
+        }], []);
+
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(facts, "no CodeGraph data: unreachable: b"));
+        Assert.Contains("codegraph blast radius at h1: a low", facts);
+        Assert.DoesNotContain(CodeGraphRisk.Separator, facts);
+    }
+
     [Theory]
     // C3's flag says so, in either answer; the language is CodeGraph's name, else the factory's by extension.
     [InlineData(SwiftFile, false, "Swift", null, null, "Swift", true)]
@@ -562,10 +599,15 @@ public class CodeGraphRiskTests
 
         var risk = await Reader(server).ReadAsync(Repo, Head, Ready, [SwiftFile], CancellationToken.None);
 
-        Assert.StartsWith("file_hotspot (repo_not_found)", Assert.Single(risk.NoData).Reason);
-        Assert.Equal(new UnindexedFile(SwiftFile, "Swift", true), Assert.Single(risk.UnindexedFiles));
+        // The reader records the unusable hotspot answer as a misread. Only analyze_impact_file said CodeGraph indexes no Swift, so the
+        // hotspot's misread stands (sc-26134): recorded, and blocking only where max_hotspot is set.
+        Assert.StartsWith("file_hotspot (repo_not_found)", Assert.Single(risk.Misreads).Reason);
+        Assert.Equal(new UnindexedFile(SwiftFile, "Swift", true, ByImpact: true), Assert.Single(risk.UnindexedFiles));
+        Assert.StartsWith("risk threshold: CodeGraph misanswered (file_hotspot (repo_not_found)",
+            Assert.Single(Evaluate(risk, TestPolicies.V3("high", "0.9"), TestPolicies.Diff(SwiftFile)).Reasons));
         var decision = Evaluate(risk, diff: TestPolicies.Diff(SwiftFile));
         Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains("CodeGraph misanswered: file_hotspot (repo_not_found)", decision.Inputs);
         // The language is the reason the gate records for the file (its blast radius and hotspot mean nothing there).
         Assert.Contains($"no CodeGraph data: its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
     }
@@ -582,7 +624,7 @@ public class CodeGraphRiskTests
         var again = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.kt"], CancellationToken.None, cache);
 
         Assert.Single(server.Calls, c => c.Tool == "file_hotspot");
-        Assert.Equal(new UnindexedFile("src/a.kt", "kotlin", true), Assert.Single(again.UnindexedFiles));
+        Assert.Equal(new UnindexedFile("src/a.kt", "kotlin", true, ByHotspot: true), Assert.Single(again.UnindexedFiles));
     }
 
     // ---- the reader: CodeGraph's answers (C7 contract) ----
@@ -646,16 +688,25 @@ public class CodeGraphRiskTests
         Assert.Equal(GateOutcome.Merge, Evaluate(newOnly, TestPolicies.V3("low", "0"), diff).Outcome);
     }
 
-    public static TheoryData<string, string> UnreadableAnswers() => new()
+    /// <summary>The amendment's causes (E5, sc-26254): CodeGraph refusing or unreachable, and C4's notIndexed with nothing on the default branch.</summary>
+    public static TheoryData<string, string> NoDataAnswers() => new()
     {
         { "not-indexed", "blast radius: analyze_impact_file is not indexed for the head (commit_not_indexed, status indexing); on the default branch: analyze_impact_file is not indexed" },
-        { "unknown-repo", "analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
         { "not-entitled", "not entitled to analyze_impact_file" },
+        { "unreachable", "analyze_impact_file could not be sent (3 attempts): " },
+        { "hotspot-not-entitled", "not entitled to file_hotspot" },
+    };
+
+    /// <summary>
+    /// A reachable CodeGraph's unusable answers (sc-26134): misreads. A head blast radius answer is tried on the default branch first,
+    /// which here misanswers too (each kind's answer is the same with or without <c>sha</c>).
+    /// </summary>
+    public static TheoryData<string, string> MisreadAnswers() => new()
+    {
+        { "unknown-repo", "analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
         { "other-commit", $"analyze_impact_file answered for {Other}, not the head" },
         { "no-found", "analyze_impact_file answered no 'found'" },
-        { "unreachable", "analyze_impact_file could not be sent (3 attempts): " },
         { "hotspot-error", "file_hotspot (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'." },
-        { "hotspot-not-entitled", "not entitled to file_hotspot" },
         { "hotspot-overlay", "file_hotspot answered from 'overlay', not the default branch" },
         { "hotspot-no-commit", "file_hotspot named no commit (neither commitSha nor indexCommitSha)" },
         { "hotspot-no-score", "file_hotspot answered no riskScore" },
@@ -665,10 +716,84 @@ public class CodeGraphRiskTests
     };
 
     [Theory]
-    [MemberData(nameof(UnreadableAnswers))]
-    public async Task A_file_codegraph_cannot_read_has_no_codegraph_data_and_the_gate_merges_on_its_other_inputs(string kind, string why)
+    [MemberData(nameof(NoDataAnswers))]
+    public async Task A_file_codegraph_cannot_give_data_for_has_no_codegraph_data_and_the_gate_merges_on_its_other_inputs(string kind, string why)
     {
-        var server = Server((tool, args) => (kind, tool) switch
+        var risk = await Reader(UnusableServer(kind)).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+
+        var noData = Assert.Single(risk.NoData);
+        Assert.Equal("src/a.cs", noData.Path);
+        Assert.StartsWith(why, noData.Reason);
+        Assert.Empty(risk.Misreads);
+        // The other tool's answer is still used: one of the two inputs is read whichever failed.
+        Assert.Equal(1, risk.BlastRadius.Count + risk.Hotspots.Count);
+        var decision = Evaluate(risk, diff: TestPolicies.Diff("src/a.cs"));
+        Assert.Equal(GateOutcome.Merge, decision.Outcome);
+        Assert.Contains($"no CodeGraph data: {why}", decision.Inputs);
+    }
+
+    [Theory]
+    [MemberData(nameof(MisreadAnswers))]
+    public async Task A_file_a_reachable_codegraph_misanswers_is_a_misread_that_blocks_never_no_codegraph_data(string kind, string why)
+    {
+        var risk = await Reader(UnusableServer(kind)).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+
+        // sc-26134: a misread is not missing data.
+        Assert.Empty(risk.NoData);
+        var misread = Assert.Single(risk.Misreads);
+        Assert.Equal("src/a.cs", misread.Path);
+        Assert.Contains(why, misread.Reason);
+        Assert.Equal(1, risk.BlastRadius.Count + risk.Hotspots.Count);
+        var hotspot = kind.StartsWith("hotspot-", StringComparison.Ordinal);
+        Assert.Equal(hotspot, misread.Hotspot);
+        var diff = TestPolicies.Diff("src/a.cs");
+        // A blast-radius misread blocks under any policy; a hotspot misread only where the policy sets max_hotspot (sc-26134).
+        foreach (var (policy, judgesHotspots) in new[] { (TestPolicies.Standard(), false), (TestPolicies.V3("high", "off"), false), (TestPolicies.V3("high", "0.9"), true) })
+        {
+            var decision = Evaluate(risk, policy, diff);
+            Assert.Contains("; CodeGraph misanswered: ", decision.Inputs);
+            Assert.Contains(why, decision.Inputs);
+            Assert.DoesNotContain("no CodeGraph data", decision.Detail);
+            if (hotspot && !judgesHotspots)
+            {
+                Assert.Equal(GateOutcome.Merge, decision.Outcome);
+                Assert.Contains("(hotspot, not judged: no max_hotspot)", decision.Inputs);
+                continue;
+            }
+            Assert.Equal(GateOutcome.Blocked, decision.Outcome);
+            Assert.StartsWith("risk threshold: CodeGraph misanswered (", Assert.Single(decision.Reasons));
+            Assert.Contains(why, decision.Reasons[0]);
+            Assert.DoesNotContain("not judged", decision.Inputs);
+        }
+    }
+
+    [Fact]
+    public void A_language_flag_excuses_only_the_misread_of_the_tool_whose_answer_carried_it()
+    {
+        // sc-26134: languageIndexed: false in file_hotspot's answer does not excuse analyze_impact_file's misread, nor the other way round.
+        CodeGraphRisk Risk(bool hotspotMisread, bool byImpact, bool byHotspot) => new(Head, [], [], [],
+            Unindexed: [new UnindexedFile(SwiftFile, "Swift", true, ByImpact: byImpact, ByHotspot: byHotspot)],
+            Misread: [new CodeGraphMisread(SwiftFile, "boom", hotspotMisread)]);
+        var diff = TestPolicies.Diff(SwiftFile);
+        var limit = TestPolicies.V3("high", "0.9");
+
+        var impactKept = Evaluate(Risk(hotspotMisread: false, byImpact: false, byHotspot: true), limit, diff);
+        Assert.Equal("risk threshold: CodeGraph misanswered (boom): " + SwiftFile, Assert.Single(impactKept.Reasons));
+        var hotspotKept = Evaluate(Risk(hotspotMisread: true, byImpact: true, byHotspot: false), limit, diff);
+        Assert.Equal("risk threshold: CodeGraph misanswered (boom): " + SwiftFile, Assert.Single(hotspotKept.Reasons));
+
+        // The same tool's own flag explains its unusable answer: no data, its language the reason.
+        foreach (var excused in new[] { Risk(false, true, false), Risk(true, false, true) })
+        {
+            var decision = Evaluate(excused, limit, diff);
+            Assert.Equal(GateOutcome.Merge, decision.Outcome);
+            Assert.DoesNotContain("misanswered", decision.Detail);
+            Assert.Contains($"its language (Swift) is not indexed by CodeGraph: {SwiftFile}", decision.Inputs);
+        }
+    }
+
+    private static FakeMcpServer UnusableServer(string kind) =>
+        Server((tool, args) => (kind, tool) switch
         {
             ("not-indexed", "analyze_impact_file") => FakeMcpServer.NotIndexed(Project, Head, "indexing", 41, IndexCommit),
             ("unknown-repo", "analyze_impact_file") or ("hotspot-error", "file_hotspot") =>
@@ -689,16 +814,34 @@ public class CodeGraphRiskTests
             _ => HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.1),
         });
 
-        var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs"], CancellationToken.None);
+    [Fact]
+    public async Task An_unusable_head_answer_is_replaced_by_the_default_branch_read_for_that_file_only()
+    {
+        // sc-26134: the head misanswers src/a.cs (another commit); its default-branch blast radius is usable, so it is used — labelled
+        // not the PR head and held to the floor — and src/b.cs is still read at the head.
+        var radius = "low";
+        var server = Server((tool, args) => (tool, args["path"]!.GetValue<string>(), args.ContainsKey("sha")) switch
+        {
+            ("file_hotspot", var p, _) => HotspotAnswer(p, true, 0.1),
+            ("analyze_impact_file", "src/a.cs", true) => ImpactAnswer(Other, "src/a.cs", true, "low"),
+            ("analyze_impact_file", var p, false) => C7Answers.ImpactFile(Project, p, IndexCommit, true, radius, overlay: false),
+            (_, var p, _) => ImpactAnswer(Head, p, true, "medium"),
+        });
 
-        var noData = Assert.Single(risk.NoData);
-        Assert.Equal("src/a.cs", noData.Path);
-        Assert.StartsWith(why, noData.Reason);
-        // The other tool's answer is still used: one of the two inputs is read whichever failed.
-        Assert.Equal(1, risk.BlastRadius.Count + risk.Hotspots.Count);
-        var decision = Evaluate(risk, diff: TestPolicies.Diff("src/a.cs"));
-        Assert.Equal(GateOutcome.Merge, decision.Outcome);
-        Assert.Contains($"no CodeGraph data: {why}", decision.Inputs);
+        var risk = await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
+
+        Assert.Empty(risk.NoData);
+        Assert.Empty(risk.Misreads);
+        Assert.Equal([new FileBlastRadius("src/a.cs", BlastRadius.Low, true, IndexCommit), new FileBlastRadius("src/b.cs", BlastRadius.Medium, true)],
+            risk.BlastRadius);
+        Assert.Single(server.Calls, c => c.Tool == "analyze_impact_file" && !c.Arguments.AsObject().ContainsKey("sha"));
+        Assert.False(risk.OverlayUnusable);
+        Assert.Equal(GateOutcome.Merge, Evaluate(risk).Outcome);
+        // The default branch's critical blocks at the floor, named as read there.
+        radius = "critical";
+        var critical = Evaluate(await Reader(server).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None));
+        Assert.Equal($"risk threshold: blast radius on the default branch as of {IndexCommit[..12]}, not the PR head, over the code floor (critical always fails): src/a.cs critical",
+            Assert.Single(critical.Reasons));
     }
 
     [Fact]
@@ -783,13 +926,20 @@ public class CodeGraphRiskTests
         var other = await Reader(server).ReadAsync(Repo, Head, Ready with { HeadSha = Other }, ["src/a.cs"], CancellationToken.None);
         Assert.Equal(IndexCommit, Assert.Single(other.BlastRadius).DefaultBranchCommit);
 
-        // Only when the default-branch read fails too is the file without data, both reasons said.
+        // A default-branch read CodeGraph answers with an error is a misread (sc-26134), both reasons said; it blocks.
         var neither = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
             : FakeMcpServer.OverlayError("repo_not_found", "Unknown repository 'Sandbox'."));
         var none = await Reader(neither).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
-        Assert.Equal(new NoCodeGraphData("src/a.cs", $"blast radius: no ready CodeGraph overlay of {Head} (timed-out (overlay 41): not ready within 10 min); "
-            + "on the default branch: analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'."), Assert.Single(none.NoData));
+        Assert.Equal(new CodeGraphMisread("src/a.cs", $"blast radius: no ready CodeGraph overlay of {Head} (timed-out (overlay 41): not ready within 10 min); "
+            + "on the default branch: analyze_impact_file (repo_not_found): Error (repo_not_found): Unknown repository 'Sandbox'."), Assert.Single(none.Misreads));
+        Assert.Empty(none.NoData);
         Assert.Empty(none.BlastRadius);
+        // Only C4's typed notIndexed on the default branch is no data there: nothing to read, not a misanswer.
+        var notIndexed = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
+            : FakeMcpServer.NotIndexed(Project, Head, "indexing", 41, IndexCommit));
+        var nothing = await Reader(notIndexed).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
+        Assert.Empty(nothing.Misreads);
+        Assert.Equal("src/a.cs", Assert.Single(nothing.NoData).Path);
     }
 
     [Fact]
@@ -799,13 +949,16 @@ public class CodeGraphRiskTests
         var overlay = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
             : ImpactAnswer(Head, args["path"]!.GetValue<string>(), true, "critical"));
         var fromOverlay = await Reader(overlay).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
-        Assert.EndsWith("on the default branch: analyze_impact_file answered from 'overlay', not the default branch", Assert.Single(fromOverlay.NoData).Reason);
+        // sc-26134: a reachable CodeGraph misanswering the default-branch read is a misread, which blocks.
+        Assert.Empty(fromOverlay.NoData);
+        Assert.EndsWith("on the default branch: analyze_impact_file answered from 'overlay', not the default branch", Assert.Single(fromOverlay.Misreads).Reason);
+        Assert.Equal(GateOutcome.Blocked, Evaluate(fromOverlay, diff: TestPolicies.Diff("src/a.cs")).Outcome);
 
         var unnamed = Server((tool, args) => tool == "file_hotspot" ? HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.3)
             : FakeMcpServer.Structured("# File Blast Radius: Sandbox/src/a.cs", new JsonObject
                 { ["source"] = "default-branch", ["path"] = "src/a.cs", ["found"] = true, ["blastRadius"] = "critical" }));
         var noCommit = await Reader(unnamed).ReadAsync(Repo, Head, timedOut, ["src/a.cs"], CancellationToken.None);
-        Assert.EndsWith("on the default branch: analyze_impact_file named no commit", Assert.Single(noCommit.NoData).Reason);
+        Assert.EndsWith("on the default branch: analyze_impact_file named no commit", Assert.Single(noCommit.Misreads).Reason);
     }
 
     [Fact]
@@ -828,17 +981,33 @@ public class CodeGraphRiskTests
         Assert.Equal(2, risk.Hotspots.Count);
         Assert.False(risk.OverlayUnusable);
 
-        // An answer for another commit concerns that file only: the next file is asked and used.
+        // An answer for another commit (at the head and on the default branch) concerns that file only: the next file is asked and
+        // used, and the misread blocks on its own (sc-26134: src/b.cs is low).
         var oneOff = Server((tool, args) => (tool, args["path"]!.GetValue<string>()) switch
         {
             ("analyze_impact_file", "src/a.cs") => ImpactAnswer(Other, "src/a.cs", true, "low"),
-            ("analyze_impact_file", var p) => ImpactAnswer(Head, p, true, "critical"),
+            ("analyze_impact_file", var p) => ImpactAnswer(Head, p, true, "low"),
             (_, var p) => HotspotAnswer(p, true, 0.1),
         });
         var partial = await Reader(oneOff).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
-        Assert.Equal("src/a.cs", Assert.Single(partial.NoData).Path);
-        Assert.Equal([new FileBlastRadius("src/b.cs", BlastRadius.Critical, true)], partial.BlastRadius);
+        Assert.Empty(partial.NoData);
+        Assert.Equal("src/a.cs", Assert.Single(partial.Misreads).Path);
+        Assert.Equal([new FileBlastRadius("src/b.cs", BlastRadius.Low, true)], partial.BlastRadius);
         Assert.Equal(GateOutcome.Blocked, Evaluate(partial).Outcome);
+
+        // A head misread whose default-branch read cannot be made stays a misread (never laundered into no data by the outage).
+        var thenDown = Server((tool, args) => (tool, args.ContainsKey("sha")) switch
+        {
+            ("analyze_impact_file", true) => ImpactAnswer(Other, args["path"]!.GetValue<string>(), true, "low"),
+            ("analyze_impact_file", false) => throw new HttpRequestException("connection refused"),
+            _ => HotspotAnswer(args["path"]!.GetValue<string>(), true, 0.1),
+        });
+        var lost = await Reader(thenDown).ReadAsync(Repo, Head, Ready, ["src/a.cs", "src/b.cs"], CancellationToken.None);
+        var first = Assert.Single(lost.Misreads);
+        Assert.Equal("src/a.cs", first.Path);
+        Assert.Contains("on the default branch: analyze_impact_file could not be sent (3 attempts): connection refused", first.Reason);
+        Assert.Equal("src/b.cs", Assert.Single(lost.NoData).Path);
+        Assert.Equal(GateOutcome.Blocked, Evaluate(lost).Outcome);
     }
 
     [Fact]

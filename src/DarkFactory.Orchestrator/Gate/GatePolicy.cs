@@ -415,10 +415,14 @@ public static class RiskyPaths
         ("Rust build and toolchain configuration", new Regex(@"(^|/)(build\.rs|rust-toolchain[^/]*|\.cargo/config[^/]*)$", Options)),
         // Apple (sc-26133): Xcode projects, workspaces, schemes, build settings and test plans set build phases, scripts, signing and
         // what runs; entitlements and Info.plist grant capabilities; XcodeGen, Tuist, CocoaPods and Carthage files generate projects and
-        // pull dependencies; xcfilelists feed build phases' inputs and outputs. `project.(yml|json)` deliberately over-matches (Nx's and
-        // legacy .NET's project.json get a security review too: it only adds a check).
+        // pull dependencies; xcfilelists feed build phases' inputs and outputs. `project.(yml|yaml|json)` deliberately over-matches (Nx's and
+        // legacy .NET's project.json get a security review too: it only adds a check). An Info.plist under any name (`Info.plist`,
+        // `App-Info.plist`, `AppInfo.plist`, `Info-Debug.plist`: an `INFOPLIST_FILE` may name any) is matched by `Info` anywhere in a
+        // `.plist` name. SwiftPM build-tool and command plugins (`Plugins/<name>/*.swift` beside a Package.swift) run code at build
+        // time; a path pattern cannot see a sibling Package.swift, so every `.swift` file under a `Plugins/` directory at any depth (any
+        // case) is matched — over-matching an app's own Plugins folder only adds a security review.
         ("Xcode, CocoaPods and app configuration", new Regex(
-            @"(^|/)([^/]+\.xcodeproj/project\.pbxproj|[^/]+\.xcworkspace/contents\.xcworkspacedata|[^/]+\.xcworkspace/xcshareddata/[^/]+\.xcsettings|[^/]+\.xcscheme|[^/]+\.xcconfig|[^/]+\.xcfilelist|[^/]+\.entitlements|([^/]*-)?Info\.plist|project\.(yml|json)|Project\.swift|Workspace\.swift|Tuist\.swift|Tuist/.+|Podfile(\.lock)?|[^/]+\.podspec(\.json)?|Cartfile(\.resolved)?|[^/]+\.xctestplan)$",
+            @"(^|/)([^/]+\.xcodeproj/project\.pbxproj|[^/]+\.xcworkspace/contents\.xcworkspacedata|[^/]+\.xcworkspace/xcshareddata/[^/]+\.xcsettings|[^/]+\.xcscheme|[^/]+\.xcconfig|[^/]+\.xcfilelist|[^/]+\.entitlements|[^/]*Info[^/]*\.plist|project\.(ya?ml|json)|Plugins/.+\.swift|Project\.swift|Workspace\.swift|Tuist\.swift|Tuist/.+|Podfile(\.lock)?|[^/]+\.podspec(\.json)?|Cartfile(\.resolved)?|[^/]+\.xctestplan)$",
             Options)),
         ("keys and environment files", new Regex(@"\.(pem|key|p12|pfx|crt|cer)$|(^|/)\.env", Options)),
         ("security-sensitive code", new Regex(
