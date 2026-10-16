@@ -2560,7 +2560,9 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   false`, `required_reviewers: []`, `allowed_merge_methods: merge, squash, rebase`) — a left-out one takes GitHub's
   default, and the unattributed-changes default (`true`) blocked every PR of unsigned (worker) commits. After each
   write, `protect` reads the ruleset back and exits 1 naming every field or parameter GitHub holds otherwise (including
-  one it stores that was not sent). Re-running `protect` overwrites same-named rulesets (PUT), so it repairs them; of
+  one it stores that was not sent) — except `dismissal_restriction` held absent, which a personal account's repository
+  does (an organization's stores it) and which counts as the disabled default that is sent; any other value it holds still
+  fails. Re-running `protect` overwrites same-named rulesets (PUT), so it repairs them; of
   several existing rulesets with one managed name only the first is written, and `protect` prints a `warning:` naming the
   other ids, which it leaves unchanged (they still apply; delete stale ones by hand).
   That `~ALL` ruleset also stops non-admin integrations (Dependabot, `GITHUB_TOKEN` Actions deploys such as
