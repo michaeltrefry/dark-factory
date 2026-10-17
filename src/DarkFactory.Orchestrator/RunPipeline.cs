@@ -952,6 +952,7 @@ public sealed partial class RunPipeline(
         }
         if (known is not null)
         {
+            if (knownControl == ControlState.Running) await ObserveCorrectionMergeAsync(known, ct);
             // Repository controls are checked only after the fresh spec and the ledger resolve the operation repository.
             if (knownControl == ControlState.Stopping) return await StopIdleAsync(known, storyId, ct);
             if (knownControl == ControlState.Paused)
@@ -1001,7 +1002,10 @@ public sealed partial class RunPipeline(
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
         if (await source.AuthorizeDispatchAsync(storyId, primary, ct) is { Claimed: false } refusal)
             return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, refusal.Refusal);
-        if (Naming == ItemNaming.Recovery && (recovery is null || !await recovery.AuthorizeCorrectionAsync(Naming.Format(storyId), primary.FullName, ct)))
+        var correctionDelivered = Naming == ItemNaming.Recovery && known is not null
+            && (known.State is WorkState.Merge or WorkState.Watch
+                || known.State == WorkState.Paused && (await ledger.ContextAsync(known, ct)).PausedFrom == WorkState.Merge);
+        if (Naming == ItemNaming.Recovery && !correctionDelivered && (recovery is null || !await recovery.AuthorizeCorrectionAsync(Naming.Format(storyId), primary.FullName, ct)))
             return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, "Correction requires fresh incident-bound authorization.");
         if (known is null && await RepositoryControlAsync(Naming.Format(storyId), spec.Epic?.Id, primary.FullName, ct) != ControlState.Running)
         {
@@ -1025,7 +1029,7 @@ public sealed partial class RunPipeline(
         var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
-        if (known is not null && item.State != WorkState.Planned && !Lifecycle.IsTerminal(item.State))
+        if (known is not null && !correctionDelivered && item.State != WorkState.Planned && !Lifecycle.IsTerminal(item.State))
         {
             var resolvedControl = await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct);
             if (resolvedControl == ControlState.Stopping) return await StopIdleLockedAsync(item, storyId, ct);
@@ -1476,11 +1480,12 @@ public sealed partial class RunPipeline(
 
         if (!attempt.Any(e => e.Step == Steps.Pushed))
         {
-            var grant = await GrantPushAsync(item, session, ct);
+            var grant = await GrantPushAsync(run, session, ct);
             if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.PublicName}", grant, ct))
             {
                 throw new InvalidOperationException("Worker finished without changing the repository; nothing to review.");
             }
+            await RecordCorrectionPushAsync(run, ct);
             await ledger.CheckpointAsync(item, Steps.Pushed, session, workspace.Branch, ct);
         }
 
@@ -1813,11 +1818,15 @@ public sealed partial class RunPipeline(
     /// The push grant for the current worker attempt (E4): every session the attempt recorded (read fresh, so a session id that
     /// changed on resume is included) plus <paramref name="session"/>, none of them tainted.
     /// </summary>
-    private async Task<PushGrant> GrantPushAsync(WorkItem item, string? session, CancellationToken ct)
+    private async Task<PushGrant> GrantPushAsync(Run run, string? session, CancellationToken ct)
     {
-        var sessions = CurrentWorkerAttempt(await ledger.HistoryAsync(item, ct))
+        var sessions = CurrentWorkerAttempt(await ledger.HistoryAsync(run.Item, ct))
             .Where(e => e.Step == Steps.Session).Select(e => e.ClaudeSessionId).Append(session);
-        return await ledger.GrantPushAsync(sessions, ct);
+        var grant = await ledger.GrantPushAsync(sessions, ct);
+        if (Naming != ItemNaming.Recovery) return grant;
+        grant = grant.WithValidation(token => ValidateCorrectionPushAsync(run, token));
+        await grant.ValidateAsync(ct);
+        return grant;
     }
 
     private async Task RemoveWorktreeAsync(Run run)
@@ -1887,7 +1896,7 @@ public sealed partial class RunPipeline(
         {
             throw new ControlRequestedException(state);
         }
-        if (Naming == ItemNaming.Recovery)
+        if (Naming == ItemNaming.Recovery && item.State is not (WorkState.Merge or WorkState.Watch))
         {
             var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(item.ExternalId, item.Repo, ct);
             // Evidence/policy acquisition awaits external reads. A human Stop during them wins even over a refused grant.

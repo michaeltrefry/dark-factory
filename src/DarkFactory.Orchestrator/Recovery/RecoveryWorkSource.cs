@@ -48,7 +48,7 @@ public sealed class RecoveryWorkSource(IDbContextFactory<LedgerDbContext> contex
     public async Task<ClaimResult> AuthorizeDispatchAsync(int id, RepoRef repository, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
-        var c = await ValidAsync(db, id, ct);
+        var c = await ValidAsync(db, id, ct) ?? await RecoveryCorrections.Delivered(db, Naming.Format(id)).SingleOrDefaultAsync(ct);
         if (c is not null && RepoRef.Parse(c.Repo).Is(repository)) return ClaimResult.Ok;
         const string reason = "Correction repository, snapshot or repair envelope does not match its incident grant.";
         if (await db.RecoveryCorrections.SingleOrDefaultAsync(c => c.Id == id, ct) is { } refused)
@@ -77,7 +77,7 @@ public sealed class RecoveryWorkSource(IDbContextFactory<LedgerDbContext> contex
     public async Task<bool> InScopeAsync(int id, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
-        return await ValidAsync(db, id, ct) is not null;
+        return await ValidAsync(db, id, ct) is not null || await RecoveryCorrections.Delivered(db, Naming.Format(id)).AnyAsync(ct);
     }
     public Task ValidateScopeAsync(CancellationToken ct) => Task.CompletedTask;
     public Task ReleaseAsync(int id, CancellationToken ct) => Task.CompletedTask;
@@ -92,7 +92,8 @@ public sealed class RecoveryWorkSource(IDbContextFactory<LedgerDbContext> contex
     public async Task<string?> DeliveryBaseAsync(int id, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
-        return (await ValidAsync(db, id, ct) ?? throw new InvalidOperationException("Recovery grant is invalid.")).Base;
+        return (await ValidAsync(db, id, ct) ?? await RecoveryCorrections.Delivered(db, Naming.Format(id)).SingleOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Recovery grant is invalid.")).Base;
     }
     public Task ReportStateAsync(int id, BoardState state, string? comment, CancellationToken ct) => UpdateAsync(id,
         state switch { BoardState.Claimed => "Claimed", BoardState.Stopped => "Stopped", _ => "Merged" }, comment, ct);
@@ -124,6 +125,15 @@ public sealed class RecoveryWorkSource(IDbContextFactory<LedgerDbContext> contex
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var c = await db.RecoveryCorrections.SingleAsync(c => c.Id == id, ct);
+        if (step == "recovery-comment" && c.State is "Pending" or "Claimed"
+            && await db.WorkItems.AnyAsync(i => i.Source == Naming.Source && i.ExternalId == Naming.Format(id) && i.State == WorkState.Escalated, ct))
+        {
+            c.State = "Failed"; c.Version++;
+            var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == c.IncidentId, ct);
+            incident.State = "Escalated"; incident.Error = "Correction delivery failed; repository remains held. See the correction's typed gate/worker outcomes.";
+            incident.Version++;
+            await AppendAsync(db, c, RecoveryCorrections.StateStep, "Failed: ordinary delivery pipeline escalated the correction", ct);
+        }
         await AppendAsync(db, c, step, detail, ct);
         await db.SaveChangesAsync(ct);
     }

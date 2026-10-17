@@ -79,6 +79,8 @@ public sealed partial class RunPipeline
                 + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository. {RenamedRemedy}");
         }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
+        if (Naming == ItemNaming.Recovery && history.LastOrDefault(e => e.Step == RecoveryPushedHead)?.Detail != pull.HeadSha)
+            throw new GateBlockedException("Correction head no longer matches the authorized worker push.");
         return (history, pull);
     }
 
@@ -133,7 +135,7 @@ public sealed partial class RunPipeline
     /// </summary>
     private static void EnsureBase(Run run, PullFacts pull)
     {
-        var expected = run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
+        var expected = run.RequiredBase ?? run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
         if (expected is not null && !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
         {
             throw new InvalidOperationException($"{pull.HtmlUrl} targets {pull.BaseRef}, not {expected}.");
@@ -806,7 +808,7 @@ public sealed partial class RunPipeline
                 }
             }
             await ThrowIfControlledAsync(item, ct);
-            var grant = await GrantPushAsync(item, session, ct);
+            var grant = await GrantPushAsync(run, session, ct);
             // The PR branch is always ahead of the base, so this pushes even when the fixer changed nothing (the same head):
             // that round is judged like any other (a review round with no fewer blocking findings fails; red CI stays red).
             await workspaces.CommitAndPushAsync(repo, workspace, commitMessage, grant, ct);
@@ -815,6 +817,7 @@ public sealed partial class RunPipeline
             {
                 log.WriteLine($"[fix] {name}: the fixer changed nothing; the head stays {Ci.Short(pushed)}");
             }
+            await RecordCorrectionPushAsync(run, ct);
             await ledger.CheckpointAsync(item, Steps.Pushed, session, pushed, ct);
         }
         else
@@ -1320,7 +1323,8 @@ public sealed partial class RunPipeline
         try
         {
             var after = await Gate.GitHub.GetPullAsync(run.Repo, gated.Number, ct);
-            return after.Merged && after.HeadSha == gated.HeadSha ? after.MergeCommitSha : null;
+            return after.Merged && after.HeadSha == gated.HeadSha && after.BaseRef == gated.BaseRef
+                && await CorrectionMergeWasAuthorizedAsync(run.Repo, await ledger.HistoryAsync(run.Item, ct), after, ct) ? after.MergeCommitSha : null;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -1347,6 +1351,7 @@ public sealed partial class RunPipeline
         var entered = history.FindLastIndex(e => e.Step is null);
         var commit = history[entered].Detail;
         var done = history.Skip(entered + 1).Select(e => e.Step).ToHashSet();
+        await RecordCorrectionDeliveryAsync(run, commit, ct);
         if (run.Changeset is { } changeset && Plans.Changeset.Ordered(history, run.Repo) is { Count: > 1 } changesets)
         {
             var delivered = Plans.Changeset.Delivered(history).Select(d => d.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);

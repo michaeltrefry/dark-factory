@@ -17,6 +17,9 @@ public interface IGateGitHub
 {
     Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct);
 
+    /// <summary>Correction crash recovery requires positive provenance from this authenticated gate App, not merely a gated head.</summary>
+    Task<bool> IsGateMergeAsync(RepoRef repo, PullFacts pull, CancellationToken ct) => Task.FromResult(false);
+
     /// <summary>The unified diff of <paramref name="headSha"/> against its merge base with <paramref name="baseSha"/>.</summary>
     Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct);
 
@@ -105,14 +108,28 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
 
     private const int PageSize = 100;
 
-    public async Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
+    private async Task<PullDto> ReadPullAsync(RepoRef repo, int number, CancellationToken ct)
     {
         using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/pulls/{number}", "Bearer", await ReadTokenAsync(repo, ct));
         using var response = await http.SendAsync(request, ct);
         await GitHubApp.EnsureSuccess(response, $"read pull request #{number}", ct);
-        var pull = (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
+        return (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
+    }
+
+    public async Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
+    {
+        var pull = await ReadPullAsync(repo, number, ct);
         return new PullFacts(pull.Number, pull.HtmlUrl, pull.State == "open", pull.Merged, pull.Draft, pull.Head.Sha, pull.Base.Ref, pull.Base.Sha,
             pull.MergeCommitSha, pull.ChangedFiles, pull.Base.Repo?.DefaultBranch);
+    }
+
+    public async Task<bool> IsGateMergeAsync(RepoRef repo, PullFacts pull, CancellationToken ct)
+    {
+        var current = await ReadPullAsync(repo, pull.Number, ct);
+        return pull.Merged && pull.MergeCommitSha is not null && current.Merged && current.Number == pull.Number
+            && current.MergeCommitSha == pull.MergeCommitSha && current.Head.Sha == pull.HeadSha && current.Base.Ref == pull.BaseRef
+            && current.MergedBy is { Type: "Bot", Login: { } login }
+            && string.Equals(login, await gateApp.SlugAsync(ct) + "[bot]", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
@@ -421,7 +438,10 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha,
         [property: JsonPropertyName("changed_files")] int? ChangedFiles,
         [property: JsonPropertyName("head")] RefDto Head,
-        [property: JsonPropertyName("base")] RefDto Base);
+        [property: JsonPropertyName("base")] RefDto Base,
+        [property: JsonPropertyName("merged_by")] MergeUserDto? MergedBy = null);
+
+    private sealed record MergeUserDto([property: JsonPropertyName("login")] string? Login, [property: JsonPropertyName("type")] string? Type);
 
     private sealed record RefDto(
         [property: JsonPropertyName("ref")] string Ref,

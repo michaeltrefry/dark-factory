@@ -147,6 +147,17 @@ public static class RecoveryCorrections
             throw new InvalidOperationException("Correction envelope has an escaping, non-explicit, sealed or protected path.");
     }
 
+    // A delivered item's bookkeeping needs no execution authority. This predicate grants no worker or merge path:
+    // it applies only after the ledger's Merge transition (bookkeeping may itself be paused) and exempts only its own incident.
+    internal static IQueryable<RecoveryCorrection> Delivered(LedgerDbContext db, string externalId)
+    {
+        int? id = ItemNaming.Recovery.TryParse(externalId, out var key) ? key : null;
+        return db.RecoveryCorrections.Where(c => id != null && c.Id == id
+            && db.WorkItems.Any(w => w.Source == ItemNaming.Recovery.Source && w.ExternalId == externalId
+                && (w.State == WorkState.Merge || w.State == WorkState.Watch || w.State == WorkState.Paused)
+                && db.LedgerEntries.Any(e => e.WorkItemId == w.Id && e.Step == null && e.State == WorkState.Merge)));
+    }
+
     /// <summary>Structural grant predicate shared by dispatch and the effective-control query. Never vouches for another incident.</summary>
     internal static IQueryable<RecoveryCorrection> Grants(LedgerDbContext db, string externalId, string? repo = null)
     {

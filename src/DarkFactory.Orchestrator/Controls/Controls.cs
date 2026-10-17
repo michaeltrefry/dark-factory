@@ -242,7 +242,8 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
         var repositories = db.WorkItems.Where(i => i.Source == source && i.ExternalId == externalId && i.State != WorkState.Planned)
             .Select(i => i.Repo.ToLower());
         var repositoryScopes = repositories.Select(r => "repo:" + r);
-        var corrections = Recovery.RecoveryCorrections.Grants(db, externalId, repoKey);
+        var corrections = Recovery.RecoveryCorrections.Grants(db, externalId, repoKey)
+            .Concat(Recovery.RecoveryCorrections.Delivered(db, externalId));
         int? correctionKey = ItemNaming.Recovery.TryParse(externalId, out var recoveryKey) ? recoveryKey : null;
         // Ancestral human controls survive grant revocation and Stop; an incident exception never removes this context.
         var ancestry = db.RecoveryAncestors.Where(a => correctionKey != null && a.CorrectionId == correctionKey).Select(a => a.Scope);

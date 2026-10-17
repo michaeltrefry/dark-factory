@@ -36,6 +36,8 @@ public class GatePipelineTests
         public string Head { get; set; } = Sha1;
         public bool Open { get; set; } = true;
         public bool Merged { get; set; }
+        public bool MergedByGate { get; set; }
+        public Task<bool> IsGateMergeAsync(RepoRef repo, PullFacts pull, CancellationToken ct) => Task.FromResult(Merged && MergedByGate);
         public string? MergeCommitSha { get; set; }
         public string? PolicyText { get; set; } = Policy;
         public const string BaseSha = "base0";
@@ -48,12 +50,14 @@ public class GatePipelineTests
         /// <summary>When set, the merge finds the head moved to this commit (GitHub's 409).</summary>
         public string? HeadMovesBeforeMerge { get; set; }
         private int _reads;
+        public string PullBaseRef { get; set; } = "main";
+        public string PullBaseSha { get; set; } = BaseSha;
 
         public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
         {
             Calls.Add($"pull {number}");
             OnPullRead?.Invoke(++_reads);
-            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, "main", BaseSha, MergeCommitSha,
+            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, PullBaseRef, PullBaseSha, MergeCommitSha,
                 ChangedFiles ?? DiffPaths.Parse(Diff(Head)).Files));
         }
 
@@ -141,6 +145,7 @@ public class GatePipelineTests
                 throw failure;
             }
             Merged = true;
+            MergedByGate = true;
             MergeCommitSha = MergeCommit;
             if (MergeThrows is { } late)
             {
