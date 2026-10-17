@@ -98,6 +98,18 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         return await AppendAsync(item, state, null, claudeSessionId, detail, ct);
     }
 
+    /// <summary>A safe incident's exact affected-work disposition permits one fresh coding transition, never a terminal resurrection.</summary>
+    internal async Task RestartCodingAsync(WorkItem item, Recovery.RecoveryRedirect redirect, CancellationToken ct)
+    {
+        var detail = System.Text.Json.JsonSerializer.Serialize(redirect);
+        if (redirect.Item != item.ExternalId || !RepoRef.Parse(redirect.Repo).Is(RepoRef.Parse(item.Repo))
+            || !await db.HotFileIncidents.AnyAsync(i => i.Id == redirect.Incident && i.State == "Resolved", ct)
+            || !await db.LedgerEntries.AnyAsync(e => e.WorkItemId == item.Id && e.Step == Recovery.RecoveryRedirect.Step && e.Detail == detail, ct))
+            throw new InvalidOperationException("No exact safe recovery disposition authorizes this restart.");
+        Lifecycle.Ensure(item.State, WorkState.Implement, (await ContextAsync(item, ct)) with { RecoveryRestart = true });
+        await AppendAsync(item, WorkState.Implement, null, null, "fresh coding after recovery: " + detail, ct);
+    }
+
     /// <summary>Records a completed sub-step of the item's current state; the state does not change.</summary>
     public Task<LedgerEntry> CheckpointAsync(WorkItem item, string step, string? claudeSessionId, string? detail, CancellationToken ct) =>
         AppendAsync(item, item.State, step, claudeSessionId, detail, ct);

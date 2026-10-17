@@ -9,6 +9,33 @@ namespace DarkFactory.Orchestrator;
 
 public sealed partial class RunPipeline
 {
+    // Old verdicts, test results, overlays and merge authorization remain audit facts, never authority for a redirected attempt.
+    internal static List<LedgerEntry> SinceRecoveryRestart(IReadOnlyList<LedgerEntry> history)
+    {
+        var start = 0;
+        for (var i = 0; i < history.Count; i++)
+            if (history[i].Step == Recovery.RecoveryRedirect.Started) start = i + 1;
+        return history.Skip(start).ToList();
+    }
+
+    private async Task RestartRedirectedCodingAsync(Run run, CancellationToken ct)
+    {
+        if (run.Redirect is not { } redirect || run.Item.State == WorkState.Intake) return;
+        var detail = JsonSerializer.Serialize(redirect);
+        var history = await ledger.HistoryAsync(run.Item, ct);
+        if (history.Any(e => e.Step == Recovery.RecoveryRedirect.Started && e.Detail == detail)) return;
+        await InWorkerPhaseAsync(run.Item, "restart redirected coding", async () =>
+        {
+            await ThrowIfControlledAsync(run.Item, ct);
+            var attempt = CurrentWorkerAttempt(history);
+            if (OrphanedWorkerPid(attempt) is { } pid)
+                await worker.StopOrphanAsync(pid, ct);
+            // PrepareAsync replaces the previous worktree as its own slot user. Never restore its old pushed branch.
+            await ledger.RestartCodingAsync(run.Item, redirect, ct);
+            await ledger.CheckpointAsync(run.Item, Recovery.RecoveryRedirect.Started, null, detail, ct);
+        }, ct);
+    }
+
     private const string RecoveryDelivered = "recovery-delivered";
     private const string RecoveryMergeAuthorized = "recovery-merge-authorized";
     private const string RecoveryPushedHead = "recovery-pushed-head";

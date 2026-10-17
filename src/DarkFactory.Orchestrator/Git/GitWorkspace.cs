@@ -43,6 +43,10 @@ public interface IRepoWorkspace
     /// </summary>
     Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null);
 
+    /// <summary>Fresh coding from the current base, containing the assessed delivered correction, never the old PR branch.</summary>
+    Task<Workspace> PrepareCorrectedAsync(RepoRef repo, string branch, string correctedCommit, CancellationToken ct, string? baseBranch = null) =>
+        throw new NotSupportedException("This workspace cannot prove a corrected base.");
+
     /// <summary>
     /// Re-creates a story's worktree from its already-pushed branch (<c>origin/&lt;branch&gt;</c>)
     /// instead of the base branch, so pushed work is continued rather than redone.
@@ -165,6 +169,18 @@ public sealed class GitWorkspace(
 
     public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
         CreateWorktreeAsync(repo, branch, baseBranch, @base => $"origin/{@base}", ct);
+
+    public async Task<Workspace> PrepareCorrectedAsync(RepoRef repo, string branch, string correctedCommit, CancellationToken ct, string? baseBranch = null)
+    {
+        if (!FullSha.IsMatch(correctedCommit)) throw new ArgumentException("Correction delivery must be a full commit id.", nameof(correctedCommit));
+        var workspace = await PrepareAsync(repo, branch, ct, baseBranch);
+        // A plan child keeps its own changeset base and blockers. Bring the delivered correction into this fresh branch,
+        // not into the plan's shared branch, under the ordinary owner-git and clone-lock rules.
+        using var cloneLock = await LockAsync(ClonePath(repo), ct);
+        await Git(workspace.Path, null, ct, [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}",
+            "-c", $"user.name={CommitterName}", "-c", $"user.email={CommitterEmail}", "merge", "--no-edit", correctedCommit]);
+        return workspace;
+    }
 
     public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
         CreateWorktreeAsync(repo, branch, baseBranch, _ => $"origin/{branch}", ct);

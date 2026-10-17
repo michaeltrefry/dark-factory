@@ -60,10 +60,11 @@ public static class RecoveryCorrections
         // Replays never revive a stopped/failed item or mint a second authority for the same attempt.
         if (existing is not null) return existing;
         if (attempt is < 1 or > 2 || attempt == 2 && !await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id
-                && c.Attempt == 1 && c.State == "Failed", ct))
+                && c.Attempt == 1 && (c.State == "Failed" || c.State == "Merged"), ct))
             throw new InvalidOperationException("Correction attempt is not authorized by a failed prior repair or exceeds two attempts.");
         var trigger = HotFileSnapshot.Parse(incident.Snapshot);
         var material = ValidateAssessment(incident, answer, trigger);
+        await HotFileRecovery.RecordRedirectsAsync(db, incident, answer, now, ct);
         var bases = trigger.Merges.Select(m => m.Base).Distinct(StringComparer.Ordinal).ToArray();
         if (bases.Length != 1 || !material.BaseTips.ContainsKey(bases[0]) || ItemNaming.IsChangesetBranch(bases[0]))
             throw new InvalidOperationException("Correction requires one recorded delivery base and its pinned tip.");
@@ -112,12 +113,15 @@ public static class RecoveryCorrections
         $"Repo: {incident.Repo}\nIncident: {incident.Id}, generation {incident.Generation}, repair attempt {attempt}.\n"
         + $"Delivery base: {deliveryBase}. Repair only these explicit paths: {string.Join(", ", paths)}.\n"
         + "Implement the bounded repair and regression tests described by this assessment data. Do not widen its envelope.\n"
-        + Worker.PromptFence.Block("recovery-findings", JsonSerializer.Serialize(answer.CorrectionFindings));
+        + Worker.PromptFence.Block("recovery-findings", JsonSerializer.Serialize(answer.CorrectionFindings))
+        + Worker.PromptFence.Block("prior-recovery", JsonSerializer.Serialize(RecoverySnapshot.FromDetail(answer.Material)?.Evidence.Where(e => e.Category == "recovery")));
 
-    internal static RecoverySnapshot ValidateAssessment(HotFileIncident incident, HotFileAssessment answer, HotFileSnapshot trigger)
+    internal static RecoverySnapshot ValidateAssessment(HotFileIncident incident, HotFileAssessment answer, HotFileSnapshot trigger, bool correction = true)
     {
         if (JsonSerializer.Serialize(answer) != incident.Answer || trigger.Repo != incident.Repo || trigger.Generation != incident.Generation
-            || trigger.EvidenceHash != incident.EvidenceHash || incident.State is not ("Unsafe" or "Correcting") || answer.Decision != "unsafe" || answer.ServedClass != "high"
+            || trigger.EvidenceHash != incident.EvidenceHash
+            || (correction ? incident.State is not ("Unsafe" or "Correcting") || answer.Decision != "unsafe" : incident.State != "Assessing")
+            || answer.ServedClass != "high"
             || answer.Repo != incident.Repo || answer.Generation != incident.Generation || answer.Snapshot != trigger.Id
             || answer.EvidenceHash != incident.EvidenceHash || answer.Material is null
             || RecoverySnapshot.Hash(answer.Material) != answer.MaterialHash || answer.Session != incident.Session)
@@ -133,7 +137,9 @@ public static class RecoveryCorrections
             citations = answer.Citations, findings = answer.Findings.Select(f => new { kind = f.Kind, blocking = f.Blocking, issue = f.Issue,
                 expectedBehavior = f.ExpectedBehavior, tests = f.Tests, paths = f.Paths, citations = f.Citations, pendingItems = f.PendingItems }) });
         var parsed = RecoveryDecision.Parse(decision, trigger, material);
-        if (parsed.CorrectionFindings.Count == 0 || JsonSerializer.Serialize(parsed.CorrectionFindings) != JsonSerializer.Serialize(answer.CorrectionFindings))
+        if (correction && parsed.CorrectionFindings.Count == 0
+            || JsonSerializer.Serialize(parsed.CorrectionFindings) != JsonSerializer.Serialize(answer.CorrectionFindings)
+            || JsonSerializer.Serialize(parsed.PendingDispositions) != JsonSerializer.Serialize(answer.PendingDispositions))
             throw new InvalidOperationException("No exact validated merged-defect correction disposition.");
         return material;
     }

@@ -41,6 +41,7 @@ public class GatePipelineTests
         public string? MergeCommitSha { get; set; }
         public string? PolicyText { get; set; } = Policy;
         public const string BaseSha = "base0";
+        public string ExpectedPolicySha { get; set; } = BaseSha;
         /// <summary>GitHub's changed_files for the PR; by default the file count of <see cref="Diff"/> at the head.</summary>
         public int? ChangedFiles { get; set; }
         public Dictionary<string, CiFacts> Ci { get; } = new();
@@ -97,7 +98,7 @@ public class GatePipelineTests
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)
         {
             // The policy is read at the base commit the diff is read against, never at the moving base branch.
-            Assert.Equal(BaseSha, baseRef);
+            Assert.Equal(ExpectedPolicySha, baseRef);
             Calls.Add($"policy {baseRef}");
             return Task.FromResult(PolicyText);
         }

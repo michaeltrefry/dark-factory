@@ -190,6 +190,11 @@ public class RunPipelineTests
             Bases.Add((branch, baseBranch));
             return Task.FromResult(new Workspace($"{Root}/{branch}", branch, baseBranch ?? "main", $"/clone/.git/worktrees/{branch}"));
         }
+        public Task<Workspace> PrepareCorrectedAsync(RepoRef repo, string branch, string correctedCommit, CancellationToken ct, string? baseBranch = null)
+        {
+            Calls.Add($"corrected {repo} {correctedCommit}");
+            return PrepareAsync(repo, branch, ct, baseBranch);
+        }
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             Calls.Add($"reopen {repo} {branch}");

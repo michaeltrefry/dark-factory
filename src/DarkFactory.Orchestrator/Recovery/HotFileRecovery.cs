@@ -71,7 +71,7 @@ public interface IHotFileAssessor
 /// acknowledges exact (base,file,merge-row) tuples; the next merge can qualify using the overlapping rolling window.
 /// Repository advisory locks serialize creation, dispatch and acceptance across processes. No worker slot is involved.
 /// </summary>
-public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts, IRunLocks locks, FreezeOptions options,
+public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts, IRunLocks locks, FreezeOptions options,
     TimeProvider time, IHotFileAssessor assessor, IReadOnlyList<IDisposable>? owned = null,
     Func<HotFileSnapshot, CancellationToken, Task<string>>? capture = null,
     Func<RepoRef, string, CancellationToken, Task<string?>>? policy = null) : IAsyncDisposable
@@ -160,7 +160,9 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
         if (held is null) return;
         await using var db = await contexts.CreateDbContextAsync(ct);
         var incident = await DetectLockedAsync(db, repo, ct);
-        if (incident is null || incident.State is "Escalated" or "Correcting" || incident.NextAttemptAt > time.GetUtcNow()) return;
+        if (incident is null) return;
+        await RefreshAfterCorrectionAsync(db, incident, ct);
+        if (incident.State is "Escalated" or "Correcting" || incident.NextAttemptAt > time.GetUtcNow()) return;
         if (incident.Attempts >= 3)
         {
             incident.State = "Escalated";
@@ -193,6 +195,12 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
                     db.LedgerEntries.Add(new LedgerEntry { WorkItemId = anchor.Id, State = anchor.State,
                         Step = HotFileAssessment.Step, Detail = incident.Answer, RecordedAt = time.GetUtcNow(),
                         Outcome = StepOutcomes.Of(anchor.State, anchor.State, HotFileAssessment.Step, incident.Answer) });
+                if (answer.Decision is "safe" or "unsafe" && capture is not null)
+                {
+                    RecoveryCorrections.ValidateAssessment(incident, answer, snapshot, correction: false);
+                    if (await capture(snapshot, ct) != answer.Material)
+                        throw new InvalidOperationException("Snapshot evidence changed before accepting assessment authority.");
+                }
                 var current = await EvidenceAsync(db, repo, ct);
                 // Any new merge touching a reviewed file invalidates the assessment, including overlapping evidence.
                 var paths = snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Base, File: f))).ToHashSet();
@@ -216,7 +224,8 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
                         if (bases.Length != 1) throw new InvalidOperationException("Correction spans more than one delivery base.");
                         var yaml = await policy(RepoRef.Parse(repo), material.BaseTips[bases[0]], ct)
                             ?? throw new InvalidOperationException("Correction base has no gate policy.");
-                        await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(yaml), time.GetUtcNow(), ct);
+                        var next = (await db.RecoveryCorrections.Where(c => c.IncidentId == incident.Id).MaxAsync(c => (int?)c.Attempt, ct) ?? 0) + 1;
+                        await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(yaml), time.GetUtcNow(), ct, next);
                     }
                     catch (Exception ex) when (!ct.IsCancellationRequested)
                     {
@@ -224,6 +233,12 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
                         incident.Error = "Correction refused; repository remains held: " + ex.Message;
                         await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct);
                     }
+                }
+                else if (!changed && answer.Decision == "unsafe" && answer.PendingDispositions.Count > 0 && capture is not null)
+                {
+                    await RecordRedirectsAsync(db, incident, answer, time.GetUtcNow(), ct);
+                    incident.State = "Held";
+                    incident.Error = "Pending work redirected; awaiting fresh assessment.";
                 }
                 else
                 {

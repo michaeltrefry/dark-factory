@@ -97,6 +97,36 @@ public class GitWorkspaceTests
         return "";
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Recovery_restart_replaces_old_work_and_includes_the_delivered_commit_without_losing_plan_blockers(bool planChild)
+    {
+        var seed = Path.Combine(_root, "seed");
+        Git(seed, "checkout", "-b", "factory/changeset-sc-1");
+        File.WriteAllText(Path.Combine(seed, "blocker.txt"), "merged plan blocker");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "blocker");
+        Git(seed, "push", _remote, "factory/changeset-sc-1");
+        Git(seed, "checkout", "main");
+        File.WriteAllText(Path.Combine(seed, "fixed.txt"), "delivered repair");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "repair");
+        Git(seed, "push", _remote, "main");
+        var corrected = Git(seed, "rev-parse", "HEAD").Trim();
+        var workspace = Workspace();
+        var old = await workspace.PrepareAsync(Repo, "factory/sc-77", default);
+        File.WriteAllText(Path.Combine(old.Path, "stale.txt"), "old assumptions");
+        var fresh = await workspace.PrepareCorrectedAsync(Repo, "factory/sc-77", corrected, default,
+            planChild ? "factory/changeset-sc-1" : null);
+        Assert.Equal("delivered repair", File.ReadAllText(Path.Combine(fresh.Path, "fixed.txt")));
+        Assert.False(File.Exists(Path.Combine(fresh.Path, "stale.txt")));
+        Assert.Equal(planChild, File.Exists(Path.Combine(fresh.Path, "blocker.txt")));
+        Assert.Equal(planChild ? "factory/changeset-sc-1" : "main", fresh.BaseBranch);
+        Assert.Equal("0", Git(fresh.Path, "rev-list", "--count", $"HEAD..{corrected}").Trim());
+        await workspace.RemoveAsync(Repo, fresh, default);
+    }
+
     [Fact]
     public async Task Correction_paths_include_committed_staged_unstaged_untracked_and_both_rename_sides()
     {

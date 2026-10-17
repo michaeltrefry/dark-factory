@@ -91,6 +91,53 @@ public sealed class RecoverySnapshotTests
             Repo = Repo, Title = id, State = state, EpicId = 9, Version = 1 };
     }
 
+    [Fact]
+    public async Task Reassessment_captures_delivery_and_dispositions_without_self_revoking_the_next_grant()
+    {
+        var f = new Fixture(); await f.Seed();
+        RecoveryCorrection first;
+        var before = await f.Evidence.CaptureAsync(f.Trigger, default);
+        HotFileAssessment Answer(string material, string issue)
+        {
+            var snapshot = RecoverySnapshot.FromDetail(material)!;
+            var citation = snapshot.Evidence.First(e => e.Category == "merged").Id;
+            var finding = new RecoveryFinding("merged", true, issue, "Count once", ["Counts once"],
+                ["src/a.cs", "tests/CountTests.cs"], [citation], []);
+            return new(f.Trigger.Id, 1, Repo, "high", "unsafe", f.Trigger.EvidenceHash)
+            { Material = material, MaterialSnapshot = snapshot.Id, MaterialHash = RecoverySnapshot.Hash(material), Session = "fresh",
+                Citations = [citation], Findings = [finding], CorrectionFindings = [finding] };
+        }
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var answer = Answer(before, "First defect");
+            var incident = new HotFileIncident { Repo = Repo, Generation = 1, State = "Unsafe", Snapshot = JsonSerializer.Serialize(f.Trigger),
+                EvidenceHash = f.Trigger.EvidenceHash, Answer = JsonSerializer.Serialize(answer), Session = answer.Session };
+            db.Add(incident); await db.SaveChangesAsync();
+            first = await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(TestPolicies.Standard()), DateTimeOffset.UtcNow, default);
+            await db.SaveChangesAsync();
+            first.State = "Merged";
+            var item = new WorkItem { Source = ItemNaming.Recovery.Source, ExternalId = $"rc-{first.Id}", Title = "repair", Repo = Repo, State = WorkState.Watch };
+            db.Add(item); await db.SaveChangesAsync();
+            db.Add(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Merge, Detail = new string('9', 40),
+                Outcome = StepOutcome.Passed, RecordedAt = DateTimeOffset.UtcNow });
+            incident.State = "Assessing";
+            await db.SaveChangesAsync();
+        }
+        var corrected = await f.Evidence.CaptureAsync(f.Trigger, default);
+        var materialized = RecoverySnapshot.FromDetail(corrected)!;
+        Assert.Contains(materialized.Evidence, e => e.Category == "recovery" && e.Commit == new string('9', 40));
+        Assert.Contains(materialized.Evidence, e => e.Category == "disposition");
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var incident = await db.HotFileIncidents.SingleAsync();
+            var answer = Answer(corrected, "Another defect discovered after delivery");
+            incident.State = "Unsafe"; incident.Answer = JsonSerializer.Serialize(answer);
+            await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(TestPolicies.Standard()), DateTimeOffset.UtcNow, default, 2);
+            await db.SaveChangesAsync();
+        }
+        Assert.Equal(corrected, await f.Evidence.CaptureAsync(f.Trigger, default));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

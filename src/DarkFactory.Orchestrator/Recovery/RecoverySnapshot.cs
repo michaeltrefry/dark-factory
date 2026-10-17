@@ -129,6 +129,36 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                     });
                 });
             }
+            // Settled repairs and dispositions belong to the next independent assessment.
+            var incident = await db.HotFileIncidents.AsNoTracking().SingleOrDefaultAsync(i => i.Repo == trigger.Repo && i.Generation == trigger.Generation, token);
+            var incidentId = incident?.Id;
+            var dispositions = (await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RecoveryRedirect.Step).OrderBy(e => e.Id).ToListAsync(token))
+                .Select(e => RecoveryRedirect.Parse(e.Detail)).Where(d => d is not null && d.Incident == incidentId)
+                .GroupBy(d => d!.Item).Select(g => g.Last()!).ToArray();
+            var repairs = await db.RecoveryCorrections.AsNoTracking().Where(c => c.IncidentId == incidentId
+                && (c.State == "Merged" || c.State == "Failed")).OrderBy(c => c.Id).ToListAsync(token);
+            if (incident?.State == "Correcting")
+            {
+                // Accepting an assessment writes its own derived dispositions. They cannot revoke that assessment's grant:
+                // retain the input dispositions while checking all live source/head/spec/result evidence below. The next
+                // post-delivery assessment reads the newly persisted dispositions, rather than this input projection.
+                foreach (var prior in RecoverySnapshot.FromDetail(HotFileAssessment.FromDetail(incident.Answer)?.Material)?.Evidence
+                    .Where(e => e.Category == "disposition") ?? [])
+                    Add(prior.Category, prior.Id, prior.Provenance, prior.Commit, JsonSerializer.Deserialize<JsonElement>(prior.Content));
+            }
+            else if (incident is not null)
+                foreach (var disposition in dispositions)
+                    Add("disposition", $"redirect:{disposition.Item}", $"incident:{incidentId}; affected:{disposition.Item}", disposition.Commit, disposition);
+            foreach (var repair in repairs)
+            {
+                var repairId = ItemNaming.Recovery.Format(repair.Id);
+                var work = await db.WorkItems.SingleOrDefaultAsync(i => i.ExternalId == repairId, token);
+                if (work is null) { Missing("recovery", "Repair has no ledger item."); continue; }
+                var rows = await Rows(work.Id);
+                Add("recovery", $"repair:{repair.Id}", $"incident:{repair.IncidentId}; attempt:{repair.Attempt}",
+                    rows.LastOrDefault(e => e.Step == null && e.State == WorkState.Merge)?.Detail,
+                    new { repair.Id, repair.IncidentId, repair.Attempt, repair.State, rows = Results(rows) });
+            }
             var known = await db.WorkItems.AsNoTracking().OrderBy(i => i.Id).ToListAsync(token);
             var items = known.Where(i => i.Source != ItemNaming.Recovery.Source && Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
             // Backlog/released children have no item row until intake sees them. A parent may currently be in another repo.
@@ -319,7 +349,8 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         return rows.Skip(start).ToList();
     }
 
-    private static object Results(IEnumerable<LedgerEntry> rows) => rows.Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }).ToArray();
+    private static object Results(IEnumerable<LedgerEntry> rows) => rows.Where(r => r.Step != RecoveryRedirect.Step && r.Step != HotFileAssessment.Step && r.Step != RecoverySnapshot.Step)
+        .Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }).ToArray();
     private static ItemRef Reference(WorkItem item) => ItemNaming.ParseAny(item.ExternalId)
         ?? throw new InvalidOperationException("Unknown evidence work source.");
     private static int PullNumber(string? link, RepoRef repo)
