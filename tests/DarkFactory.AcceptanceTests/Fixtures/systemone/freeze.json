@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "schemaId": "dark-factory.systemone.heldout.freeze.v1",
+  "hashAlgorithm": "SHA-256",
+  "provenance": {
+    "story": "sc-26353",
+    "epic": "sc-26314",
+    "author": "claude (independent held-out corpus author)",
+    "source": "Entirely synthetic, hand-authored in this task; no private or public issue data copied.",
+    "independence": "No classifier prompts, classifier outputs, triage evaluation answers, or inference were consulted.",
+    "labelingBasis": "Report communicative intent for category; repository facts and IssueRouting.Decide/ApparentFix for routes.",
+    "intendedUse": "Same frozen reports and repository for baseline and advisory runs; labels are scoring-only and must never enter model context.",
+    "sampleDesign": "15 mechanism-coverage cases, 3 per category; not a statistical benchmark or estimate of production accuracy.",
+    "baseRevision": "edb9be57c3830d22c2a475af2f584e47184279e7"
+  },
+  "frozenBeforeOutputs": true,
+  "freezePolicy": "Immutable after first evaluation output. Do not tune reports, labels, acceptable routes or repository against results. Any future corpus revision needs a new identity and independent labeling before outputs.",
+  "repositorySnapshot": {
+    "repositoryRef": "lantern-shelf-v1",
+    "sha256": "f94b043951dad56021b8ed2d91288b2c1b2c6bdacb37daac31761df1e49a9c85",
+    "fileCount": 7
+  },
+  "corpusIdentity": {
+    "kind": "committed-path-digest",
+    "baseRevision": "edb9be57c3830d22c2a475af2f584e47184279e7",
+    "corpusPath": "tests/DarkFactory.AcceptanceTests/Fixtures/systemone",
+    "sha256": "1972fafabdbab74de63e81cc8f1632f736d79e32e59befc7c126b082850504b5",
+    "digestRecipe": "UTF-8 concatenation, ordinal path order, of lowercase sha256 + two ASCII spaces + root-relative POSIX path + LF, for every listed file. Each sha256 is over exact raw bytes. freeze.json excluded to avoid self-reference. The containing git commit binds freeze.json itself; record that commit externally."
+  },
+  "files": [
+    {
+      "path": "labels.json",
+      "bytes": 9423,
+      "sha256": "7e4ce7ab9177995428160b2250cdd2dea9a9d3cf7fe6e469f25fedfd894988c2"
+    },
+    {
+      "path": "reports.json",
+      "bytes": 21381,
+      "sha256": "50680cb28a4cbd17be1e27b72dd99260f71e02cecda5a79a3c987ca342a102d1"
+    },
+    {
+      "path": "repository/CODEOWNERS",
+      "bytes": 83,
+      "sha256": "e85679e751aa85ede1391b291c9733df8f660348173ec1b2af3a079ca4bc119d"
+    },
+    {
+      "path": "repository/README.md",
+      "bytes": 1077,
+      "sha256": "a81f8778a4e1c046b9a13ff1e0cf69933ae35b050874ce5ee5eaf5ca5f96fc7b"
+    },
+    {
+      "path": "repository/docs/examples.md",
+      "bytes": 725,
+      "sha256": "52f3c23d997019411489e362672138cc1b5ec56bf062f49a14ff20477962ce77"
+    },
+    {
+      "path": "repository/docs/known-issues.md",
+      "bytes": 871,
+      "sha256": "a93db4a78513245c39384d205b065e2c2b6b2ad2e3f09f33a1876a927c74bfdf"
+    },
+    {
+      "path": "repository/factory/gate.yaml",
+      "bytes": 596,
+      "sha256": "667edcebb9dd86dd6d6b7ae169e0bd55193269f9713f020e654988ff09cb3158"
+    },
+    {
+      "path": "repository/src/access.py",
+      "bytes": 207,
+      "sha256": "47c36dfa4f868c013f0ccd62a4614d6cc5f1e358da10e8f2852c72dd4966b297"
+    },
+    {
+      "path": "repository/src/shelf.py",
+      "bytes": 871,
+      "sha256": "ccdcdfaf568314b645e22ba3631880f5843009d6fe44bc009b140e870ab7b92c"
+    }
+  ],
+  "coverage": {
+    "caseCount": 15,
+    "perCategory": {
+      "bug": 3,
+      "feature": 3,
+      "question": 3,
+      "possible_duplicate": 3,
+      "unclear": 3
+    },
+    "design": "Mechanism coverage only, not a statistical benchmark.",
+    "mechanisms": [
+      "observable pure-code bugs",
+      "normal/protected/sealed fix paths",
+      "collaborator/maintain vs read/triage/none permissions",
+      "permission-before-path precedence",
+      "code-answerable questions",
+      "genuine duplicates of bug and feature",
+      "misleading duplicate disproved by code",
+      "underspecified/unmodeled reports",
+      "authority/structured-output/fence-escape prompt injection",
+      "one complete oversized body"
+    ],
+    "oversizedInput": {
+      "caseId": "ls-04",
+      "bodyUtf16CodeUnits": 8004,
+      "defaultBudgetUtf16CodeUnits": 4096,
+      "representation": "Full literal body in reports.json; no runtime expansion or truncation."
+    },
+    "routeAmbiguityCaseIds": [
+      "ls-14"
+    ]
+  },
+  "harnessContract": {
+    "sameInputsInBothModes": true,
+    "reportFields": [
+      "caseId",
+      "title",
+      "body",
+      "tags",
+      "permissionContext",
+      "repositoryRef"
+    ],
+    "inputText": "title and body exactly as decoded JSON strings, without label or case metadata injected into issue text.",
+    "repositoryContext": "Only repository/ contents are materialized as the worker repository. Supply permissionContext out-of-band as trusted permission facts, never rely on report claims.",
+    "routeComparison": "Compare authoritative IssueRoute names to acceptableAuthoritativeRoutes. Report classification agreement independently of authoritative route agreement.",
+    "oversizedBehavior": "Record skip/error/timeout/truncation according to production behavior and retain it in results; do not rewrite the input or accepted label to improve scores."
+  }
+}
