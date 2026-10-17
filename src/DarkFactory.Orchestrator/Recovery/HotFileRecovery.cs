@@ -364,11 +364,28 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         string? deliveryBase = null, string? baseSha = null, IReadOnlyList<string>? paths = null)
     {
         if (!ItemNaming.Recovery.TryParse(externalId, out var id) || capture is null || policy is null) return false;
-        await using var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
-        if (held is null) return false;
         await using var db = await contexts.CreateDbContextAsync(ct);
         var correction = await RecoveryWorkSource.ValidAsync(db, id, ct);
         if (correction is null || correction.Repo != Key(repository)) return false;
+        // Backoff (E11): after a boundary that could not verify, nothing is captured again before RetryAt — not every poll.
+        if (correction.RetryAt > time.GetUtcNow()) return false;
+        // Other holders of the repository's lock are brief while it is Correcting (a hold check, a reconciliation, another
+        // boundary): wait for it a little before calling the boundary unverifiable.
+        var lockUntil = DateTimeOffset.UtcNow + LockWait;
+        var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
+        while (held is null && DateTimeOffset.UtcNow < lockUntil)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(50), ct);
+            held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
+        }
+        await using var _ = held;
+        if (held is null)
+        {
+            // Another process is deciding the repository. Counted like any unverifiable boundary, under the rows' CAS tokens.
+            try { await DeferAsync(db, correction, null, "the repository's recovery lock is held by another process", externalId, ct); }
+            catch (DbUpdateConcurrencyException) { } // a writer under the lock decided meanwhile; the next boundary reads it
+            return false;
+        }
         var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == correction.IncidentId, ct);
         var trigger = HotFileSnapshot.Parse(incident.Snapshot);
         var provenStale = false;
@@ -394,21 +411,54 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                 throw new InvalidOperationException("Correction delivery base no longer matches its pinned grant.");
             if (paths is not null && paths.Any(p => !envelope.Contains(p, StringComparer.Ordinal)))
                 throw new InvalidOperationException("Correction diff leaves its authorized repair envelope.");
+            if (correction.Deferrals != 0 || correction.RetryAt is not null)
+            {
+                // A verified boundary ends the run of deferrals.
+                correction.Deferrals = 0; correction.RetryAt = null; correction.Version++;
+                await db.SaveChangesAsync(ct);
+            }
             return true;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            var reason = "Correction authorization deferred (could not verify): " + ex.Message;
-            if (provenStale)
+            if (!provenStale)
             {
-                correction.State = "Revoked"; correction.Version++;
-                incident.State = "Refreshing"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
-                reason = incident.Error;
+                await DeferAsync(db, correction, incident, ex.Message, externalId, ct);
+                return false;
             }
-            await RecoveryCorrections.RecordRefusalAsync(db, incident, reason, time.GetUtcNow(), ct, externalId);
+            correction.State = "Revoked"; correction.Version++;
+            incident.State = "Refreshing"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
+            await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct, externalId);
             await db.SaveChangesAsync(ct);
             return false;
         }
+    }
+
+    /// <summary>Boundary authorizations in a row that may not verify before the incident escalates (E11).</summary>
+    internal const int DeferralLimit = 3;
+
+    /// <summary>How long a boundary waits for the repository's recovery lock before it counts as unverifiable.</summary>
+    internal static readonly TimeSpan LockWait = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// A boundary that could not verify the correction's authority (no proof it is stale): counted durably on the correction,
+    /// retried after 30 s then 120 s (the assessment retry backoff), and after <see cref="DeferralLimit"/> in a row the incident
+    /// escalates with the reason and the human remedy — never a capture and a pair of pause rows every poll, forever.
+    /// </summary>
+    private async Task DeferAsync(LedgerDbContext db, RecoveryCorrection correction, HotFileIncident? incident, string why,
+        string externalId, CancellationToken ct)
+    {
+        incident ??= await db.HotFileIncidents.SingleAsync(i => i.Id == correction.IncidentId, ct);
+        var now = time.GetUtcNow();
+        correction.Deferrals++;
+        correction.RetryAt = now + RetryDelay(correction.Deferrals);
+        correction.Version++;
+        var reason = $"Correction authorization deferred (could not verify, {correction.Deferrals} of {DeferralLimit} in a row): {why}";
+        if (correction.Deferrals >= DeferralLimit)
+            Escalate(incident, $"Correction authority could not be verified {DeferralLimit} times in a row ({why}); fix the named "
+                + $"evidence or environment problem, then `factory recovery reassess --repo {incident.Repo}`");
+        await RecoveryCorrections.RecordRefusalAsync(db, incident, reason, now, ct, externalId);
+        await db.SaveChangesAsync(ct);
     }
 
     /// <summary>

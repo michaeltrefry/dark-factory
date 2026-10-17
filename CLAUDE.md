@@ -944,6 +944,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   (resumes by itself once it resolves; dashboard phase "held by repository recovery"), and so is a correction whose boundary
   authorization refused or could not verify it (a busy repository lock, a capture that cannot be read:
   `ControlRequestedException.CorrectionDeferred`); `user-paused` only when a human Pause holds it too (then both must lift).
+  Such a deferral (no proof the grant is stale; a busy lock is waited for `HotFileRecovery.LockWait`, 5 s, first) is counted on
+  the correction (`recovery_corrections.Deferrals`, migration `RecoveryCorrectionDeferrals`) and no boundary is tried again
+  before `RetryAt` (30 s, then 120 s): a poll inside the backoff captures and writes nothing; after
+  `HotFileRecovery.DeferralLimit` (3) in a row the incident escalates naming the reason and `factory recovery reassess`; a
+  verified boundary resets the count.
   Recovery's own ledger rows are never evidence: one rule, `RecoverySnapshot.IsBookkeeping` (every `recovery-` step, and the
   slot rows), so rows anchored on a pending item (a Planned coordinator) cannot revoke the grant they record. Human supremacy (E2): no recovery stage writes a control; a safe answer never synthesizes Running;
   a Stop is never undone; `continue --repo` lifts only that Pause, not an incident. Re-arm (E11): an Escalated incident holds

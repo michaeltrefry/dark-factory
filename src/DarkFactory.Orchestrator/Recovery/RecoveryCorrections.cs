@@ -23,6 +23,10 @@ public sealed class RecoveryCorrection
     public required string Spec { get; set; }
     public required string State { get; set; }
     public long Version { get; set; }
+    /// <summary>Boundary authorizations in a row that could not verify the grant (an unreadable capture, a busy repository lock).</summary>
+    public int Deferrals { get; set; }
+    /// <summary>No boundary authorization is tried before this (30 s after the first deferral, then 120 s): no capture every poll.</summary>
+    public DateTimeOffset? RetryAt { get; set; }
 }
 
 /// <summary>Captured contributing item/plan ancestry, not a new manual control. Human controls are only read.</summary>

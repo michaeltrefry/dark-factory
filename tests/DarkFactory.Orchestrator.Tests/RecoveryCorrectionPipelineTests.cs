@@ -312,7 +312,69 @@ public class RecoveryCorrectionPipelineTests
         f.CaptureFault = null;
         f.AfterWorker = null;
         locks.Busy = false;
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(30)); // the deferral's backoff
         Assert.Equal(WorkState.Watch, (await f.Run()).State);
+    }
+
+    /// <summary>
+    /// Review round 3 (E11): authority that can never be verified (a capture that never reads) is retried after 30 s, then 120 s,
+    /// never every poll, and after three deferrals in a row the incident escalates with the reason and the re-arm remedy.
+    /// Polls in between capture nothing and write nothing (no paired unpaused/paused rows).
+    /// </summary>
+    [Fact]
+    public async Task Unverifiable_correction_authority_backs_off_and_escalates_after_three_deferrals()
+    {
+        var f = new Fixture(); await f.Initialize();
+        f.CaptureFault = _ => new HttpRequestException("evidence store unreachable");
+        var time = f.Recovery.Seed.Time;
+        async Task<(int Faults, int Rows)> Poll()
+        {
+            await f.Run();
+            await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+            return (f.Captures.Count(c => c == "fault"), (await f.Rows()).Count);
+        }
+        Assert.Equal(1, (await Poll()).Faults);
+        var quiet = await Poll(); // inside the 30 s backoff: nothing captured, nothing written
+        Assert.Equal(1, quiet.Faults);
+        Assert.Equal(quiet, await Poll());
+        time.Advance(TimeSpan.FromSeconds(30));
+        Assert.Equal(2, (await Poll()).Faults);
+        time.Advance(TimeSpan.FromSeconds(119));
+        Assert.Equal(2, (await Poll()).Faults); // the second backoff is 120 s
+        time.Advance(TimeSpan.FromSeconds(1));
+        var escalated = await Poll();
+        Assert.Equal(3, escalated.Faults);
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+        {
+            var incident = await db.HotFileIncidents.SingleAsync();
+            Assert.Equal("Escalated", incident.State);
+            Assert.Contains("could not be verified 3 times in a row (evidence store unreachable)", incident.Error);
+            Assert.Contains("factory recovery reassess --repo owner/alpha", incident.Error);
+            Assert.Equal(3, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
+            Assert.Equal(3, await db.LedgerEntries.CountAsync(e => e.Step == RecoveryCorrections.RefusalStep && e.Detail!.Contains("in a row")));
+        }
+        // Escalated: the grant is void, so later polls capture nothing and write nothing either.
+        time.Advance(TimeSpan.FromHours(1));
+        Assert.Equal(escalated, await Poll());
+        Assert.Empty(f.Prs.Opened);
+    }
+
+    [Fact]
+    public async Task A_verified_boundary_after_a_deferral_resets_the_count_and_delivers()
+    {
+        var f = new Fixture(); await f.Initialize();
+        f.CaptureFault = n => n == 1 ? new HttpRequestException("evidence read timed out") : null;
+        await f.Run();
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.Equal(1, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(30));
+        Assert.Equal(WorkState.Watch, (await f.Run()).State);
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+        {
+            var correction = await db.RecoveryCorrections.SingleAsync();
+            Assert.Equal((0, (DateTimeOffset?)null), (correction.Deferrals, correction.RetryAt));
+            Assert.NotEqual("Escalated", (await db.HotFileIncidents.SingleAsync()).State);
+        }
     }
 
     [Fact]

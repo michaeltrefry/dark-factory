@@ -595,6 +595,9 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
+                    b.Property<int>("Deferrals")
+                        .HasColumnType("integer");
+
                     b.Property<string>("EvidenceHash")
                         .IsRequired()
                         .HasColumnType("text");
@@ -621,6 +624,9 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .IsRequired()
                         .HasMaxLength(200)
                         .HasColumnType("character varying(200)");
+
+                    b.Property<DateTimeOffset?>("RetryAt")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("Snapshot")
                         .IsRequired()

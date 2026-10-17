@@ -255,6 +255,9 @@ public sealed class RecoveryGrantTests
             Assert.Equal("Correcting", Assert.Single(db.HotFileIncidents).State);
         }
         unavailable = false;
+        // Within the deferral's 30 s backoff nothing is tried again; after it the verified grant passes.
+        Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
+        f.Seed.Time.Advance(TimeSpan.FromSeconds(30));
         Assert.True(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
         Assert.Equal(c.Id, (await f.Materialize()).Id);
         Assert.Equal(new[] { c.Id }, await f.Source.ListReadyAsync(default));
