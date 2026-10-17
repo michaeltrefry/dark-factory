@@ -32,6 +32,81 @@ public class RecoveryReassessTests
         return f;
     }
 
+    /// <summary>Two generations of one repository: the first resolved, then a later merge opens and resolves the second.</summary>
+    private static async Task<(HotFileRecoveryTests.Fixture F, long Older, long Newer)> TwoGenerationsAsync()
+    {
+        var f = new HotFileRecoveryTests.Fixture();
+        for (var i = 0; i < 8; i++) await f.Merge(A);
+        await using (var recovery = f.Recovery) await recovery.AdvanceAsync(A, default);
+        await f.Merge(A);
+        await using (var recovery = f.Recovery) await recovery.AdvanceAsync(A, default);
+        await using var db = f.Contexts.CreateDbContext();
+        var incidents = await db.HotFileIncidents.OrderBy(i => i.Generation).ToListAsync();
+        Assert.Equal(new[] { ("Resolved", 1), ("Resolved", 2) }, incidents.Select(i => (i.State, i.Generation)));
+        return (f, incidents[0].Id, incidents[1].Id);
+    }
+
+    private static async Task SetAsync(HotFileRecoveryTests.Fixture f, long id, string state)
+    {
+        await using var db = f.Contexts.CreateDbContext();
+        var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == id);
+        incident.State = state; incident.Attempts = 0; incident.NextAttemptAt = null; incident.Version++;
+        await db.SaveChangesAsync();
+    }
+
+    [Fact]
+    public async Task An_older_unresolved_generation_behind_a_newer_resolved_one_is_advanced_not_left_holding()
+    {
+        var (f, older, newer) = await TwoGenerationsAsync();
+        await SetAsync(f, older, "Held");
+        var calls = f.Assessor.Calls;
+        await using (var recovery = f.Recovery)
+        {
+            Assert.NotNull(await recovery.HeldAsync(A, default));
+            // Its evidence moved on (the later merge), so it is refreshed and then assessed afresh — driven, not stranded.
+            for (var i = 0; i < 3 && await recovery.HeldAsync(A, default) is not null; i++)
+            {
+                await recovery.AdvanceAsync(A, default);
+                f.Time.Advance(TimeSpan.FromMinutes(5));
+            }
+            Assert.Null(await recovery.HeldAsync(A, default));
+        }
+        Assert.True(f.Assessor.Calls > calls);
+        await using var db = f.Contexts.CreateDbContext();
+        Assert.Equal("Resolved", (await db.HotFileIncidents.SingleAsync(i => i.Id == older)).State);
+        Assert.Equal("Resolved", (await db.HotFileIncidents.SingleAsync(i => i.Id == newer)).State);
+        Assert.Equal(2, await db.HotFileIncidents.CountAsync());
+    }
+
+    [Fact]
+    public async Task Every_unresolved_generation_of_a_repository_is_advanced_by_one_poll_not_only_the_newest()
+    {
+        var (f, older, newer) = await TwoGenerationsAsync();
+        await SetAsync(f, older, "Held");
+        await SetAsync(f, newer, "Held");
+        var calls = f.Assessor.Calls;
+        await using (var recovery = f.Recovery) await recovery.AdvanceAsync(A, default);
+        Assert.Equal(calls + 2, f.Assessor.Calls);
+        await using var db = f.Contexts.CreateDbContext();
+        Assert.All(await db.HotFileIncidents.ToListAsync(), i => Assert.Equal(1, i.Attempts));
+    }
+
+    [Fact]
+    public async Task Reassess_rearms_an_older_escalated_generation_behind_a_newer_resolved_one()
+    {
+        var (f, older, newer) = await TwoGenerationsAsync();
+        await SetAsync(f, older, "Escalated");
+        var result = await new RecoveryReassessment(f.Contexts, f.Locks, f.Time).ReassessAsync(A, "human", default);
+        Assert.True(result.Ok, result.Message);
+        await using var db = f.Contexts.CreateDbContext();
+        var rearmed = await db.HotFileIncidents.SingleAsync(i => i.Id == older);
+        // A generation is unique per repository: the re-armed incident takes the next one after every incident's.
+        Assert.Equal(("Held", 3), (rearmed.State, rearmed.Generation));
+        var untouched = await db.HotFileIncidents.SingleAsync(i => i.Id == newer);
+        Assert.Equal(("Resolved", 2), (untouched.State, untouched.Generation));
+        Assert.Contains($"incident {older} generation 1", (await db.LedgerEntries.SingleAsync(e => e.Step == RecoveryReassessment.Step)).Detail);
+    }
+
     private static async Task<string> ControlsJsonAsync(HotFileRecoveryTests.Fixture f)
     {
         await using var db = f.Contexts.CreateDbContext();

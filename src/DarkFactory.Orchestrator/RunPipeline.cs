@@ -969,8 +969,8 @@ public sealed partial class RunPipeline(
         if (known is not null)
         {
             if (knownControl == ControlState.Running) await ObserveCorrectionMergeAsync(known, ct);
-            // Repository controls are checked only after the fresh spec and the ledger resolve the operation repository.
-            if (knownControl == ControlState.Stopping) return await StopIdleAsync(known, storyId, ct);
+            // Repository controls are checked only after the fresh spec and the ledger resolve the operation repository
+            // (resolvedControl, under the run lock); a Stop without them was finished above.
             if (knownControl == ControlState.Paused)
             {
                 log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");

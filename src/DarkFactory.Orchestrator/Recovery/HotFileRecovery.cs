@@ -128,7 +128,9 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
     private async Task<HotFileIncident?> DetectLockedAsync(LedgerDbContext db, string repo, CancellationToken ct)
     {
         var incidents = await db.HotFileIncidents.Where(i => i.Repo == repo).OrderBy(i => i.Generation).ToListAsync(ct);
-        if (incidents.LastOrDefault() is { State: not "Resolved" } active) return active;
+        // Any unresolved generation holds the repository (LedgerControls), so any one is the active incident here, the newest
+        // first; AdvanceAsync drives every one of them, never only the newest.
+        if (incidents.LastOrDefault(i => i.State != "Resolved") is { } active) return active;
         var evidence = await EvidenceAsync(db, repo, ct);
         var acknowledged = incidents.Where(i => i.State == "Resolved").SelectMany(i => HotFileSnapshot.Parse(i.Snapshot).Merges)
             .SelectMany(m => m.Files.Select(f => (m.Row, m.Base, File: f))).ToHashSet();
@@ -162,8 +164,16 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         await using var held = await locks.TryAcquireAsync(LockKey(repo), ct);
         if (held is null) return;
         await using var db = await contexts.CreateDbContextAsync(ct);
-        var incident = await DetectLockedAsync(db, repo, ct);
-        if (incident is null) return;
+        if (await DetectLockedAsync(db, repo, ct) is null) return;
+        // Every unresolved incident of the repository holds it, so every one is advanced, oldest generation first — an older
+        // generation left unresolved behind a newer one would otherwise hold the repository with nothing to move it.
+        var unresolved = await db.HotFileIncidents.Where(i => i.Repo == repo && i.State != "Resolved")
+            .OrderBy(i => i.Generation).ThenBy(i => i.Id).ToListAsync(ct);
+        foreach (var each in unresolved) await AdvanceIncidentAsync(db, repo, each, ct);
+    }
+
+    private async Task AdvanceIncidentAsync(LedgerDbContext db, string repo, HotFileIncident incident, CancellationToken ct)
+    {
         // Terminal escalation is sticky. Only a failed delivery awaiting its first observation may leave the legacy
         // Escalated state; no spent assessment/refresh budget can be reset by observing an old merge again.
         await ReconcileCorrectionAsync(db, incident, ct);

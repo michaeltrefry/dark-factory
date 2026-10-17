@@ -251,6 +251,7 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<Recovery.RecoveryCorrection> RecoveryCorrections => Set<Recovery.RecoveryCorrection>();
     public DbSet<Recovery.RecoveryAncestor> RecoveryAncestors => Set<Recovery.RecoveryAncestor>();
     public DbSet<Recovery.RecoveryAssessmentAttempt> RecoveryAssessmentAttempts => Set<Recovery.RecoveryAssessmentAttempt>();
+    public DbSet<Recovery.RecoveryMaterial> RecoveryMaterials => Set<Recovery.RecoveryMaterial>();
 
     // E3: an incident's state change is saved with its append-only ledger row (Recovery.IncidentTransitions).
     public override int SaveChanges(bool acceptAllChangesOnSuccess)
@@ -291,6 +292,12 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.Scope).HasMaxLength(240);
             e.HasOne(x => x.Correction).WithMany().HasForeignKey(x => x.CorrectionId).OnDelete(DeleteBehavior.Restrict);
             e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<Recovery.RecoveryMaterial>(e =>
+        {
+            e.ToTable("recovery_materials");
+            e.HasKey(x => x.Hash);
+            e.Property(x => x.Hash).HasMaxLength(64);
         });
         modelBuilder.Entity<Recovery.HotFileIncident>(e =>
         {

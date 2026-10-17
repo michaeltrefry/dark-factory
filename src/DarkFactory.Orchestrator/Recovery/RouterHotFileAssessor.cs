@@ -20,8 +20,10 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         if (!captured.Complete || captured.IncidentSnapshot != snapshot.Id || captured.Repo != snapshot.Repo || captured.Generation != snapshot.Generation)
             throw new InvalidOperationException("Required recovery snapshot is incomplete or names another incident.");
         var prompt = ReviewPrompts.For("hot-file-assessment");
+        // An index, not the bodies: up to 2 MiB of evidence inline would leave the tool budget at its floor and overrun the
+        // context. Every entry is read by id through read_evidence, which serves exactly these hashed bodies.
         var request = JsonSerializer.Serialize(new { version = 1, snapshot.Id, snapshot.Generation, snapshot.Repo, snapshot.EvidenceHash,
-            materialHash = RecoverySnapshot.Hash(material), material = captured });
+            materialHash = RecoverySnapshot.Hash(material), material = Index(captured) });
         var bindings = new RecoveryAssessmentTools(captured, files, request.Length + prompt.Text.Length).Bindings;
         AssessmentConversation? conversation = null;
         HotFileAssessment Inconclusive(string why) => new(snapshot.Id, snapshot.Generation, snapshot.Repo, conversation?.Class,
@@ -71,6 +73,15 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
             Tools = conversation?.Tools ?? [], Turns = conversation?.Turns ?? [],
             CostUsd = cost is { RequestCount: > 0 } ? cost.ActualCostUsdMicros / 1_000_000m : null };
     }
+
+    /// <summary>The material as the model is first shown it: identity, base tips, what is missing, and per evidence entry its id,
+    /// category, provenance, commits, SHA-256 and UTF-8 size — never its content.</summary>
+    internal static object Index(RecoverySnapshot material) => new
+    {
+        material.Id, material.IncidentSnapshot, material.Repo, material.Generation, material.BaseTips, material.Missing,
+        Evidence = material.Evidence.Select(e => new { e.Id, e.Category, e.Provenance, e.Commit, e.BaseCommit, e.Hash,
+            Bytes = Encoding.UTF8.GetByteCount(e.Content) }).ToArray(),
+    };
 
     private async Task<string> CaptureAsync(HotFileSnapshot snapshot, CancellationToken ct)
     {

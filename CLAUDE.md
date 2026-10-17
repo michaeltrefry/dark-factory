@@ -923,9 +923,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   generation (`RecoveryCorrections.CorrectionLimit`; attempt numbers stay monotone per incident, a generation counts from the
   last attempt before it, `BaselineAsync`), 3 evidence refreshes per incident (reset only by a human re-arm); a failed or inconclusive assessment
   retries after 30 s, then 120 s; at most one assessment per repository and two across processes (two advisory seats beside a
-  process limiter); snapshots refuse more than 50 contributing merges, 100 pending items or 2 MiB as incomplete, never safe.
+  process limiter); snapshots refuse more than 50 contributing merges, 100 pending items or 2 MiB as incomplete, never safe. A capture's body
+  is stored once per content hash in `recovery_materials` (`RecoveryMaterial`, migration `RecoveryMaterials`) before any
+  router call, and its `recovery-snapshot` ledger row is a small `RecoveryCapture` naming that hash (with what was missing),
+  so captures at every authority boundary never add multi-MiB rows to an item's history; the full material stays in the
+  assessment's own answer.
   Assessment (E4/E5): a fresh router session on `high` (`RouterHotFileAssessor`, the compiled-in `hot-file-assessment`
-  prompt, read-only tools pinned to snapshot commits), its answer bound to incident, generation, snapshot, repo and evidence
+  prompt, read-only tools pinned to snapshot commits; the request carries an index of the evidence — each entry's id,
+  category, provenance, commits, SHA-256 and size, `RouterHotFileAssessor.Index` — and the model reads each body through
+  `read_evidence`, so the tool budget is not spent on inline material), its answer bound to incident, generation, snapshot, repo and evidence
   hash and parsed strictly (`RecoveryDecision`); only the exact current safe answer resolves, acknowledging exactly its
   (merge row, base, file) tuples beyond the window and restarts (a later merge of a reviewed file opens a new generation).
   Correction (E7/E8): an accepted unsafe merged finding materializes ONE `rc-<n>` work item per attempt in exactly the
@@ -940,7 +946,15 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   structural `EffectiveAsync` composition only, which already contains the grant predicate — no capture (`RecoveryCorrectionPipelineTests.A_correction_captures_evidence_once_…`).
   The correction then runs the ordinary panel, CI, new-tests, taint, gate and merge queue unweakened; a gate merge is not a safe
   verdict: the delivered commit is reassessed afresh (E10), and affected pending work restarts fresh from the corrected base
-  (`RecoveryRedirect`). Held work: an item a hold stops mid-run is recorded `recovery-held` when only the incident holds it
+  (`RecoveryRedirect`). A disposition is revalidated against fresh evidence (`HotFileRecovery.RedirectAsync`) only while the
+  item has not yet acted on it and its incident is the repository's newest: once its exact `recovery-restarted` row exists it
+  is returned as recorded with no capture, lock or write (another item's merge moving the base, or another pending item
+  advancing, says nothing about a restart already made); one the item outgrew without restarting (Merge, Watch, Done,
+  Cancelled, a plan coordinator) is void; one of an older incident is returned without capture when the newest incident is
+  resolved and deferred while it is not. Only the newest incident's own unconsumed disposition may send that incident back to
+  Refreshing on a mismatch, so an old generation is never reopened. Every unresolved incident of a repository holds it, and
+  every one is advanced (`AdvanceAsync`, oldest generation first) and re-armed (`reassess` re-arms each escalated incident,
+  each to the next generation after all of the repository's). Held work: an item a hold stops mid-run is recorded `recovery-held` when only the incident holds it
   (resumes by itself once it resolves; dashboard phase "held by repository recovery"), and so is a correction whose boundary
   authorization refused or could not verify it (a busy repository lock, a capture that cannot be read:
   `ControlRequestedException.CorrectionDeferred`); `user-paused` only when a human Pause holds it too (then both must lift).
@@ -955,7 +969,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   slot rows), so rows anchored on a pending item (a Planned coordinator) cannot revoke the grant they record. Human supremacy (E2): no recovery stage writes a control; a safe answer never synthesizes Running;
   a Stop is never undone; `continue --repo` lifts only that Pause, not an incident. Re-arm (E11): an Escalated incident holds
   its repository until a human runs `factory recovery reassess --repo owner/name` (owner CLI) or the dashboard incident panel's
-  Reassess (login + antiforgery, `DashboardControls.ReassessPath`): the SAME incident moves to a new generation over its
+  Reassess (login + antiforgery, `DashboardControls.ReassessPath`; a refusal answers 409 with its reason, nothing written): the SAME incident moves to a new generation over its
   recorded merges with fresh budgets (assessments, refreshes and corrections), revoking the old generation's waiting
   correction grants, with one audited `recovery-reassess` ledger row (who, when, incident, old and new generation), under the
   repository lock; it clears no Pause or Stop, leaves the freeze, usage and other incidents byte-identical, and a stopped

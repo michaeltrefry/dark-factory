@@ -653,6 +653,24 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("recovery_corrections", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryMaterial", b =>
+                {
+                    b.Property<string>("Hash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Body")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("CapturedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Hash");
+
+                    b.ToTable("recovery_materials", (string)null);
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.IssueClassification", b =>
                 {
                     b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)

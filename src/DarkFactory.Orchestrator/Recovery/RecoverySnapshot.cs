@@ -19,6 +19,30 @@ public sealed record RecoveryEvidence(string Id, string Category, string Provena
 public sealed record MissingRecoveryEvidence(string Category, string Reason);
 
 /// <summary>
+/// The full body of one captured material, kept once per content hash (<c>recovery_materials</c>), apart from the ledger:
+/// every capture's ledger row (<see cref="RecoveryCapture"/>) names it by hash, so item histories never load multi-MiB rows.
+/// </summary>
+public sealed class RecoveryMaterial
+{
+    public required string Hash { get; set; }
+    public required string Body { get; set; }
+    public DateTimeOffset CapturedAt { get; set; }
+}
+
+/// <summary>A capture's ledger record: which material (by hash, <see cref="RecoveryMaterial"/>), for which incident snapshot, and
+/// what was missing. The body is in the side table; a capture of the same material on the same item records nothing again.</summary>
+public sealed record RecoveryCapture(string Material, string Id, string IncidentSnapshot, string Repo, int Generation, int Bytes,
+    IReadOnlyList<MissingRecoveryEvidence> Missing)
+{
+    public bool Complete => Missing.Count == 0;
+    public static RecoveryCapture? FromDetail(string? detail)
+    {
+        try { return detail is null ? null : JsonSerializer.Deserialize<RecoveryCapture>(detail); }
+        catch (JsonException) { return null; }
+    }
+}
+
+/// <summary>
 /// Immutable acquisition, identified by its canonical content. The append-only ledger retains every acquisition used for a
 /// model call, including incomplete ones. No captured timestamp is compared as evidence; commits, source content and ledger
 /// versions are. File tools must use these commits, never the branch names in BaseTips.
@@ -72,18 +96,40 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         await using var db = await contexts.CreateDbContextAsync(persist);
         anchor ??= await db.WorkItems.OrderBy(i => i.Id).Where(i => i.Repo.ToLower() == trigger.Repo.ToLower())
             .Select(i => (long?)i.Id).FirstOrDefaultAsync(persist);
+        var hash = RecoverySnapshot.Hash(material);
+        // The body once per content hash, the ledger row a small record naming it: a capture per authority boundary never
+        // appends another multi-MiB row to an item's history.
+        if (!await db.RecoveryMaterials.AnyAsync(m => m.Hash == hash, persist))
+        {
+            db.RecoveryMaterials.Add(new RecoveryMaterial { Hash = hash, Body = material, CapturedAt = DateTimeOffset.UtcNow });
+            try { await db.SaveChangesAsync(persist); }
+            catch (DbUpdateException)
+            {
+                // Another process stored the same body first (the hash is the key); anything else is this capture's failure.
+                if (!await StoredAsync(hash)) throw;
+                db.ChangeTracker.Clear();
+            }
+        }
+        var record = JsonSerializer.Serialize(new RecoveryCapture(hash, snapshot.Id, snapshot.IncidentSnapshot, snapshot.Repo,
+            snapshot.Generation, Encoding.UTF8.GetByteCount(material), snapshot.Missing));
         if (anchor is { } itemId && !await db.LedgerEntries.AnyAsync(e => e.WorkItemId == itemId
-                && e.Step == RecoverySnapshot.Step && e.Detail == material, persist))
+                && e.Step == RecoverySnapshot.Step && e.Detail == record, persist))
         {
             var state = (await db.WorkItems.SingleAsync(i => i.Id == itemId, persist)).State;
             db.LedgerEntries.Add(new LedgerEntry { WorkItemId = itemId, State = state,
-                Step = RecoverySnapshot.Step, Detail = material, RecordedAt = DateTimeOffset.UtcNow,
-                Outcome = StepOutcomes.Of(state, state, RecoverySnapshot.Step, material) });
+                Step = RecoverySnapshot.Step, Detail = record, RecordedAt = DateTimeOffset.UtcNow,
+                Outcome = StepOutcomes.Of(state, state, RecoverySnapshot.Step, record) });
             await db.SaveChangesAsync(persist);
         }
         if (!snapshot.Complete) throw new InvalidOperationException("Incomplete recovery snapshot: "
             + string.Join("; ", snapshot.Missing.Select(m => $"{m.Category}: {m.Reason}")));
         return material;
+
+        async Task<bool> StoredAsync(string key)
+        {
+            await using var check = await contexts.CreateDbContextAsync(persist);
+            return await check.RecoveryMaterials.AnyAsync(m => m.Hash == key, persist);
+        }
     }
 
     public async Task<RecoverySnapshot> SnapshotAsync(HotFileSnapshot trigger, CancellationToken ct)

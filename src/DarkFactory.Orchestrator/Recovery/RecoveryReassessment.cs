@@ -34,15 +34,30 @@ public sealed class RecoveryReassessment(IDbContextFactory<LedgerDbContext> cont
         if (held is null)
             return new(false, $"{repo}: another process is driving this repository's recovery right now; nothing was written. Try again.");
         await using var db = await contexts.CreateDbContextAsync(ct);
-        var incident = await db.HotFileIncidents.Where(i => i.Repo == repo).OrderByDescending(i => i.Generation).FirstOrDefaultAsync(ct);
-        if (incident is null) return new(false, $"{repo} has no hot-file recovery incident; nothing was written.");
-        if (incident.State != "Escalated")
-            return new(false, $"{repo} incident {incident.Id} generation {incident.Generation} is {incident.State}, not Escalated: "
+        var incidents = await db.HotFileIncidents.Where(i => i.Repo == repo).OrderBy(i => i.Generation).ThenBy(i => i.Id).ToListAsync(ct);
+        if (incidents.Count == 0) return new(false, $"{repo} has no hot-file recovery incident; nothing was written.");
+        // Every escalated incident of the repository holds it, the newest generation or an older one: each is re-armed.
+        var escalated = incidents.Where(i => i.State == "Escalated").ToList();
+        if (escalated.Count == 0)
+        {
+            var newest = incidents[^1];
+            return new(false, $"{repo} incident {newest.Id} generation {newest.Generation} is {newest.State}, not Escalated: "
                 + "only an escalated incident is re-armed; nothing was written.");
-        var old = HotFileSnapshot.Parse(incident.Snapshot);
-        var generation = incident.Generation + 1;
-        var snapshot = new HotFileSnapshot(Guid.NewGuid().ToString("N"), repo, generation, old.Merges, HotFileRecovery.Hash(old.Merges));
+        }
         var now = time.GetUtcNow();
+        var details = new List<string>();
+        // A generation is unique per repository: each re-armed incident takes the next one after every incident's.
+        var next = incidents.Max(i => i.Generation);
+        foreach (var incident in escalated) details.Add(await RearmAsync(db, repo, incident, ++next, by, now, ct));
+        await db.SaveChangesAsync(ct);
+        return new(true, $"{repo}: {string.Join("; ", details)}.");
+    }
+
+    private static async Task<string> RearmAsync(LedgerDbContext db, string repo, HotFileIncident incident, int generation,
+        string by, DateTimeOffset now, CancellationToken ct)
+    {
+        var old = HotFileSnapshot.Parse(incident.Snapshot);
+        var snapshot = new HotFileSnapshot(Guid.NewGuid().ToString("N"), repo, generation, old.Merges, HotFileRecovery.Hash(old.Merges));
         var was = $"incident {incident.Id} generation {incident.Generation} ({Cut(incident.Error)})";
         incident.Generation = generation;
         incident.Snapshot = JsonSerializer.Serialize(snapshot);
@@ -72,8 +87,7 @@ public sealed class RecoveryReassessment(IDbContextFactory<LedgerDbContext> cont
         if (anchor is not null)
             db.LedgerEntries.Add(new LedgerEntry { WorkItemId = anchor.Id, State = anchor.State, Step = Step, Detail = detail,
                 RecordedAt = now, Outcome = StepOutcomes.Of(anchor.State, anchor.State, Step, detail) });
-        await db.SaveChangesAsync(ct);
-        return new(true, $"{repo}: {detail}.");
+        return detail;
     }
 
     private static string Cut(string? text) => text is null ? "no reason recorded" : text.Length <= 300 ? text : text[..300] + "…";

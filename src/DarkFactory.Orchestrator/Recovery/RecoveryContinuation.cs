@@ -128,19 +128,44 @@ public sealed partial class HotFileRecovery
         }
     }
 
-    /// <summary>Only a safe, current incident can hand a disposition to a run. The caller still composes every control.</summary>
+    /// <summary>
+    /// Only a safe, current incident can hand a not-yet-consumed disposition to a run. The caller still composes every control.
+    /// <para>A disposition the item has already acted on (its exact <see cref="RecoveryRedirect.Started"/> row exists) is
+    /// returned as recorded, with no capture, no lock and no write: the restarted attempt needs its commit and context, and
+    /// later evidence (another item's merge moving the base, a pending item advancing) is not about whether that restart was
+    /// authorized. One the item has outgrown without restarting (it is merged, finished or a plan coordinator now) is void:
+    /// null. One whose incident is no longer the repository's newest, while that newest incident is resolved, is returned
+    /// without capture too: the newer safe assessment saw this item pending, and a fresh restart from the current base only
+    /// discards work. Only the newest incident's own unconsumed disposition is revalidated against fresh evidence, and only
+    /// then may a mismatch send that incident back to Refreshing (a fresh assessment, bounded by the refresh budget): an old
+    /// incident is never reopened, so a repository is never held by a generation nothing advances.</para>
+    /// </summary>
     public async Task<RecoveryRedirect?> RedirectAsync(string externalId, CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var mark = RecoveryRedirect.ItemMark(externalId);
-        var detailRow = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RecoveryRedirect.Step
-            && e.Detail != null && e.Detail.Contains(mark)).OrderByDescending(e => e.Id).Select(e => e.Detail).FirstOrDefaultAsync(ct);
-        var redirect = RecoveryRedirect.Parse(detailRow);
-        if (redirect is null) return null;
+        var row = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RecoveryRedirect.Step
+            && e.Detail != null && e.Detail.Contains(mark)).OrderByDescending(e => e.Id)
+            .Select(e => new { e.Detail }).FirstOrDefaultAsync(ct);
+        var redirect = RecoveryRedirect.Parse(row?.Detail);
+        if (redirect is null || redirect.Item != externalId) return null;
+        if (await db.LedgerEntries.AsNoTracking().AnyAsync(e => e.Step == RecoveryRedirect.Started && e.Detail == row!.Detail, ct))
+            return redirect;
+        var state = await db.WorkItems.AsNoTracking().Where(i => i.ExternalId == externalId && i.Source != ItemNaming.Recovery.Source)
+            .Select(i => (WorkState?)i.State).FirstOrDefaultAsync(ct);
+        if (state is WorkState.Merge or WorkState.Watch or WorkState.Done or WorkState.Cancelled or WorkState.Planned or WorkState.Plan)
+            return null;
         await using var repoLock = await locks.TryAcquireAsync(LockKey(redirect.Repo), ct);
         if (repoLock is null) throw new RecoveryContinuationDeferredException("Required redirect is temporarily unverifiable: repository lock is held.");
         var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == redirect.Incident, ct);
         if (incident.State != "Resolved") throw new RecoveryContinuationDeferredException("Required redirect awaits a safe current assessment.");
+        var newest = await db.HotFileIncidents.AsNoTracking().Where(i => i.Repo == incident.Repo)
+            .OrderByDescending(i => i.Generation).ThenByDescending(i => i.Id).FirstAsync(ct);
+        if (newest.Id != incident.Id)
+        {
+            if (newest.State == "Resolved") return redirect;
+            throw new RecoveryContinuationDeferredException("Required redirect awaits the repository's newer incident.");
+        }
         try
         {
             if (capture is null) throw new InvalidOperationException("Redirect requires current pinned recovery evidence.");

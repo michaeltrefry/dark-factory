@@ -292,9 +292,24 @@ public sealed class RecoverySnapshotTests
         Assert.Contains(snapshot.Evidence, e => e.Category == "pending" && e.Content.Contains(f.GitHub.Head));
         Assert.Contains(f.GitHub.Calls, c => c == $"diff {GatePipelineTests.FakeGateGitHub.BaseSha}...{f.GitHub.Head}");
         await using var db = f.Contexts.CreateDbContext();
-        Assert.Equal(material, (await db.LedgerEntries.SingleAsync(r => r.Step == RecoverySnapshot.Step)).Detail);
+        // Durable before review: the body once in the side table by its hash, the ledger row a small record naming it.
+        var row = await db.LedgerEntries.SingleAsync(r => r.Step == RecoverySnapshot.Step);
+        var record = RecoveryCapture.FromDetail(row.Detail)!;
+        Assert.Equal((RecoverySnapshot.Hash(material), snapshot.Id, f.Trigger.Id, true), (record.Material, record.Id, record.IncidentSnapshot, record.Complete));
+        Assert.True(row.Detail!.Length < 1024, $"the capture's ledger row holds the body ({row.Detail.Length} chars)");
+        Assert.Equal(material, (await db.RecoveryMaterials.SingleAsync(m => m.Hash == record.Material)).Body);
         Assert.Equal(material, await f.Evidence.CaptureAsync(f.Trigger, CancellationToken.None));
         Assert.Single(await db.LedgerEntries.Where(r => r.Step == RecoverySnapshot.Step).ToListAsync());
+        Assert.Single(await db.RecoveryMaterials.ToListAsync());
+        // Different material: one more small row and one more body, never the body in the ledger.
+        var spec = await f.Source.ReadSpecAsync(2, default);
+        f.Source.SpecFor = id => spec with { Story = spec.Story with { Id = id, Description = id == 2 ? "requirements changed" : spec.Story.Description } };
+        var changed = await f.Evidence.CaptureAsync(f.Trigger, CancellationToken.None);
+        Assert.NotEqual(material, changed);
+        var rows = await db.LedgerEntries.AsNoTracking().Where(r => r.Step == RecoverySnapshot.Step).OrderBy(r => r.Id).ToListAsync();
+        Assert.Equal(2, rows.Count);
+        Assert.All(rows, r => Assert.True(r.Detail!.Length < 1024));
+        Assert.Equal(changed, (await db.RecoveryMaterials.AsNoTracking().SingleAsync(m => m.Hash == RecoveryCapture.FromDetail(rows[1].Detail)!.Material)).Body);
     }
 
     [Theory]
@@ -388,7 +403,9 @@ public sealed class RecoverySnapshotTests
         var result = await assessor.AssessAsync(f.Trigger, Guid.NewGuid().ToString(), CancellationToken.None);
         Assert.Equal("inconclusive", result.Decision);
         await using var saved = f.Contexts.CreateDbContext();
-        Assert.Contains(await saved.LedgerEntries.Where(e => e.Step == RecoverySnapshot.Step).ToListAsync(), e => e.Detail == result.Material);
+        Assert.Contains(await saved.LedgerEntries.Where(e => e.Step == RecoverySnapshot.Step).ToListAsync(),
+            e => RecoveryCapture.FromDetail(e.Detail)?.Material == RecoverySnapshot.Hash(result.Material!));
+        Assert.Equal(result.Material, (await saved.RecoveryMaterials.SingleAsync(m => m.Hash == RecoverySnapshot.Hash(result.Material!))).Body);
     }
     [Theory]
     [InlineData(false)]
@@ -532,7 +549,7 @@ public sealed class RecoverySnapshotTests
         if (shutdown) Assert.Empty(saved);
         else
         {
-            var snapshot = RecoverySnapshot.FromDetail(Assert.Single(saved).Detail)!;
+            var snapshot = RecoveryCapture.FromDetail(Assert.Single(saved).Detail)!;
             Assert.False(snapshot.Complete);
             Assert.Contains(snapshot.Missing, m => m.Category == "acquisition-deadline");
             Assert.Equal(StepOutcome.Failed, saved[0].Outcome);

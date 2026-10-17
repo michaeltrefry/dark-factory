@@ -493,6 +493,11 @@ public sealed class DashboardHostTests : IAsyncLifetime
             // The human repository Pause is untouched.
             Assert.Equal(Controls.ControlState.Paused, (await db.Controls.SingleAsync(c => c.Scope == "repo:acme/widgets")).State);
         }
+        // A refused re-arm (the incident is Held now) says why instead of returning to a page that looks unchanged.
+        using var refusedAgain = await DashboardLogin.PostAsync(http, DashboardControls.ReassessPath, form, DashboardLogin.TokenFrom(await http.GetStringAsync("/")));
+        Assert.Equal(HttpStatusCode.Conflict, refusedAgain.StatusCode);
+        Assert.Contains("not Escalated", await refusedAgain.Content.ReadAsStringAsync());
+        Assert.Contains("nothing was written", await refusedAgain.Content.ReadAsStringAsync());
     }
 
     [Fact]

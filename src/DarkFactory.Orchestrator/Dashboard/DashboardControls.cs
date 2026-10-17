@@ -26,7 +26,9 @@ public static class DashboardControls
                 if (repo is null || ControlScope.RepositoryOf("repo:" + repo.ToLowerInvariant()) is null) return Results.BadRequest();
                 var result = await reassessment.ReassessAsync(repo, By, ct);
                 Console.WriteLine($"[dashboard] reassess {repo}: {result.Message}");
-                return Results.Redirect("/");
+                // Re-armed, the panel shows the new generation. Refused (not escalated, the lock busy, no incident), nothing was
+                // written and the page would look unchanged, so the refusal itself is the answer.
+                return result.Ok ? Results.Redirect("/") : Results.Text(result.Message, "text/plain; charset=utf-8", statusCode: StatusCodes.Status409Conflict);
             })
             .WithMetadata(new RequireAntiforgeryTokenAttribute());
         MapControls(endpoints);

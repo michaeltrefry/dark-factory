@@ -237,6 +237,141 @@ public sealed class RecoveryContinuationBoundaryTests
         Assert.Equal(change == "none", await db.LedgerEntries.AnyAsync(e => e.Step == RecoveryRedirect.Started));
     }
 
+    /// <summary>A recovery whose capture is counted: a disposition already acted on must need none.</summary>
+    private static HotFileRecovery Counting(RecoverySnapshotTests.Fixture f, Action counted) =>
+        new(f.Contexts, new InProcessRunLocks(), new FreezeOptions(), TimeProvider.System, new HotFileRecoveryTests.Assessor(),
+            capture: (trigger, ct) => { counted(); return f.Evidence.CaptureAsync(trigger, ct); });
+
+    private static async Task<HotFileIncident> IncidentAsync(RecoverySnapshotTests.Fixture f, long? id = null)
+    {
+        await using var db = f.Contexts.CreateDbContext();
+        return await db.HotFileIncidents.AsNoTracking().OrderBy(i => i.Id).FirstAsync(i => id == null || i.Id == id);
+    }
+
+    [Fact]
+    public async Task Real_capture_a_restarted_item_is_never_revalidated_when_the_base_moves_and_another_pending_item_advances()
+    {
+        var f = await SeedSafe(two: true);
+        var captures = 0;
+        await using var recovery = Counting(f, () => captures++);
+        var calls = 0;
+        Func<WorkerCall, Task<WorkerResult>> fresh = async call =>
+        {
+            calls++; await call.Callbacks.OnSession!("fresh-" + calls, default);
+            return calls == 1 ? Ok with { SessionId = "fresh-1", ExitCode = 1, IsError = true, ResultText = "boom" } : Ok with { SessionId = "fresh-" + calls };
+        };
+        var spaces = new FakeWorkspaces { Head = () => f.GitHub.Head };
+        // sc-2 restarts from its disposition (consumed), then its fresh attempt escalates.
+        Assert.Equal(WorkState.Escalated, (await Run(f, recovery, 2, spaces, new FakeWorker(fresh))).State);
+        await using (var db = f.Contexts.CreateDbContext())
+            Assert.Single(await db.LedgerEntries.Where(e => e.Step == RecoveryRedirect.Started).ToListAsync());
+        // Between the restart and sc-2's next dispatch: the delivery base moves and the other pending item advances.
+        f.GitHub.Compare = _ => new("new-default-tip", 0);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var other = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-3");
+            db.Add(new LedgerEntry { WorkItemId = other.Id, State = WorkState.Paused, Detail = RunPipeline.UserPaused, Outcome = StepOutcome.Deferred });
+            other.Version++;
+            await db.SaveChangesAsync();
+        }
+        var resolved = await IncidentAsync(f);
+        // The evidence really did change: the safe answer's material is no longer what a capture sees.
+        Assert.NotEqual(HotFileAssessment.FromDetail(resolved.Answer)!.Material, await f.Evidence.CaptureAsync(f.Trigger, default));
+        captures = 0;
+
+        Assert.NotNull(await recovery.RedirectAsync("sc-2", default));
+        var result = await Run(f, recovery, 2, spaces, new FakeWorker(fresh));
+
+        Assert.Equal(WorkState.Review, result.State);
+        Assert.Equal(0, captures);
+        var after = await IncidentAsync(f);
+        Assert.Equal(("Resolved", 0, resolved.Version), (after.State, after.Refreshes, after.Version));
+        Assert.Null(await recovery.HeldAsync(Repo, default));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Real_capture_a_newer_resolved_incident_never_reopens_the_older_one(bool consumed)
+    {
+        var f = await SeedSafe();
+        var captures = 0;
+        await using var recovery = Counting(f, () => captures++);
+        var spaces = new FakeWorkspaces { Head = () => f.GitHub.Head };
+        var calls = 0;
+        Func<WorkerCall, Task<WorkerResult>> fresh = async call =>
+        {
+            calls++; await call.Callbacks.OnSession!("fresh-" + calls, default);
+            return calls == 1 && consumed ? Ok with { SessionId = "fresh-1", ExitCode = 1, IsError = true, ResultText = "boom" } : Ok with { SessionId = "fresh-" + calls };
+        };
+        if (consumed) Assert.Equal(WorkState.Escalated, (await Run(f, recovery, 2, spaces, new FakeWorker(fresh))).State);
+        long older;
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            older = (await db.HotFileIncidents.SingleAsync()).Id;
+            // A later generation of the repository was detected and resolved safe while sc-2 was in flight.
+            var trigger = f.Trigger with { Id = "newer", Generation = 2 };
+            db.Add(new HotFileIncident { Repo = Repo, Generation = 2, State = "Resolved", Snapshot = JsonSerializer.Serialize(trigger),
+                EvidenceHash = trigger.EvidenceHash, ResolvedAt = DateTimeOffset.UtcNow, Version = 1 });
+            await db.SaveChangesAsync();
+        }
+        f.GitHub.Compare = _ => new("new-default-tip", 0);
+        var before = await IncidentAsync(f, older);
+        captures = 0;
+
+        Assert.NotNull(await recovery.RedirectAsync("sc-2", default));
+        var result = await Run(f, recovery, 2, spaces, new FakeWorker(fresh));
+
+        Assert.Equal(WorkState.Review, result.State);
+        Assert.Equal(0, captures);
+        var after = await IncidentAsync(f, older);
+        Assert.Equal(("Resolved", before.Refreshes, before.Version), (after.State, after.Refreshes, after.Version));
+        Assert.Null(await recovery.HeldAsync(Repo, default));
+        await using (var db = f.Contexts.CreateDbContext())
+            Assert.Single(await db.LedgerEntries.Where(e => e.Step == RecoveryRedirect.Started).ToListAsync());
+    }
+
+    [Fact]
+    public async Task A_newer_unresolved_incident_defers_an_older_disposition_without_touching_either()
+    {
+        var f = await SeedSafe();
+        var captures = 0;
+        await using var recovery = Counting(f, () => captures++);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var trigger = f.Trigger with { Id = "newer", Generation = 2 };
+            db.Add(new HotFileIncident { Repo = Repo, Generation = 2, State = "Held", Snapshot = JsonSerializer.Serialize(trigger),
+                EvidenceHash = trigger.EvidenceHash, Version = 1 });
+            await db.SaveChangesAsync();
+        }
+        var before = await IncidentAsync(f);
+        await Assert.ThrowsAsync<RecoveryContinuationDeferredException>(() => recovery.RedirectAsync("sc-2", default));
+        Assert.Equal(0, captures);
+        var after = await IncidentAsync(f);
+        Assert.Equal((before.State, before.Version), (after.State, after.Version));
+    }
+
+    [Theory]
+    [InlineData(WorkState.Watch)]
+    [InlineData(WorkState.Done)]
+    [InlineData(WorkState.Merge)]
+    public async Task A_disposition_the_item_outgrew_without_restarting_is_void_and_captures_nothing(WorkState state)
+    {
+        var f = await SeedSafe();
+        var captures = 0;
+        await using var recovery = Counting(f, () => captures++);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-2")).State = state;
+            await db.SaveChangesAsync();
+        }
+        f.GitHub.Compare = _ => new("new-default-tip", 0);
+        var before = await IncidentAsync(f);
+        Assert.Null(await recovery.RedirectAsync("sc-2", default));
+        Assert.Equal(0, captures);
+        Assert.Equal(before.Version, (await IncidentAsync(f)).Version);
+    }
+
     [Fact]
     public async Task Redirect_recording_resolves_the_correction_once_asynchronously_not_per_merge_per_pending_item()
     {

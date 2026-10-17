@@ -122,7 +122,7 @@ public static class StepOutcomes
             "unsafe" => StepOutcome.GateRejected,
             _ => StepOutcome.Failed
         },
-        Recovery.RecoverySnapshot.Step => Recovery.RecoverySnapshot.FromDetail(detail) is { Complete: true } ? StepOutcome.Passed : StepOutcome.Failed,
+        Recovery.RecoverySnapshot.Step => Recovery.RecoveryCapture.FromDetail(detail) is { Complete: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.Verdict => ReviewVerdict.FromDetail(detail) is { Passed: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.FixProgress => FixProgress.FromDetail(detail) is { MadeProgress: true } ? StepOutcome.Passed : StepOutcome.Failed,
         RunPipeline.Steps.GateDecision => detail?.StartsWith($"{GateOutcome.Merge} ", StringComparison.Ordinal) == true

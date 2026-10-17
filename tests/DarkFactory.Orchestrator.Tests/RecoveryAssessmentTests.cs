@@ -230,6 +230,33 @@ public sealed class RecoveryAssessmentTests
         Assert.All(api.Requests, r => Assert.Equal("high", r.Headers["x-weave-model-class"]));
     }
 
+    [Fact]
+    public async Task The_assessor_is_sent_an_index_of_the_evidence_and_reads_each_body_through_read_evidence()
+    {
+        // About 1.5 MiB of evidence: inline it would leave the tool budget at its floor and overrun the context.
+        var large = new string('d', 1_500_000);
+        var material = Snapshot with { Evidence = [Snapshot.Evidence[0] with { Content = large, Hash = RecoverySnapshot.Hash(large) },
+            Snapshot.Evidence[1]] };
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
+            ? SseAnswers.ToolTurn(("read", "read_evidence", """{"id":"diff:1"}"""))
+            : SseAnswers.Answer(Answer("safe"))));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "indexed", CancellationToken.None);
+        Assert.Equal("safe", result.Decision);
+        var first = api.Requests[0].Body!;
+        Assert.True(first.Length < 64 * 1024, $"the first request inlines the evidence ({first.Length} chars)");
+        Assert.DoesNotContain(new string('d', 1000), first);
+        // The index names each entry, its hash and its size; the body arrives only as read_evidence's result.
+        Assert.Contains("diff:1", first);
+        Assert.Contains(RecoverySnapshot.Hash(large), first);
+        Assert.Contains("1500000", first);
+        Assert.Contains("pending:sc-2", first);
+        Assert.Contains(new string('d', 1000), api.Requests[1].Body!);
+        Assert.False(Assert.Single(result.Tools).Error);
+    }
+
     [Theory]
     [InlineData("safe")]
     [InlineData("unsafe")]
