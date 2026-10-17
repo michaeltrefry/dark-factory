@@ -48,6 +48,7 @@ public class IssueIntakeTests
 
         public Harness(string answer)
         {
+            Contexts = new LedgerDbContextFactory(_options);
             GitHub = new FakeGitHubIssues(Time);
             GitHub.Permissions["maintainer"] = new RepoPermission("write", "maintain");
             GitHub.Permissions["owner"] = new RepoPermission("admin", "admin");
@@ -64,9 +65,10 @@ public class IssueIntakeTests
         public InProcessRunLocks Locks { get; } = new();
         public IntakeStatus Status => _status ??= new IntakeStatus(Time);
         private IntakeStatus? _status;
-        public IDbContextFactory<LedgerDbContext> Contexts => new LedgerDbContextFactory(_options);
+        /// <summary>The ledger contexts the intake reads and writes; a test may point it at another store (e.g. real Postgres).</summary>
+        public IDbContextFactory<LedgerDbContext> Contexts { get; set; } = null!;
         public IControls Controls => new LedgerControls(Contexts, Time);
-        public LedgerDbContext Db() => new(_options);
+        public LedgerDbContext Db() => Contexts.CreateDbContext();
 
         /// <summary>A fresh intake each time, as after a restart: everything it knows comes from the ledger.</summary>
         public IssueIntake Intake() =>

@@ -250,10 +250,18 @@ public sealed class IssueIntake(
         {
             if (classifier is not null)
             {
-                var classification = await ClassifyAsync(item, version, issue, ct);
+                // A completed attempt for this version is durable and reused across polls and process restarts (E9): the
+                // attempt may have been persisted just before a crash, before the authoritative triage recorded anything.
+                // A pre-release edit is a new version hash, so it starts a fresh attempt; a released issue never reaches here.
+                // Completed unavailable/skipped outcomes are observable attempts too — they are not silently retried each poll.
                 await using var classificationDb = await contexts.CreateDbContextAsync(ct);
-                classificationDb.IssueClassifications.Add(classification);
-                await classificationDb.SaveChangesAsync(ct);
+                if (!await classificationDb.IssueClassifications.AsNoTracking()
+                        .AnyAsync(a => a.WorkItemId == item.Id && a.IssueVersion == version, ct))
+                {
+                    var classification = await ClassifyAsync(item, version, issue, ct);
+                    classificationDb.IssueClassifications.Add(classification);
+                    await classificationDb.SaveChangesAsync(ct);
+                }
             }
             var (triaged, usagePaused) = await TriageAsync(ledger, item, repo, issue, version, ct);
             if (triaged is null)
