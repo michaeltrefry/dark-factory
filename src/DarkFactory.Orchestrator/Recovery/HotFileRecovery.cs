@@ -371,11 +371,14 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         if (correction.RetryAt > time.GetUtcNow()) return false;
         // Other holders of the repository's lock are brief while it is Correcting (a hold check, a reconciliation, another
         // boundary): wait for it a little before calling the boundary unverifiable.
-        var lockUntil = DateTimeOffset.UtcNow + LockWait;
+        // The deadline is the injected clock's; the tries are also bounded (a clock that does not move — a test's — cannot
+        // make the wait endless), and paced by a short real pause between them.
+        var lockUntil = time.GetUtcNow() + LockWait;
+        var tries = (int)(LockWait / LockRetry);
         var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
-        while (held is null && DateTimeOffset.UtcNow < lockUntil)
+        while (held is null && time.GetUtcNow() < lockUntil && tries-- > 0)
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(50), ct);
+            await Task.Delay(LockRetry, ct);
             held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
         }
         await using var _ = held;
@@ -411,12 +414,8 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                 throw new InvalidOperationException("Correction delivery base no longer matches its pinned grant.");
             if (paths is not null && paths.Any(p => !envelope.Contains(p, StringComparer.Ordinal)))
                 throw new InvalidOperationException("Correction diff leaves its authorized repair envelope.");
-            if (correction.Deferrals != 0 || correction.RetryAt is not null)
-            {
-                // A verified boundary ends the run of deferrals.
-                correction.Deferrals = 0; correction.RetryAt = null; correction.Version++;
-                await db.SaveChangesAsync(ct);
-            }
+            // A verified boundary alone does not end a run of deferrals (dispatch verifying and worker entry deferring would
+            // never escalate): only real progress past the boundaries does (ProgressedAsync, after the push and the merge).
             return true;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -434,11 +433,27 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         }
     }
 
+    /// <summary>
+    /// The correction made real progress past its boundaries (its push, its authorized merge): a run of deferrals ends. A
+    /// verified boundary alone does not count, so a correction that always verifies at dispatch and defers at worker entry
+    /// still escalates after <see cref="DeferralLimit"/>.
+    /// </summary>
+    public async Task ProgressedAsync(string externalId, CancellationToken ct)
+    {
+        if (!ItemNaming.Recovery.TryParse(externalId, out var id)) return;
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var correction = await db.RecoveryCorrections.SingleOrDefaultAsync(c => c.Id == id, ct);
+        if (correction is null || correction.Deferrals == 0 && correction.RetryAt is null) return;
+        correction.Deferrals = 0; correction.RetryAt = null; correction.Version++;
+        await db.SaveChangesAsync(ct);
+    }
+
     /// <summary>Boundary authorizations in a row that may not verify before the incident escalates (E11).</summary>
     internal const int DeferralLimit = 3;
 
     /// <summary>How long a boundary waits for the repository's recovery lock before it counts as unverifiable.</summary>
     internal static readonly TimeSpan LockWait = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan LockRetry = TimeSpan.FromMilliseconds(50);
 
     /// <summary>
     /// A boundary that could not verify the correction's authority (no proof it is stale): counted durably on the correction,
@@ -453,7 +468,9 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         correction.Deferrals++;
         correction.RetryAt = now + RetryDelay(correction.Deferrals);
         correction.Version++;
-        var reason = $"Correction authorization deferred (could not verify, {correction.Deferrals} of {DeferralLimit} in a row): {why}";
+        // Each deferral is its own row (count and time in it), so the ledger shows every one, never one deduplicated line.
+        var reason = $"Correction authorization deferred (could not verify, {correction.Deferrals} of {DeferralLimit} in a row, "
+            + $"at {now:O}; next try not before {correction.RetryAt:O}): {why}";
         if (correction.Deferrals >= DeferralLimit)
             Escalate(incident, $"Correction authority could not be verified {DeferralLimit} times in a row ({why}); fix the named "
                 + $"evidence or environment problem, then `factory recovery reassess --repo {incident.Repo}`");

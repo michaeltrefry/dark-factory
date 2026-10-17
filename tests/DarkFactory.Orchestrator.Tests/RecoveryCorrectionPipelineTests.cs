@@ -276,11 +276,39 @@ public class RecoveryCorrectionPipelineTests
     }
 
     /// <summary>Refuses the incident repository's advisory lock while <see cref="Busy"/> is set (another process deciding it).</summary>
-    private sealed class BusyRepositoryLocks(IRunLocks inner) : IRunLocks
+    internal sealed class BusyRepositoryLocks(IRunLocks inner) : IRunLocks
     {
         internal volatile bool Busy;
-        public Task<IAsyncDisposable?> TryAcquireAsync(long key, CancellationToken ct) =>
-            Busy && key == HotFileRecovery.LockKey("owner/alpha") ? Task.FromResult<IAsyncDisposable?>(null) : inner.TryAcquireAsync(key, ct);
+        /// <summary>Refused tries left before the lock frees by itself (while <see cref="Busy"/>); null: never.</summary>
+        internal int? FreesAfter;
+        internal int Refused;
+        /// <summary>The fake clock the boundary's lock wait reads: each refusal lets a second of it pass, as a real wait would.</summary>
+        internal Microsoft.Extensions.Time.Testing.FakeTimeProvider? Time;
+        public Task<IAsyncDisposable?> TryAcquireAsync(long key, CancellationToken ct)
+        {
+            if (!Busy || key != HotFileRecovery.LockKey("owner/alpha") || FreesAfter is { } n && Refused >= n) return inner.TryAcquireAsync(key, ct);
+            Refused++;
+            if (Time is { } time) _ = Task.Run(async () => { await Task.Delay(5); time.Advance(TimeSpan.FromSeconds(1)); });
+            return Task.FromResult<IAsyncDisposable?>(null);
+        }
+    }
+
+    [Theory]
+    [InlineData(2, true)]     // frees within the 5 s wait: authorized, nothing counted
+    [InlineData(null, false)] // still held after the wait: one deferral counted
+    public async Task A_boundary_waits_on_the_injected_clock_for_a_briefly_held_repository_lock(int? freesAfter, bool authorized)
+    {
+        var locks = new BusyRepositoryLocks(new InProcessRunLocks());
+        var f = new Fixture(locks: locks); await f.Initialize();
+        locks.Time = f.Recovery.Seed.Time;
+        locks.FreesAfter = freesAfter;
+        locks.Busy = true;
+        await using var recovery = f.Recovery.Recovery(() => f.Material);
+        Assert.Equal(authorized, await recovery.AuthorizeCorrectionAsync($"rc-{f.Correction.Id}", "owner/alpha", default)
+            .WaitAsync(TimeSpan.FromSeconds(10)));
+        await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+        Assert.Equal(authorized ? 0 : 1, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
+        if (!authorized) Assert.InRange(locks.Refused, 5, 50); // ended by five fake seconds of one-second tries, not the try bound (100)
     }
 
     /// <summary>
@@ -295,6 +323,7 @@ public class RecoveryCorrectionPipelineTests
     {
         var locks = new BusyRepositoryLocks(new InProcessRunLocks());
         var f = new Fixture(locks: locks); await f.Initialize();
+        locks.Time = f.Recovery.Seed.Time; // the push's 5 s lock wait passes on the fake clock
         if (boundary == "worker-entry") f.CaptureFault = n => n == 2 ? new HttpRequestException("evidence read timed out") : null;
         else f.AfterWorker = () => { locks.Busy = true; return Task.CompletedTask; };
         var held = await f.Run();
@@ -319,13 +348,17 @@ public class RecoveryCorrectionPipelineTests
     /// <summary>
     /// Review round 3 (E11): authority that can never be verified (a capture that never reads) is retried after 30 s, then 120 s,
     /// never every poll, and after three deferrals in a row the incident escalates with the reason and the re-arm remedy.
-    /// Polls in between capture nothing and write nothing (no paired unpaused/paused rows).
+    /// Polls in between capture nothing and write nothing (no paired unpaused/paused rows). "worker-entry" is the paused-item
+    /// path a reviewer reproduced (round 4): dispatch verifies every time and worker entry defers every time — a verified
+    /// dispatch is no progress, so the count still reaches three.
     /// </summary>
-    [Fact]
-    public async Task Unverifiable_correction_authority_backs_off_and_escalates_after_three_deferrals()
+    [Theory]
+    [InlineData("dispatch")]
+    [InlineData("worker-entry")]
+    public async Task Unverifiable_correction_authority_backs_off_and_escalates_after_three_deferrals(string boundary)
     {
         var f = new Fixture(); await f.Initialize();
-        f.CaptureFault = _ => new HttpRequestException("evidence store unreachable");
+        f.CaptureFault = n => boundary == "dispatch" || n % 2 == 0 ? new HttpRequestException("evidence store unreachable") : null;
         var time = f.Recovery.Seed.Time;
         async Task<(int Faults, int Rows)> Poll()
         {
@@ -337,6 +370,13 @@ public class RecoveryCorrectionPipelineTests
         var quiet = await Poll(); // inside the 30 s backoff: nothing captured, nothing written
         Assert.Equal(1, quiet.Faults);
         Assert.Equal(quiet, await Poll());
+        if (boundary == "worker-entry")
+        {
+            // Not vacuous: the item exists, paused recovery-held, and the polls inside the backoff added none of its rows.
+            Assert.True(quiet.Rows > 0);
+            Assert.Equal((WorkState.Paused, RunPipeline.RecoveryHeld), (await f.Rows()).Last(r => r.Step == null) is var p ? (p.State, p.Detail) : default);
+            Assert.Equal(1, f.Captures.Count(c => c != "fault")); // the verified dispatch capture, once
+        }
         time.Advance(TimeSpan.FromSeconds(30));
         Assert.Equal(2, (await Poll()).Faults);
         time.Advance(TimeSpan.FromSeconds(119));
@@ -351,16 +391,26 @@ public class RecoveryCorrectionPipelineTests
             Assert.Contains("could not be verified 3 times in a row (evidence store unreachable)", incident.Error);
             Assert.Contains("factory recovery reassess --repo owner/alpha", incident.Error);
             Assert.Equal(3, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
-            Assert.Equal(3, await db.LedgerEntries.CountAsync(e => e.Step == RecoveryCorrections.RefusalStep && e.Detail!.Contains("in a row")));
+            // Each deferral is its own row (1, 2 and 3 of 3), none folded into another.
+            var deferrals = await db.LedgerEntries.Where(e => e.Step == RecoveryCorrections.RefusalStep && e.Detail!.Contains("in a row"))
+                .Select(e => e.Detail!).ToListAsync();
+            Assert.Equal(3, deferrals.Distinct().Count());
+            Assert.All(new[] { 1, 2, 3 }, n => Assert.Contains(deferrals, d => d.Contains($"{n} of 3 in a row")));
         }
         // Escalated: the grant is void, so later polls capture nothing and write nothing either.
+        // A started item is parked once (outside the scope its grant gave it); then nothing more, and no poll lists it.
         time.Advance(TimeSpan.FromHours(1));
-        Assert.Equal(escalated, await Poll());
+        var settled = await Poll();
+        Assert.Equal(escalated.Faults, settled.Faults);
+        time.Advance(TimeSpan.FromHours(1));
+        Assert.Equal(settled, await Poll());
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, time), ItemNaming.Recovery, default, f.Controls));
         Assert.Empty(f.Prs.Opened);
     }
 
     [Fact]
-    public async Task A_verified_boundary_after_a_deferral_resets_the_count_and_delivers()
+    public async Task Progress_past_the_boundaries_after_a_deferral_resets_the_count_and_delivers()
     {
         var f = new Fixture(); await f.Initialize();
         f.CaptureFault = n => n == 1 ? new HttpRequestException("evidence read timed out") : null;

@@ -45,8 +45,10 @@ public sealed partial class RunPipeline
 
     private async Task RecordCorrectionPushAsync(Run run, CancellationToken ct)
     {
-        if (Naming == ItemNaming.Recovery)
-            await ledger.CheckpointAsync(run.Item, RecoveryPushedHead, null, await workspaces.HeadAsync(run.Workspace!, ct), ct);
+        if (Naming != ItemNaming.Recovery) return;
+        await ledger.CheckpointAsync(run.Item, RecoveryPushedHead, null, await workspaces.HeadAsync(run.Workspace!, ct), ct);
+        // Real progress past the boundaries: a run of could-not-verify deferrals ends here, not at a verified check alone.
+        if (recovery is not null) await recovery.ProgressedAsync(run.Item.ExternalId, ct);
     }
     private sealed record CorrectionMerge(int Pull, string Base, string BaseSha, string Head);
 
@@ -78,6 +80,7 @@ public sealed partial class RunPipeline
         if (!authorized) throw ControlRequestedException.Deferred();
         await ledger.CheckpointAsync(run.Item, RecoveryMergeAuthorized, null,
             JsonSerializer.Serialize(new CorrectionMerge(pull.Number, pull.BaseRef, pull.BaseSha, pull.HeadSha)), ct);
+        await recovery!.ProgressedAsync(run.Item.ExternalId, ct);
         await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
     }
 
