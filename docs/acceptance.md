@@ -6,16 +6,22 @@ opt-in: the tests skip, naming the missing prerequisite, unless their gate varia
 ## SystemOne S6 evaluation-only graceful cancellation (sc-26354)
 
 For a **new, explicitly authorized** held-out campaign only (not an instruction to start or stop an existing run):
-choose a unique artifact directory outside every repository, frozen fixture and worker context, with no symlinked
-ancestors. On macOS use a real path such as `/private/tmp`, not `/tmp` or `/var`. Preserve the existing prerequisites
-(router, Postgres, sandbox setup, catalog model and exclusive sandbox locks).
+choose a unique artifact directory inside the **owner's session folder**, outside the frozen scoring corpus and the
+configured `Factory:WorkRoot` (which contains every isolated arm's synthetic snapshot, clone and triage ReadRule
+worktree). An ignored artifact directory inside the owner's checkout is allowed: that checkout is not given to the
+worker. Git metadata paths and symlinked artifact ancestors remain forbidden. Use the session's physical path
+(`pwd -P`). Preserve the existing prerequisites (router, Postgres, sandbox setup, catalog model and exclusive sandbox locks).
 
 ```sh
 # Example only: this starts paid live inference. Do not run alongside an existing campaign.
-artifacts="$(mktemp -d /private/tmp/systemone-evaluation.XXXXXXXX)"
+# Run from the owner's isolated session checkout, not a worker worktree.
+session="$(pwd -P)"
+mkdir -p "$session/artifacts"
+artifacts="$(mktemp -d "$session/artifacts/systemone-evaluation.XXXXXXXX")"
 export FACTORY_E2E=1 FACTORY_E2E_SYSTEMONE_EVALUATION=1
 export FACTORY_E2E_SYSTEMONE_REPORT="$artifacts/evidence.json"
 export FACTORY_E2E_SYSTEMONE_CANCEL_FILE="$FACTORY_E2E_SYSTEMONE_REPORT.cancel"
+printf 'This run cancellation file: %s\n' "$FACTORY_E2E_SYSTEMONE_CANCEL_FILE"
 # Issues__Classification__Model must already name the approved SystemOne catalog model.
 dotnet test --project tests/DarkFactory.AcceptanceTests \
   --filter-method '*Frozen_corpus_paired_disabled_vs_advisory_live_campaign'
@@ -25,13 +31,14 @@ From another shell, create **that run's exact flag** (substitute the printed/rec
 
 ```sh
 # Existence only; the harness never reads the file body. No process signals.
-touch /private/tmp/systemone-evaluation.XXXXXXXX/evidence.json.cancel
+touch /absolute/owner/session/artifacts/systemone-evaluation.XXXXXXXX/evidence.json.cancel
 ```
 
 The dedicated variable is read only after both live opt-ins. It has **no default**, and must equal the absolute
 report path plus `.cancel`; the report itself is reserved with create-new semantics, preventing shared campaign
-ownership. With the variable absent, no file watcher runs. Flags in a repository, another campaign's flag, relative
-paths and symlinked artifact ancestors are refused before client construction. A pre-existing flag writes initial
+ownership. With the variable absent, no file watcher runs. Flags in the actual scoring corpus or configured worker
+work root, git metadata, another campaign's flag, relative paths and symlinked artifact ancestors are refused before
+client construction. A `.git` entry in an owner-checkout ancestor alone is not a reason to reject session artifacts. A pre-existing flag writes initial
 `incomplete` evidence and stops before client construction/inference; do not delete a flag to resume a campaign.
 
 The linked token preserves the caller's cancellation and 100-minute deadline, checks synchronously between arms

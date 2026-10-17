@@ -173,13 +173,13 @@ public static class SystemOneEvaluation
     }
 
     public static async Task<EvaluationReport> RunToFileAsync(string root, string output,
-        Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct, string? cancelFile = null)
+        Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct, string? cancelFile = null, string? workerWorkRoot = null)
     {
         var corpus = EvaluationCorpus.Load(root);
         output = Path.GetFullPath(output);
         if (output == Path.GetFullPath(root) || output.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
         { throw new InvalidDataException("Evidence must be outside the frozen corpus."); }
-        EvaluationCancellation.Validate(output, cancelFile);
+        EvaluationCancellation.Validate(output, cancelFile, root, workerWorkRoot);
         await using var cancellation = new EvaluationCancellation(cancelFile, ct);
         // Reserve once, never overwrite an earlier campaign. Checkpoints replace it atomically in the same directory.
         using (new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
@@ -219,19 +219,30 @@ internal sealed class EvaluationCancellation : IAsyncDisposable
         watcher = file is null ? Task.CompletedTask : WatchAsync();
     }
 
-    public static void Validate(string output, string? file)
+    public static void Validate(string output, string? file, string corpusRoot, string? workerWorkRoot)
     {
         if (file is null) { return; } // No global/default flag; existing campaigns are unaffected.
         if (!Path.IsPathFullyQualified(file) || Path.GetFullPath(file) != output + ".cancel")
         { throw new InvalidDataException("Cancellation file must be the absolute evidence path plus .cancel."); }
-        // Neither artifacts nor the flag may be in a repository/worker context, or reached through a symlink.
+        // The live composition supplies its configured work root: all isolated ledgers' synthetic snapshots,
+        // clones and triage ReadRule worktrees live below it. The owner's checkout is NOT a worker context.
+        if (Within(output, PhysicalRoot(new DirectoryInfo(corpusRoot)))
+            || workerWorkRoot is not null && Within(output, PhysicalRoot(new DirectoryInfo(workerWorkRoot))))
+        { throw new InvalidDataException("Cancellation artifacts must be outside the scoring corpus and worker work root."); }
         for (var directory = new DirectoryInfo(Path.GetDirectoryName(output)!); directory is not null; directory = directory.Parent)
         {
-            if (directory.LinkTarget is not null || File.Exists(Path.Combine(directory.FullName, ".git"))
-                || Directory.Exists(Path.Combine(directory.FullName, ".git")))
-            { throw new InvalidDataException("Cancellation artifacts must be outside repositories and symlinked directories."); }
+            if (directory.LinkTarget is not null || directory.Name.Equals(".git", StringComparison.OrdinalIgnoreCase))
+            { throw new InvalidDataException("Cancellation artifacts must be outside git metadata and symlinked directories."); }
         }
     }
+
+    private static bool Within(string path, string root) => path.Equals(root, StringComparison.OrdinalIgnoreCase)
+        || path.StartsWith(Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+
+    // Resolve protected-root aliases too; artifacts themselves reject every symlink ancestor below.
+    private static string PhysicalRoot(DirectoryInfo directory) => directory.LinkTarget is not null
+        ? directory.ResolveLinkTarget(returnFinalTarget: true)!.FullName
+        : directory.Parent is null ? directory.FullName : Path.Combine(PhysicalRoot(directory.Parent), directory.Name);
 
     private void Refresh()
     {

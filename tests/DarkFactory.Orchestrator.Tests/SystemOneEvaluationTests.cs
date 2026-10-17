@@ -531,12 +531,102 @@ public class SystemOneEvaluationTests
                     _ => throw new Exception("must not construct clients"), CancellationToken.None, flag));
                 Assert.False(File.Exists(output));
             }
-            Directory.CreateDirectory(Path.Combine(directory, ".git"));
-            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
-                _ => throw new Exception("must not construct clients"), CancellationToken.None, output + ".cancel"));
-            Assert.False(File.Exists(output));
         }
         finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_session_artifacts_inside_owner_checkout_are_allowed_without_overwriting_evidence()
+    {
+        var owner = NewCancellationArtifactDirectory();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(owner, ".git"));
+            var artifacts = Directory.CreateDirectory(Path.Combine(owner, ".claude", "session", "artifacts")).FullName;
+            var output = Path.Combine(artifacts, "evidence.json");
+            var workers = Path.Combine(owner, "worker-root");
+            await SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => new DelegateEvaluationArm((input, mode, _) => Task.FromResult(Sample(input, mode))),
+                CancellationToken.None, output + ".cancel", workers);
+            var original = File.ReadAllText(output);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(original)!;
+            Assert.Equal(("complete", 30), (evidence.Status, evidence.Observations.Count));
+            await Assert.ThrowsAsync<IOException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => throw new Exception("must not construct clients"), CancellationToken.None, output + ".cancel", workers));
+            Assert.Equal(original, File.ReadAllText(output));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    [Theory]
+    [InlineData("worker-root")]
+    [InlineData("worker-root/e2e/isolated/synthetic-snapshot")]
+    [InlineData("scoring")]
+    [InlineData(".git")]
+    [InlineData(".git/worktrees/session")]
+    public async Task Evaluation_actual_composition_protects_worker_fixture_and_metadata_before_clients(string location)
+    {
+        var owner = NewCancellationArtifactDirectory();
+        var constructed = false;
+        try
+        {
+            var corpus = Path.Combine(owner, "scoring");
+            foreach (var file in Directory.GetFiles(CorpusPath, "*", SearchOption.AllDirectories))
+            {
+                var copy = Path.Combine(corpus, Path.GetRelativePath(CorpusPath, file));
+                Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
+                File.Copy(file, copy);
+            }
+            var artifacts = Directory.CreateDirectory(Path.Combine(owner, location)).FullName;
+            var output = Path.Combine(artifacts, "evidence.json");
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(corpus, output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); },
+                CancellationToken.None, output + ".cancel", Path.Combine(owner, "worker-root")));
+            Assert.False(constructed);
+            Assert.False(File.Exists(output));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_worker_root_alias_cannot_hide_materialized_repository_from_guard()
+    {
+        var owner = NewCancellationArtifactDirectory();
+        var constructed = false;
+        try
+        {
+            var workers = Directory.CreateDirectory(Path.Combine(owner, "worker-root")).FullName;
+            var alias = Path.Combine(owner, "worker-alias");
+            Directory.CreateSymbolicLink(alias, workers);
+            var output = Path.Combine(workers, "evidence.json");
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); },
+                CancellationToken.None, output + ".cancel", alias));
+            Assert.False(constructed);
+            Assert.False(File.Exists(output));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_owner_session_artifact_symlink_is_refused_before_clients()
+    {
+        var owner = NewCancellationArtifactDirectory();
+        var constructed = false;
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(owner, ".git"));
+            var artifacts = Directory.CreateDirectory(Path.Combine(owner, "artifacts")).FullName;
+            var link = Path.Combine(owner, "linked-artifacts");
+            Directory.CreateSymbolicLink(link, artifacts);
+            var output = Path.Combine(link, "evidence.json");
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); },
+                CancellationToken.None, output + ".cancel", Path.Combine(owner, "worker-root")));
+            Assert.False(constructed);
+            Assert.False(File.Exists(Path.Combine(artifacts, "evidence.json")));
+        }
+        finally { Directory.Delete(owner, true); }
     }
 
     private sealed class RouterOnlySecrets : ISecretStore

@@ -32,7 +32,9 @@ public class SystemOneEvaluationLiveTests
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(TimeSpan.FromMinutes(100));
         var cancelFile = Environment.GetEnvironmentVariable("FACTORY_E2E_SYSTEMONE_CANCEL_FILE");
-        var result = await SystemOneEvaluation.RunToFileAsync(root, output, corpus => new LiveEvaluationArm(corpus, model), timeout.Token, cancelFile);
+        // E2e creates every arm below this configured work root, including the synthetic snapshot and triage ReadRule.
+        var result = await SystemOneEvaluation.RunToFileAsync(root, output, corpus => new LiveEvaluationArm(corpus, model),
+            timeout.Token, cancelFile, Harness.Options.WorkRoot);
         Assert.Equal(15, result.Pairs.Count);
         // Failed performance/quality goals remain measured evidence, not a reason to relabel or rerun the corpus.
         Console.WriteLine($"SystemOne paired report: {output}; corpus {result.CorpusIdentity}; {result.Pairs.Count} pairs; optimization not established.");
