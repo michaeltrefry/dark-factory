@@ -1,0 +1,23 @@
+version: 2
+tiers:
+  sealed:
+    paths:
+      - factory/gate.yaml
+      - CODEOWNERS
+      - .github/CODEOWNERS
+      - docs/CODEOWNERS
+      - .github/workflows/
+      - factory/prompts/
+    checks: [ci-green, review-pass, security-review]
+  protected:
+    paths: [src/access.py]
+    checks: [ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base]
+  normal:
+    checks: [ci-green, review-pass, risk-threshold, new-tests-fail-on-base]
+  free:
+    paths: [docs/]
+    checks: [ci-green, review-pass]
+risk:
+  max_changed_lines: 120
+  max_changed_files: 8
+  max_fix_rounds: 3

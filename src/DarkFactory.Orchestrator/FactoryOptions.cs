@@ -499,10 +499,47 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSlots, WorkerAuth, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
         _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
-        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
+        _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl, IssueClassificationMode, IssueClassificationModel, IssueClassificationTimeout, IssueClassificationMaxInputChars);
         // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
         WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
     }
+
+    /// <summary>Optional report classification: disabled by default, shadow metadata only, or a non-authoritative advisory triage hint.</summary>
+    public string IssueClassificationMode
+    {
+        get
+        {
+            var mode = config["Issues:Classification:Mode"] ?? "disabled";
+            return mode is "disabled" or "shadow" or "advisory" ? mode
+                : throw new InvalidOperationException("Issues:Classification:Mode must be disabled, shadow or advisory.");
+        }
+    }
+
+    /// <summary>The explicit SystemOne catalog id; no default model or fallback is selected by the factory.</summary>
+    public string? IssueClassificationModel
+    {
+        get
+        {
+            var model = config["Issues:Classification:Model"];
+            if (IssueClassificationMode == "disabled") { return model; }
+            return !string.IsNullOrWhiteSpace(model) && model.Length <= 128 && !model.Any(char.IsWhiteSpace) ? model
+                : throw new InvalidOperationException("Issues:Classification:Model must name an explicit SystemOne catalog model in shadow or advisory mode.");
+        }
+    }
+
+    /// <summary>
+    /// Total classifier HTTP deadline, including the response body; no retries (default 5 seconds). The bound is the largest
+    /// duration <see cref="System.Threading.CancellationTokenSource.CancelAfter(TimeSpan)"/> accepts — 4,294,967,294 ms, one
+    /// below <c>uint.MaxValue</c> — so an accepted setting can never throw out of the classifier as an item failure.
+    /// </summary>
+    public TimeSpan IssueClassificationTimeout =>
+        config.GetValue("Issues:Classification:TimeoutSeconds", 5d) is var seconds
+            && double.IsFinite(seconds) && seconds > 0 && seconds <= (uint.MaxValue - 1) / 1000d
+            ? TimeSpan.FromSeconds(seconds)
+            : throw new InvalidOperationException("Issues:Classification:TimeoutSeconds must be finite, more than 0, and fit the request timer.");
+
+    /// <summary>Complete title + body budget in UTF-16 characters, not tokens or a universal model context limit.</summary>
+    public int IssueClassificationMaxInputChars => AtLeast("Issues:Classification:MaxInputChars", 4096, 1);
 
     public bool TryGet(Func<FactoryOptions, string> secret, out string? value)
     {

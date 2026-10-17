@@ -105,6 +105,80 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("github_issue_cursors", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.IssueClassification", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("ClassifierVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<double?>("Confidence")
+                        .HasColumnType("double precision");
+
+                    b.Property<long>("ElapsedMs")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("InputTokens")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("IssueVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Label")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<string>("Mode")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<string>("Model")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<long?>("OutputTokens")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Probabilities")
+                        .HasColumnType("text");
+
+                    b.Property<string>("PromptVersion")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)");
+
+                    b.Property<DateTimeOffset>("RecordedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("RequestedModel")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("WorkItemId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("WorkItemId", "IssueVersion");
+
+                    b.ToTable("issue_classifications", (string)null);
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.KanbanEpicKey", b =>
                 {
                     b.Property<int>("Id")
@@ -571,6 +645,15 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .IsUnique();
 
                     b.ToTable("recovery_corrections", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.IssueClassification", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
+                        .WithMany()
+                        .HasForeignKey("WorkItemId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.LedgerEntry", b =>
