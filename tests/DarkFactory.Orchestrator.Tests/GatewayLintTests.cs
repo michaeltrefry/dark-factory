@@ -892,6 +892,9 @@ public sealed class GatewayLintTests
         Assert.Equal(System.Net.HttpStatusCode.Found, answer.StatusCode);
         Assert.Equal(["GET /mcp/codegraph HTTP/1.1"], requests.ToArray());
         await stop.CancelAsync();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => server);
+        // The server loop either sees the cancellation at its loop check (ends normally) or inside
+        // AcceptTcpClientAsync (throws OperationCanceledException); both are a clean stop.
+        try { await server; } catch (OperationCanceledException) { }
+        Assert.Single(requests);
     }
 }
