@@ -94,8 +94,9 @@ public class GitHubReadRetryTests
     {
         var (gate, api, time) = Gate(a => a.On($"GET {Repo}/pulls/7", _ => Status(HttpStatusCode.ServiceUnavailable)));
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => gate.GetPullAsync(Sandbox, 7, CancellationToken.None));
+        var ex = await Assert.ThrowsAsync<GitHubGatewayException>(() => gate.GetPullAsync(Sandbox, 7, CancellationToken.None));
 
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, ex.StatusCode);
         Assert.Equal("GitHub read pull request #7 failed: 503 unavailable", ex.Message);
         Assert.Equal(GitHubReadRetry.MaxAttempts, Count(api, $"GET {Repo}/pulls/7"));
         Assert.Equal([TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)], time.Delays);
