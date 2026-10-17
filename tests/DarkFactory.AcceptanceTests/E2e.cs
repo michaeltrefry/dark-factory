@@ -165,7 +165,7 @@ internal sealed class E2e : IAsyncDisposable
         {
             // CREATE DATABASE above is uncancelled until ownership is established, so a cancelled command cannot
             // leave an ambiguously-created database. Everything after ownership cancels through the usual cleanup.
-            if (evaluation) { e2e.EvaluationRoot = EvaluationWorkRoot.Create(Path.Combine(realRoot, "e2e"), database); }
+            if (evaluation) { e2e.EvaluationRoot = EvaluationWorkRoot.Create(Path.Combine(realRoot, "e2e"), database, Harness.Options.WorkerSlotCount); }
             ct.ThrowIfCancellationRequested();
             await LedgerMigrations.MigrateAsync(e2e.Ledger, ct);
             await using (var ledger = new NpgsqlConnection(e2e.Ledger))

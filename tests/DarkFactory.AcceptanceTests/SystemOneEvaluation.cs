@@ -301,18 +301,20 @@ public sealed class EvaluationWorkRoot
     private static readonly System.Collections.Concurrent.ConcurrentBag<IDisposable> RetainedLocks = new();
     private bool workerMayBeRunning;
     private int active;
+    private readonly int workerSlots;
     public string Path { get; }
-    private EvaluationWorkRoot(string path) => Path = path;
+    private EvaluationWorkRoot(string path, int workerSlots) => (Path, this.workerSlots) = (path, workerSlots);
 
-    public static EvaluationWorkRoot Create(string parent, string name)
+    public static EvaluationWorkRoot Create(string parent, string name, int workerSlots = 1)
     {
         if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0)
         { throw new InvalidDataException("Evaluation root must be a unique child directory."); }
+        if (workerSlots is < 1 or > WorkerSlots.MaxSlots) { throw new ArgumentOutOfRangeException(nameof(workerSlots)); }
         var path = System.IO.Path.Combine(System.IO.Path.GetFullPath(parent), name);
         RequireNoLinkedAncestors(path);
         if (System.IO.Path.Exists(path)) { throw new IOException("Evaluation root already exists; refusing to adopt it."); }
         Directory.CreateDirectory(path);
-        return new EvaluationWorkRoot(path);
+        return new EvaluationWorkRoot(path, workerSlots);
     }
 
     private static void RequireNoLinkedAncestors(string path)
@@ -358,6 +360,26 @@ public sealed class EvaluationWorkRoot
             if (heldLocks is not null) { RetainedLocks.Add(heldLocks); }
             throw new InvalidOperationException($"Evaluation worker may still be running; retained ledger, locks and work root {Path}. Stop/inspect the runner before manual cleanup.");
         }
+        var stopped = new List<IDisposable>();
+        try
+        {
+            // Exception markers alone are insufficient: probe cancellation can be unmarked, and recorder cleanup
+            // can replace a worker's exception. EndAsync/KeepUntil retains the actual isolated slot lock in both cases.
+            RequireNoLinkedAncestors(Path);
+            for (var slot = 1; slot <= workerSlots; slot++)
+            {
+                var lockPath = WorkerLock.For(Path, slot).Path;
+                RequireNoLinkedAncestors(System.IO.Path.GetDirectoryName(lockPath)!);
+                if (new FileInfo(lockPath).LinkTarget is not null) { throw new InvalidDataException("Linked evaluation lock file."); }
+                stopped.Add(WorkerLock.Acquire(Path, slot)); // Nonblocking; no process/helper/probe.
+            }
+        }
+        catch (Exception ex)
+        {
+            stopped.ForEach(held => held.Dispose());
+            if (heldLocks is not null) { RetainedLocks.Add(heldLocks); }
+            throw new InvalidOperationException($"Evaluation sandbox quiescence not established ({ex.GetType().Name}); retained ledger, machine locks and work root {Path}. Inspect the runner before manual cleanup.");
+        }
         try
         {
             try { await dropLedger(); }
@@ -367,7 +389,11 @@ public sealed class EvaluationWorkRoot
                 if (Directory.Exists(Path)) { Directory.Delete(Path, recursive: true); }
             }
         }
-        finally { heldLocks?.Dispose(); }
+        finally
+        {
+            stopped.ForEach(held => held.Dispose());
+            heldLocks?.Dispose();
+        }
     }
 }
 

@@ -388,7 +388,7 @@ public class SystemOneEvaluationTests
         var trace = new List<string>();
         try
         {
-            var root = EvaluationWorkRoot.Create(parent, "arm");
+            var root = EvaluationWorkRoot.Create(parent, "arm", workerSlots: 2);
             var foreign = Directory.CreateDirectory(Path.Combine(parent, "foreign")).FullName;
             var sentinel = Path.Combine(foreign, "sentinel");
             await File.WriteAllTextAsync(sentinel, "owner");
@@ -401,6 +401,8 @@ public class SystemOneEvaluationTests
             await root.DisposeAsync(() =>
             {
                 Assert.True(Directory.Exists(root.Path));
+                Assert.Throws<InvalidOperationException>(() => WorkerLock.Acquire(root.Path));
+                Assert.Throws<InvalidOperationException>(() => WorkerLock.Acquire(root.Path, 2));
                 trace.Add("ledger");
                 return Task.CompletedTask;
             }, new CallbackDisposable(() =>
@@ -439,9 +441,9 @@ public class SystemOneEvaluationTests
             }
             var failure = await Record.ExceptionAsync(() => root.DisposeAsync(() => throw new IOException("fake-ledger-teardown"),
                 new CallbackDisposable(() => released = true)));
-            if (ancestor) { Assert.IsType<InvalidDataException>(failure); }
+            if (ancestor) { Assert.IsType<InvalidOperationException>(failure); }
             else { Assert.IsType<IOException>(failure); }
-            Assert.True(released);
+            Assert.Equal(!ancestor, released); // Unknown quiescence at a replaced root retains the machine locks.
             Assert.Equal("owner", await File.ReadAllTextAsync(sentinel));
             if (ancestor) { Assert.NotNull(new DirectoryInfo(root.Path).LinkTarget); }
             else { Assert.False(Directory.Exists(root.Path)); }
@@ -458,11 +460,14 @@ public class SystemOneEvaluationTests
         try
         {
             var root = EvaluationWorkRoot.Create(parent, "arm");
-            Directory.Delete(root.Path);
             var foreign = Directory.CreateDirectory(Path.Combine(parent, "foreign")).FullName;
-            Directory.CreateSymbolicLink(root.Path, foreign);
-            await Assert.ThrowsAsync<InvalidDataException>(() => root.DisposeAsync(() => Task.CompletedTask,
-                new CallbackDisposable(() => released = true)));
+            await Assert.ThrowsAsync<InvalidDataException>(() => root.DisposeAsync(() =>
+            {
+                // A fake deletion failure after quiescence is established must still release locks.
+                Directory.Move(root.Path, Path.Combine(parent, "saved"));
+                Directory.CreateSymbolicLink(root.Path, foreign);
+                return Task.CompletedTask;
+            }, new CallbackDisposable(() => released = true)));
             Assert.True(released);
             var running = EvaluationWorkRoot.Create(parent, "running");
             released = false;
@@ -478,6 +483,35 @@ public class SystemOneEvaluationTests
             Assert.True(Directory.Exists(running.Path));
         }
         finally { Directory.Delete(parent, true); } // Inert fake only; no worker exists.
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Evaluation_teardown_refuses_an_isolated_slot_still_held_without_a_worker_exception_marker(int busySlot)
+    {
+        var parent = NewCancellationArtifactDirectory();
+        var released = false;
+        var ledgerDropped = false;
+        try
+        {
+            var root = EvaluationWorkRoot.Create(parent, "arm", workerSlots: 2);
+            using var busy = WorkerLock.Acquire(root.Path, busySlot); // Inert real file lock; no process/helper.
+            // The outer production call can hide a marker or return cancellation; the underlying hold is the authority.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => root.RunAsync(() => throw new OperationCanceledException()));
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => root.DisposeAsync(
+                () => { ledgerDropped = true; return Task.CompletedTask; }, new CallbackDisposable(() => released = true)));
+            Assert.Contains("retained", failure.Message);
+            Assert.False(ledgerDropped);
+            Assert.False(released);
+            Assert.True(Directory.Exists(root.Path));
+            if (busySlot == 2)
+            {
+                // An unsuccessful acquire-all releases its own partial hold, never the real machine locks.
+                using var first = WorkerLock.Acquire(root.Path, 1);
+            }
+        }
+        finally { Directory.Delete(parent, true); }
     }
 
     private sealed class CallbackDisposable(Action dispose) : IDisposable
