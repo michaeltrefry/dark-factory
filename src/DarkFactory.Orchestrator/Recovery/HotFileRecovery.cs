@@ -23,6 +23,7 @@ public sealed class HotFileIncident
     public string? Answer { get; set; }
     public string? Error { get; set; }
     public int Attempts { get; set; }
+    public int Refreshes { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? ResolvedAt { get; set; }
     public DateTimeOffset? NextAttemptAt { get; set; }
@@ -53,6 +54,7 @@ public sealed record HotFileAssessment(string Snapshot, int Generation, string R
     public string? Prompt { get; init; }
     public string? MaterialSnapshot { get; init; }
     public string? Problem { get; init; }
+    public bool EvidenceChanged { get; init; }
     public IReadOnlyList<string> Citations { get; init; } = [];
     public IReadOnlyList<RecoveryFinding> Findings { get; init; } = [];
     public IReadOnlyList<RecoveryFinding> CorrectionFindings { get; init; } = [];
@@ -125,11 +127,7 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         var evidence = await EvidenceAsync(db, repo, ct);
         var acknowledged = incidents.Where(i => i.State == "Resolved").SelectMany(i => HotFileSnapshot.Parse(i.Snapshot).Merges)
             .SelectMany(m => m.Files.Select(f => (m.Row, m.Base, File: f))).ToHashSet();
-        var hot = evidence.SelectMany(m => m.Files.Select(f => (Merge: m, File: f)))
-            .GroupBy(x => (x.Merge.Base, x.File))
-            .Where(g => g.Select(x => x.Merge.Row).Distinct().Count() >= options.HotFileMerges
-                && g.Any(x => !acknowledged.Contains((x.Merge.Row, x.Merge.Base, x.File))))
-            .Select(g => g.Key).ToHashSet();
+        var hot = QualifyingPaths(evidence, acknowledged);
         if (hot.Count == 0) return null;
         var contributing = evidence.Select(m => m with { Files = m.Files.Where(f => hot.Contains((m.Base, f))).ToArray() })
             .Where(m => m.Files.Count > 0).ToArray();
@@ -161,31 +159,58 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         await using var db = await contexts.CreateDbContextAsync(ct);
         var incident = await DetectLockedAsync(db, repo, ct);
         if (incident is null) return;
+        // Terminal escalation is sticky. Only a failed delivery awaiting its first observation may leave the legacy
+        // Escalated state; no spent assessment/refresh budget can be reset by observing an old merge again.
+        await ReconcileCorrectionAsync(db, incident, ct);
+        if (incident.State == "Escalated" && incident.Error?.StartsWith("Correction delivery failed;", StringComparison.Ordinal) != true) return;
         await RefreshAfterCorrectionAsync(db, incident, ct);
-        if (incident.State is "Escalated" or "Correcting" || incident.NextAttemptAt > time.GetUtcNow()) return;
-        if (incident.Attempts >= 3)
+        if (incident.State == "Refreshing") await RefreshStaleAsync(db, incident, ct);
+        if (incident.State is "Escalated" or "Correcting" or "Resolved") return;
+        if (incident.Attempts >= AssessmentLimit)
         {
-            incident.State = "Escalated";
-            incident.Error = "Assessment budget exhausted; repository remains held.";
-            incident.Version++;
+            Escalate(incident, "Assessment budget exhausted");
             await db.SaveChangesAsync(ct);
             return;
         }
+        if (incident.NextAttemptAt > time.GetUtcNow()) return;
+        var abandoned = await db.RecoveryAssessmentAttempts.Where(a => a.IncidentId == incident.Id && a.State == "Reserved")
+            .OrderByDescending(a => a.Id).FirstOrDefaultAsync(ct);
+        if (abandoned is not null)
+        {
+            if (abandoned.LeaseUntil > time.GetUtcNow()) return;
+            abandoned.State = "Uncertain"; abandoned.Version++;
+            await db.SaveChangesAsync(ct);
+        }
+        // The process-local limiter and two database advisory seats bound assessments across processes, not just hosts.
         await Assessments.WaitAsync(ct);
+        IAsyncDisposable? seat = null;
         try
         {
+            seat = await locks.TryAcquireAsync(LockKey("assessment-seat-1"), ct)
+                ?? await locks.TryAcquireAsync(LockKey("assessment-seat-2"), ct);
+            if (seat is null) return;
             incident.State = "Assessing";
             incident.Attempts++;
             incident.Session = Guid.NewGuid().ToString();
+            incident.Answer = null;
             incident.Prompt = ReviewPrompts.For("hot-file-assessment").Id;
+            incident.NextAttemptAt = time.GetUtcNow() + RetryDelay(incident.Attempts);
             incident.Version++;
-            // Reserved before dispatch: a crash cannot replay an uncertain call for free.
+            var reservation = new RecoveryAssessmentAttempt { IncidentId = incident.Id,
+                Snapshot = HotFileSnapshot.Parse(incident.Snapshot).Id, Session = incident.Session,
+                Number = incident.Attempts, State = "Reserved", LeaseUntil = time.GetUtcNow() + StageTimeout, Version = 1 };
+            db.RecoveryAssessmentAttempts.Add(reservation);
+            // Claim, retry time and semantic attempt commit together BEFORE dispatch. A crash spends the uncertain call.
             await db.SaveChangesAsync(ct);
+            using var deadline = new CancellationTokenSource(StageTimeout, time);
+            using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
             var snapshot = HotFileSnapshot.Parse(incident.Snapshot);
             try
             {
                 if (snapshot.Merges.Count > 50) throw new InvalidOperationException("Required evidence exceeds 50 contributing merges.");
-                var answer = await assessor.AssessAsync(snapshot, incident.Session, ct);
+                var answer = await assessor.AssessAsync(snapshot, incident.Session, bounded.Token).WaitAsync(bounded.Token);
+                if (reservation.LeaseUntil <= time.GetUtcNow())
+                    throw new InvalidOperationException("Assessment lease expired; its late result has no authority.");
                 incident.Answer = JsonSerializer.Serialize(answer);
                 // Keep each session's result even when a subsequent attempt overwrites the incident's latest answer.
                 var anchorId = snapshot.Merges.FirstOrDefault()?.Item;
@@ -198,13 +223,14 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                 if (answer.Decision is "safe" or "unsafe" && capture is not null)
                 {
                     RecoveryCorrections.ValidateAssessment(incident, answer, snapshot, correction: false);
-                    if (await capture(snapshot, ct) != answer.Material)
-                        throw new InvalidOperationException("Snapshot evidence changed before accepting assessment authority.");
+                    if (await capture(snapshot, bounded.Token).WaitAsync(bounded.Token) != answer.Material)
+                        throw new RecoveryEvidenceChangedException("Snapshot evidence changed before accepting assessment authority.");
                 }
-                var current = await EvidenceAsync(db, repo, ct);
-                // Any new merge touching a reviewed file invalidates the assessment, including overlapping evidence.
-                var paths = snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Base, File: f))).ToHashSet();
-                var changed = current.Any(m => m.Files.Any(f => paths.Contains((m.Base, f))) && !snapshot.Merges.Any(old => old.Row == m.Row));
+                var current = await RefreshEvidenceAsync(db, snapshot, ct);
+                // New overlaps and newly qualifying hot files both need review. Compare tuples, not just rows:
+                // an existing contributing row may now contribute another file that was not in the snapshot.
+                var reviewed = snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Row, m.Base, File: f))).ToHashSet();
+                var changed = current.Any(m => m.Files.Any(f => !reviewed.Contains((m.Row, m.Base, f))));
                 if (answer.Snapshot == snapshot.Id && answer.Generation == incident.Generation && answer.Repo == repo
                     && answer.ServedClass == "high" && answer.Decision == "safe" && answer.EvidenceHash == incident.EvidenceHash && !changed)
                 {
@@ -219,18 +245,22 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                     {
                         incident.State = "Unsafe";
                         var material = RecoveryCorrections.ValidateAssessment(incident, answer, snapshot);
-                        if (await capture(snapshot, ct) != answer.Material)
-                            throw new InvalidOperationException("Snapshot evidence changed before correction authorization.");
+                        if (await capture(snapshot, bounded.Token).WaitAsync(bounded.Token) != answer.Material)
+                            throw new RecoveryEvidenceChangedException("Snapshot evidence changed before correction authorization.");
                         var bases = snapshot.Merges.Select(m => m.Base).Distinct().ToArray();
                         if (bases.Length != 1) throw new InvalidOperationException("Correction spans more than one delivery base.");
-                        var yaml = await policy(RepoRef.Parse(repo), material.BaseTips[bases[0]], ct)
+                        var yaml = await policy(RepoRef.Parse(repo), material.BaseTips[bases[0]], bounded.Token).WaitAsync(bounded.Token)
                             ?? throw new InvalidOperationException("Correction base has no gate policy.");
                         var next = (await db.RecoveryCorrections.Where(c => c.IncidentId == incident.Id).MaxAsync(c => (int?)c.Attempt, ct) ?? 0) + 1;
+                        bounded.Token.ThrowIfCancellationRequested();
                         await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(yaml), time.GetUtcNow(), ct, next);
                     }
-                    catch (Exception ex) when (!ct.IsCancellationRequested)
+                    catch (Exception ex) when (!ct.IsCancellationRequested
+                        && ex is not (OperationCanceledException or HttpRequestException or TimeoutException or GitHub.GitHubGatewayException))
                     {
-                        incident.State = "Escalated";
+                        // Invalid scope/policy is definitive. Unavailable verification and the shared stage deadline
+                        // instead reach the bounded assessment retry path; a transient read spends no correction.
+                        incident.State = ex is RecoveryEvidenceChangedException ? "Refreshing" : "Escalated";
                         incident.Error = "Correction refused; repository remains held: " + ex.Message;
                         await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct);
                     }
@@ -238,26 +268,55 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                 else if (!changed && answer.Decision == "unsafe" && answer.PendingDispositions.Count > 0 && capture is not null)
                 {
                     await RecordRedirectsAsync(db, incident, answer, time.GetUtcNow(), ct);
-                    incident.State = "Held";
+                    incident.State = "Refreshing";
                     incident.Error = "Pending work redirected; awaiting fresh assessment.";
                 }
                 else
                 {
-                    incident.State = "Held";
-                    incident.Error = changed ? "Merge evidence changed during assessment; repository remains held." : "No exact high-class safe acknowledgement; repository remains held.";
+                    incident.State = changed || answer.EvidenceChanged ? "Refreshing" : "Held";
+                    incident.Error = changed ? "Merge evidence changed during assessment; repository remains held." : answer.Problem ?? "No exact high-class safe acknowledgement; repository remains held.";
                 }
+            }
+            catch (RouterUsageLimitedException ex)
+            {
+                // Usage waits and orderly shutdown are not semantic failures. Keep their session record for accounting.
+                incident.Attempts--;
+                incident.State = "Held";
+                incident.Error = "Assessment waiting for router usage: " + ex.Message;
+                reservation.State = "UsageWait";
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                incident.Attempts--;
+                incident.State = "Held";
+                incident.Error = "Assessment interrupted by shutdown; no semantic attempt spent.";
+                incident.NextAttemptAt = null;
+                incident.Version++;
+                reservation.State = "Cancelled"; reservation.Version++;
+                using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                await db.SaveChangesAsync(cleanup.Token);
+                throw;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
-                incident.State = "Held";
+                incident.State = ex is RecoveryEvidenceChangedException ? "Refreshing" : "Held";
                 incident.Error = ex.Message;
             }
-            incident.NextAttemptAt = time.GetUtcNow() + TimeSpan.FromSeconds(incident.Attempts == 1 ? 30 : 120);
+            if (reservation.State == "Reserved") reservation.State = "Accepted";
+            reservation.Result = incident.Answer ?? incident.Error;
+            reservation.Version++;
+            incident.NextAttemptAt = time.GetUtcNow() + RetryDelay(Math.Max(1, incident.Attempts));
+            if (incident.State == "Held" && incident.Attempts >= AssessmentLimit)
+                Escalate(incident, "Assessment budget exhausted: " + incident.Error);
             incident.Version++;
-            // State and exact acknowledgement (the immutable snapshot) commit together, never a control write.
+            // Result, state and exact acknowledgement commit together, with both CAS tokens. No control write.
             await db.SaveChangesAsync(ct);
         }
-        finally { Assessments.Release(); }
+        finally
+        {
+            if (seat is not null) await seat.DisposeAsync();
+            Assessments.Release();
+        }
     }
 
     /// <summary>Fresh dispatch/worker-entry authority; only this exact grant's own incident hold is excepted.</summary>
@@ -313,7 +372,7 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
             if (provenStale)
             {
                 correction.State = "Revoked"; correction.Version++;
-                incident.State = "Held"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
+                incident.State = "Refreshing"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
                 reason = incident.Error;
             }
             await RecoveryCorrections.RecordRefusalAsync(db, incident, reason, time.GetUtcNow(), ct, externalId);

@@ -15,9 +15,10 @@ namespace DarkFactory.Orchestrator.Tests;
 
 public class RecoveryCorrectionPipelineTests
 {
-    internal sealed class Fixture
+    internal sealed class Fixture(DbContextOptions<LedgerDbContext>? options = null, IRunLocks? locks = null)
     {
-        internal readonly RecoveryWorkSourceTests.Fixture Recovery = new();
+        internal readonly RecoveryWorkSourceTests.Fixture Recovery = new(options, locks);
+        internal IPullRequests? PrClient;
         internal readonly FakeWorkspaces Workspaces = new();
         internal readonly FakePullRequests Prs = new();
         internal readonly GatePipelineTests.FakeGateGitHub GitHub = new();
@@ -58,7 +59,7 @@ public class RecoveryCorrectionPipelineTests
                 return new WorkerResult("correction-session", 0, false, "success", "done", "");
             });
             return await new RunPipeline(Recovery.Source, new WorkLedger(db, Recovery.Seed.Time), Recovery.Seed.Locks,
-                Workspaces, worker, Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: Controls,
+                Workspaces, worker, PrClient ?? Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: Controls,
                 recovery: Recovery.Recovery(() => Material),
                 gate: new GateStage(GateClient ?? GitHub, Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(2), Tests: Tests,
                     Risk: FakeCodeGraphRisk.Reader(new FakeCodeGraphRisk())))

@@ -224,7 +224,7 @@ public sealed class RecoveryGrantTests
         Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{correction.Id}", "owner/alpha", default));
         await using var db = f.Seed.Contexts.CreateDbContext();
         Assert.Equal("Revoked", Assert.Single(db.RecoveryCorrections).State);
-        Assert.Equal("Held", Assert.Single(db.HotFileIncidents).State);
+        Assert.Equal("Refreshing", Assert.Single(db.HotFileIncidents).State);
         Assert.Empty(await f.Source.ListReadyAsync(default));
     }
 

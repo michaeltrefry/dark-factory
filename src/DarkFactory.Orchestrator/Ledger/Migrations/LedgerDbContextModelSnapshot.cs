@@ -406,6 +406,9 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.Property<string>("Prompt")
                         .HasColumnType("text");
 
+                    b.Property<int>("Refreshes")
+                        .HasColumnType("integer");
+
                     b.Property<string>("Repo")
                         .IsRequired()
                         .HasMaxLength(200)
@@ -455,6 +458,52 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.HasIndex("WorkItemId");
 
                     b.ToTable("recovery_ancestors", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAssessmentAttempt", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<long>("IncidentId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTimeOffset>("LeaseUntil")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Number")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Result")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Session")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Snapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Session")
+                        .IsUnique();
+
+                    b.HasIndex("IncidentId", "Snapshot", "Number");
+
+                    b.ToTable("recovery_assessment_attempts", (string)null);
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", b =>
@@ -587,6 +636,15 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .IsRequired();
 
                     b.Navigation("Correction");
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAssessmentAttempt", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Recovery.HotFileIncident", null)
+                        .WithMany()
+                        .HasForeignKey("IncidentId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", b =>

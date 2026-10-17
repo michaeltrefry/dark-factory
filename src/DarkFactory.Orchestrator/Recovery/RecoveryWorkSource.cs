@@ -128,11 +128,17 @@ public sealed class RecoveryWorkSource(IDbContextFactory<LedgerDbContext> contex
         if (step == "recovery-comment" && c.State is "Pending" or "Claimed"
             && await db.WorkItems.AnyAsync(i => i.Source == Naming.Source && i.ExternalId == Naming.Format(id) && i.State == WorkState.Escalated, ct))
         {
-            c.State = "Failed"; c.Version++;
             var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == c.IncidentId, ct);
-            incident.State = "Escalated"; incident.Error = "Correction delivery failed; repository remains held. See the correction's typed gate/worker outcomes.";
-            incident.Version++;
-            await AppendAsync(db, c, RecoveryCorrections.StateStep, "Failed: ordinary delivery pipeline escalated the correction", ct);
+            var item = await db.WorkItems.SingleAsync(i => i.Source == Naming.Source && i.ExternalId == Naming.Format(id), ct);
+            if (await RecoveryCorrections.HasUncertainPrAsync(db, item.Id, ct))
+                RecoveryCorrections.HoldUncertainPr(incident, c);
+            else
+            {
+                c.State = "Failed"; c.Version++;
+                incident.State = "Escalated"; incident.Error = "Correction delivery failed; repository remains held. See the correction's typed gate/worker outcomes.";
+                incident.Version++;
+            }
+            await AppendAsync(db, c, RecoveryCorrections.StateStep, c.State + ": ordinary delivery pipeline escalated the correction", ct);
         }
         await AppendAsync(db, c, step, detail, ct);
         await db.SaveChangesAsync(ct);

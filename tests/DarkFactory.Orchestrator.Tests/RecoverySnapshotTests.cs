@@ -41,7 +41,13 @@ public sealed class RecoverySnapshotTests
         using var http = api.Client("https://api.github.com/");
         var gate = new DarkFactory.Orchestrator.GitHub.GitHubGate(http,
             new DarkFactory.Orchestrator.GitHub.GitHubApp(http, "4242", key.ExportRSAPrivateKeyPem(), TimeProvider.System));
-        if (missingPage || missingTotal || overlap is not null) await Assert.ThrowsAsync<InvalidOperationException>(
+        if (missingPage)
+        {
+            var unavailable = await Assert.ThrowsAsync<DarkFactory.Orchestrator.GitHub.GitHubGatewayException>(
+                () => gate.GetRecoveryCiAsync(RepoRef.Parse(Repo), "head", CancellationToken.None));
+            Assert.Equal(System.Net.HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
+        }
+        else if (missingTotal || overlap is not null) await Assert.ThrowsAsync<InvalidOperationException>(
             () => gate.GetRecoveryCiAsync(RepoRef.Parse(Repo), "head", CancellationToken.None));
         else
         {

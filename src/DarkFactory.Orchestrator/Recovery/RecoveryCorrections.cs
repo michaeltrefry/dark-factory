@@ -37,8 +37,20 @@ public sealed class RecoveryAncestor
 public static class RecoveryCorrections
 {
     public const string Step = "recovery-correction";
+    internal const string PrUncertainStep = "recovery-pr-unresolved";
     public const string StateStep = "recovery-correction-state";
     public const string RefusalStep = "recovery-correction-refused";
+
+    internal static Task<bool> HasUncertainPrAsync(LedgerDbContext db, long item, CancellationToken ct) =>
+        db.LedgerEntries.AnyAsync(e => e.WorkItemId == item && e.Step == PrUncertainStep, ct);
+
+    internal static void HoldUncertainPr(HotFileIncident incident, RecoveryCorrection correction)
+    {
+        correction.State = "Uncertain"; correction.Version++;
+        incident.State = "Escalated";
+        incident.Error = "Correction PR creation could not be reconciled; repository remains held. No replacement correction is authorized.";
+        incident.Version++;
+    }
 
     internal static async Task RecordRefusalAsync(LedgerDbContext db, HotFileIncident incident, string reason, DateTimeOffset now,
         CancellationToken ct, string? externalId = null)
@@ -60,8 +72,11 @@ public static class RecoveryCorrections
         // Replays never revive a stopped/failed item or mint a second authority for the same attempt.
         if (existing is not null) return existing;
         if (attempt is < 1 or > 2 || attempt == 2 && !await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id
-                && c.Attempt == 1 && (c.State == "Failed" || c.State == "Merged"), ct))
+                && c.Attempt == 1 && (c.State == "Failed" || c.State == "Merged" || c.State == "Revoked"), ct))
             throw new InvalidOperationException("Correction attempt is not authorized by a failed prior repair or exceeds two attempts.");
+        if (await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id && (c.State == "Stopped"
+            || db.WorkItems.Any(w => w.ExternalId == "rc-" + c.Id && w.State == WorkState.Cancelled)), ct))
+            throw new InvalidOperationException("A correction was stopped; no replacement repair is authorized.");
         var trigger = HotFileSnapshot.Parse(incident.Snapshot);
         var material = ValidateAssessment(incident, answer, trigger);
         await HotFileRecovery.RecordRedirectsAsync(db, incident, answer, now, ct);
