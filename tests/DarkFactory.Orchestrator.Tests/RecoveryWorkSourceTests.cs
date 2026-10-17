@@ -213,19 +213,137 @@ public sealed class RecoveryGrantTests
 
     [Theory]
     [InlineData("changed")]
-    [InlineData("unreadable")]
     [InlineData("protected")]
     public async Task Fresh_evidence_and_current_policy_revoke_stale_authority(string change)
     {
         var f = new RecoveryWorkSourceTests.Fixture(); await f.Initialize();
         var correction = await f.Materialize();
-        await using var recovery = f.Recovery(() => change == "protected" ? f.Answer.Material! : change,
+        await using var recovery = f.Recovery(() => change == "protected" ? f.Answer.Material!
+            : JsonSerializer.Serialize(RecoverySnapshot.FromDetail(f.Answer.Material)! with { BaseTips = new Dictionary<string, string> { ["main"] = new('c', 40) } }),
             change == "protected" ? TestPolicies.Standard().Replace("infra/", "infra/, src/") : null);
         Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{correction.Id}", "owner/alpha", default));
         await using var db = f.Seed.Contexts.CreateDbContext();
         Assert.Equal("Revoked", Assert.Single(db.RecoveryCorrections).State);
         Assert.Equal("Held", Assert.Single(db.HotFileIncidents).State);
         Assert.Empty(await f.Source.ListReadyAsync(default));
+    }
+
+    [Theory]
+    [InlineData("capture")]
+    [InlineData("unreadable")]
+    [InlineData("incomplete")]
+    [InlineData("policy")]
+    public async Task Unverifiable_authorization_defers_without_spending_the_existing_identity(string failure)
+    {
+        var f = new RecoveryWorkSourceTests.Fixture(); await f.Initialize();
+        var c = await f.Materialize();
+        var unavailable = true;
+        await using var recovery = new HotFileRecovery(f.Seed.Contexts, f.Seed.Locks, f.Seed.Options, f.Seed.Time,
+            f.Seed.Assessor, capture: (_, _) => failure == "capture" && unavailable
+                ? throw new IOException("temporary evidence outage")
+                : Task.FromResult(failure == "unreadable" && unavailable ? "unreadable" : failure == "incomplete" && unavailable
+                    ? JsonSerializer.Serialize(RecoverySnapshot.FromDetail(f.Answer.Material)! with { Missing = [new("ci", "temporarily unavailable")] })
+                    : f.Answer.Material!),
+            policy: (_, _, _) => failure == "policy" && unavailable
+                ? throw new IOException("temporary policy outage") : Task.FromResult<string?>(TestPolicies.Standard()));
+        Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
+        await using (var db = f.Seed.Contexts.CreateDbContext())
+        {
+            Assert.Equal("Pending", Assert.Single(db.RecoveryCorrections).State);
+            Assert.Equal("Correcting", Assert.Single(db.HotFileIncidents).State);
+        }
+        unavailable = false;
+        Assert.True(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
+        Assert.Equal(c.Id, (await f.Materialize()).Id);
+        Assert.Equal(new[] { c.Id }, await f.Source.ListReadyAsync(default));
+    }
+
+    [Theory]
+    [InlineData(ControlState.Paused)]
+    [InlineData(ControlState.Stopping)]
+    public async Task Human_control_during_FINAL_worker_authorization_blocks_coding_and_finishes_Stop(ControlState state)
+    {
+        var f = new RecoveryWorkSourceTests.Fixture(); await f.Initialize();
+        var c = await f.Materialize();
+        var controls = new LedgerControls(f.Seed.Contexts, f.Seed.Time);
+        var entered = false;
+        await using var recovery = f.Recovery(() =>
+        {
+            // Inject inside the final session-entry capture, not dispatch's earlier authorization.
+            if (Environment.StackTrace.Contains("RunSessionAsync", StringComparison.Ordinal))
+            {
+                entered = true;
+                controls.SetAsync($"item:rc-{c.Id}", state, "human", default).GetAwaiter().GetResult();
+            }
+            return f.Answer.Material!;
+        });
+        var worker = new RunPipelineTests.FakeWorker();
+        await using var db = f.Seed.Contexts.CreateDbContext();
+        var outcome = await new RunPipeline(f.Source, new WorkLedger(db, f.Seed.Time), f.Seed.Locks,
+            new RunPipelineTests.FakeWorkspaces(), worker, new RunPipelineTests.FakePullRequests(),
+            RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: controls, recovery: recovery).RunAsync(c.Id, default);
+        Assert.True(entered);
+        Assert.Empty(worker.Calls);
+        Assert.Equal(state == ControlState.Stopping ? WorkState.Cancelled : WorkState.Paused, outcome.State);
+        if (state == ControlState.Stopping)
+        {
+            await using var read = f.Seed.Contexts.CreateDbContext();
+            Assert.Equal("Stopped", Assert.Single(read.RecoveryCorrections).State);
+            Assert.Null(await controls.GetAsync($"item:rc-{c.Id}", default));
+        }
+        else Assert.Equal("human", (await controls.GetAsync($"item:rc-{c.Id}", default))!.ChangedBy);
+    }
+
+    [Theory]
+    [InlineData("correction")]
+    [InlineData("factory")]
+    [InlineData("repo")]
+    [InlineData("plan")]
+    [InlineData("epic")]
+    public async Task Public_Stop_settles_preintake_correction_and_never_replaces_it(string scope)
+    {
+        var f = new RecoveryWorkSourceTests.Fixture(); await f.Initialize();
+        await using (var db = f.Seed.Contexts.CreateDbContext())
+        {
+            var plan = new WorkItem { Source = "shortcut", ExternalId = "sc-99", Title = "completed plan",
+                Repo = "owner/alpha", State = WorkState.Done, EpicId = 42 };
+            db.Add(plan); await db.SaveChangesAsync();
+            (await db.WorkItems.FirstAsync(i => i.ExternalId == "sc-1")).PlanItemId = plan.Id;
+            await db.SaveChangesAsync();
+        }
+        var c = await f.Materialize();
+        var controls = new LedgerControls(f.Seed.Contexts, f.Seed.Time);
+        var actions = new ControlActions(controls, f.Seed.Contexts, new PublicStops(f, controls),
+            naming => naming == ItemNaming.Recovery ? f.Source : new FakeWorkSource(
+                new WorkStory(99, "plan", "requirements", "chore", "", ItemNaming.Shortcut)), f.Seed.Locks);
+        var key = scope switch { "correction" => $"item:rc-{c.Id}", "repo" => "repo:owner/alpha", "plan" => "item:sc-99",
+            "epic" => "epic:42", _ => "factory" };
+        Assert.True((await actions.StopAsync(key, "human", default)).Ok);
+        await using (var db = f.Seed.Contexts.CreateDbContext())
+        {
+            Assert.Equal("Stopped", Assert.Single(db.RecoveryCorrections).State);
+            Assert.Equal("Escalated", Assert.Single(db.HotFileIncidents).State);
+        }
+        Assert.Empty(await f.Source.ListReadyAsync(default));
+        Assert.False((await f.Source.ClaimAsync(c.Id, true, default)).Claimed);
+        Assert.Equal(c.Id, (await f.Materialize()).Id);
+        await using var recovery = f.Recovery();
+        Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
+        await recovery.AdvanceAsync("owner/alpha", default);
+        await using var final = f.Seed.Contexts.CreateDbContext();
+        Assert.Equal("Stopped", Assert.Single(final.RecoveryCorrections).State);
+    }
+
+    private sealed class PublicStops(RecoveryWorkSourceTests.Fixture f, IControls controls) : IItemStops
+    {
+        public async Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct)
+        {
+            await using var db = f.Seed.Contexts.CreateDbContext();
+            IWorkSource source = item.Naming == ItemNaming.Recovery ? f.Source : new FakeWorkSource(
+                new WorkStory(item.Id, "contributor", "requirements", "chore", "", item.Naming));
+            return await new ItemStopper(source, new WorkLedger(db, f.Seed.Time), f.Seed.Locks,
+                new RunPipelineTests.FakePullRequests(), controls, TextWriter.Null).StopAsync(item.Id, ct);
+        }
     }
 
     [Theory]

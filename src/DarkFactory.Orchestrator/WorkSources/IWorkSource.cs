@@ -161,6 +161,9 @@ public interface IWorkSource
     /// </summary>
     ItemNaming Naming { get; }
 
+    /// <summary>Settle a source-owned identity that exists before pipeline intake. False when this source has no such item.</summary>
+    Task<bool> StopBeforeIntakeAsync(int id, CancellationToken ct) => Task.FromResult(false);
+
     /// <summary>
     /// How many claim refusals in a row an item may get before its run escalates it instead of parking it again (E10), for a source
     /// that lists a refused item again by itself (<see cref="ListReadyAsync"/>); null for a source that lists a refused item only once

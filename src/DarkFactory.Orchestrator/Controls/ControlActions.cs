@@ -174,12 +174,24 @@ public sealed class ControlActions(
             }
             stories.AddRange(found.OfType<ItemRef>().Distinct());
         }
+        // A recovery identity exists before intake, and its contributing plan may already be completed.
+        // Include persisted ancestry, not only active WorkItems, so Stop cannot leave a pending replacement behind.
+        await using (var db = await contexts.CreateDbContextAsync(ct))
+        {
+            var repository = ControlScope.RepositoryOf(scope)?.Key;
+            var correctionIds = await db.RecoveryCorrections.AsNoTracking()
+                .Where(c => (c.State == "Pending" || c.State == "Claimed")
+                    && (scope == ControlScope.Factory || repository != null && c.Repo == repository
+                        || db.RecoveryAncestors.Any(a => a.CorrectionId == c.Id && a.Scope == scope)))
+                .Select(c => c.Id).ToListAsync(ct);
+            stories.AddRange(correctionIds.Select(id => new ItemRef(ItemNaming.Recovery, id)));
+        }
         var ok = unknown.Count == 0;
         var results = new List<string>();
         if (ControlScope.RepositoryOf(scope) is not null)
             results.Add($"{scope} manually paused until human Continue; only this repository's active items are stopped."
                 + (retainedPlans.Count == 0 ? "" : $" Multi-repository plans retained: {string.Join(", ", retainedPlans)}; other repositories continue, cancelled children keep their plans incomplete."));
-        foreach (var item in stories)
+        foreach (var item in stories.Distinct())
         {
             await controls.SetAsync(ControlScope.Item(item.ToString()), ControlState.Stopping, by, ct);
             if (stops is null)

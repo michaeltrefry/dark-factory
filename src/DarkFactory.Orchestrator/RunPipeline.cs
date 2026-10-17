@@ -1887,8 +1887,14 @@ public sealed partial class RunPipeline(
         {
             throw new ControlRequestedException(state);
         }
-        if (Naming == ItemNaming.Recovery && (recovery is null || !await recovery.AuthorizeCorrectionAsync(item.ExternalId, item.Repo, ct)))
-            throw new ControlRequestedException(ControlState.Paused);
+        if (Naming == ItemNaming.Recovery)
+        {
+            var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(item.ExternalId, item.Repo, ct);
+            // Evidence/policy acquisition awaits external reads. A human Stop during them wins even over a refused grant.
+            var current = await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct);
+            if (current != ControlState.Running) throw new ControlRequestedException(current);
+            if (!authorized) throw new ControlRequestedException(ControlState.Paused);
+        }
     }
 
     /// <summary>

@@ -111,6 +111,13 @@ public sealed class RecoveryWorkSource(IDbContextFactory<LedgerDbContext> contex
         await AppendAsync(db, c, RecoveryCorrections.StateStep, state + (comment is null ? "" : ": " + comment), ct);
         await db.SaveChangesAsync(ct);
     }
+    public async Task<bool> StopBeforeIntakeAsync(int id, CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        if (!await db.RecoveryCorrections.AnyAsync(c => c.Id == id, ct)) return false;
+        await UpdateAsync(id, "Stopped", "Human Stop before pipeline intake; no automated replacement is authorized.", ct);
+        return true;
+    }
     public Task CommentAsync(int id, string text, CancellationToken ct) => RecordAsync(id, "recovery-comment", text, ct);
     public Task LinkAsync(int id, IReadOnlyList<string> urls, CancellationToken ct) => RecordAsync(id, "recovery-links", JsonSerializer.Serialize(urls), ct);
     private async Task RecordAsync(int id, string step, string detail, CancellationToken ct)

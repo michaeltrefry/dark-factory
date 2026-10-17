@@ -255,22 +255,35 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
         if (correction is null || correction.Repo != Key(repository)) return false;
         var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == correction.IncidentId, ct);
         var trigger = HotFileSnapshot.Parse(incident.Snapshot);
+        var provenStale = false;
         try
         {
             var material = await capture(trigger, ct);
+            var snapshot = RecoverySnapshot.FromDetail(material);
+            if (snapshot is not { Complete: true })
+                throw new InvalidOperationException("Current evidence could not be completely verified.");
             if (RecoverySnapshot.Hash(material) != correction.MaterialHash)
+            {
+                provenStale = true;
                 throw new InvalidOperationException("Snapshot evidence changed; correction authority is stale.");
-            var snapshot = RecoverySnapshot.FromDetail(material)!;
+            }
             var yaml = await policy(RepoRef.Parse(repository), snapshot.BaseTips[correction.Base], ct)
                 ?? throw new InvalidOperationException("Correction base has no gate policy.");
-            RecoveryCorrections.ValidateEnvelope(JsonSerializer.Deserialize<string[]>(correction.Paths)!, GatePolicy.Parse(yaml));
+            var currentPolicy = GatePolicy.Parse(yaml);
+            provenStale = true; // A verified policy that excludes the envelope is definitive, unlike an unavailable read.
+            RecoveryCorrections.ValidateEnvelope(JsonSerializer.Deserialize<string[]>(correction.Paths)!, currentPolicy);
             return true;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            correction.State = "Revoked"; correction.Version++;
-            incident.State = "Held"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
-            await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct, externalId);
+            var reason = "Correction authorization deferred (could not verify): " + ex.Message;
+            if (provenStale)
+            {
+                correction.State = "Revoked"; correction.Version++;
+                incident.State = "Held"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
+                reason = incident.Error;
+            }
+            await RecoveryCorrections.RecordRefusalAsync(db, incident, reason, time.GetUtcNow(), ct, externalId);
             await db.SaveChangesAsync(ct);
             return false;
         }
