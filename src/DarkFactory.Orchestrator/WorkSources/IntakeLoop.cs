@@ -994,6 +994,7 @@ public static class IntakeServiceCollectionExtensions
         services.AddHostedService(sp => sp.GetRequiredService<Router.UsageMonitor>());
         // Every source the host reaches comes from this one registry (sc-25982): the loop's lanes, the dashboard's controls and Stop.
         services.AddSingleton(_ => new WorkSourceRegistry(options));
+        services.AddSingleton(_ => FactoryRunner.CreateFreeze(options));
         // The dashboard's Stop finishes a stop itself when no run holds the item, on the item's own source.
         services.AddSingleton<Controls.IItemStops>(sp => new FactoryItemStops(options, sp.GetRequiredService<WorkSourceRegistry>(), Console.Out));
         services.AddHostedService(sp =>
@@ -1003,7 +1004,7 @@ public static class IntakeServiceCollectionExtensions
             // sc-25989). A watched source without its credential
             // fails the host's start here.
             var status = sp.GetRequiredService<IntakeStatus>();
-            var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out), status, Console.Out);
+            var lanes = sp.GetRequiredService<WorkSourceRegistry>().Lanes(source => new FactoryItemRunner(options, source, Console.Out, () => sp.GetRequiredService<Controls.FactoryFreeze>().Recovery), status, Console.Out);
             // One evaluator for the loop's life, so its main-red reads are reused within FactoryFreeze.MainRedCacheTtl; built on the
             // first poll, so a missing credential fails that poll (counted as frozen) rather than the host's start.
             Controls.FactoryFreeze? evaluator = null;
@@ -1011,7 +1012,7 @@ public static class IntakeServiceCollectionExtensions
                 lanes, sp.GetRequiredService<IntakeOptions>(),
                 sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<IntakeLoop>>(), sp.GetRequiredService<Controls.IControls>(),
                 sp.GetRequiredService<Router.UsageMonitor>(), status,
-                ct => (evaluator ??= FactoryRunner.CreateFreeze(options)).CheckAsync(ct));
+                ct => (evaluator ??= sp.GetRequiredService<Controls.FactoryFreeze>()).CheckAsync(ct));
         });
         return services;
     }

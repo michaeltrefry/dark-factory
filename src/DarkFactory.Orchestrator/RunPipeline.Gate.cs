@@ -67,7 +67,7 @@ public sealed partial class RunPipeline
 
     private async Task<(List<LedgerEntry> History, PullFacts Pull)> ReadPullAsync(Run run, CancellationToken ct)
     {
-        var history = await ledger.HistoryAsync(run.Item, ct);
+        var history = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct));
         var url = LinkedPullRequestUrl(history) ?? throw new InvalidOperationException($"{run.Item.ExternalId} has no pull request in its ledger.");
         var (linked, number) = GitHubGate.ParsePullUrl(url);
         // An item's pull request is in the item's repository (sc-25873). The number alone names a different pull request in any
@@ -79,6 +79,8 @@ public sealed partial class RunPipeline
                 + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository. {RenamedRemedy}");
         }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
+        if (Naming == ItemNaming.Recovery && history.LastOrDefault(e => e.Step == RecoveryPushedHead)?.Detail != pull.HeadSha)
+            throw new GateBlockedException("Correction head no longer matches the authorized worker push.");
         return (history, pull);
     }
 
@@ -133,7 +135,7 @@ public sealed partial class RunPipeline
     /// </summary>
     private static void EnsureBase(Run run, PullFacts pull)
     {
-        var expected = run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
+        var expected = run.RequiredBase ?? run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
         if (expected is not null && !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
         {
             throw new InvalidOperationException($"{pull.HtmlUrl} targets {pull.BaseRef}, not {expected}.");
@@ -621,7 +623,7 @@ public sealed partial class RunPipeline
         bool requestAgain = false, CancellationToken? wait = null)
     {
         await ThrowIfControlledAsync(run.Item, ct);
-        var row = (await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
+        var row = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
             && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha);
         if (!requestAgain && CodeGraphOverlay.FromDetail(row?.Detail) is { IsReady: true } recorded)
         {
@@ -806,7 +808,7 @@ public sealed partial class RunPipeline
                 }
             }
             await ThrowIfControlledAsync(item, ct);
-            var grant = await GrantPushAsync(item, session, ct);
+            var grant = await GrantPushAsync(run, session, ct);
             // The PR branch is always ahead of the base, so this pushes even when the fixer changed nothing (the same head):
             // that round is judged like any other (a review round with no fewer blocking findings fails; red CI stays red).
             await workspaces.CommitAndPushAsync(repo, workspace, commitMessage, grant, ct);
@@ -815,6 +817,7 @@ public sealed partial class RunPipeline
             {
                 log.WriteLine($"[fix] {name}: the fixer changed nothing; the head stays {Ci.Short(pushed)}");
             }
+            await RecordCorrectionPushAsync(run, ct);
             await ledger.CheckpointAsync(item, Steps.Pushed, session, pushed, ct);
         }
         else
@@ -1309,7 +1312,7 @@ public sealed partial class RunPipeline
     /// (<see cref="Plans.Changeset.CurrentPass"/>): the gate passing an earlier repository's changeset says nothing about this one.
     /// </summary>
     internal static string? GatePassedAt(IReadOnlyList<LedgerEntry> history, PullFacts pull) =>
-        pull.Merged && Plans.Changeset.CurrentPass(history).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
+        pull.Merged && Plans.Changeset.CurrentPass(SinceRecoveryRestart(history)).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 
     /// <summary>
     /// After a merge call failed: re-reads the PR and returns its merge commit when GitHub merged it at the gated head;
@@ -1320,7 +1323,8 @@ public sealed partial class RunPipeline
         try
         {
             var after = await Gate.GitHub.GetPullAsync(run.Repo, gated.Number, ct);
-            return after.Merged && after.HeadSha == gated.HeadSha ? after.MergeCommitSha : null;
+            return after.Merged && after.HeadSha == gated.HeadSha && after.BaseRef == gated.BaseRef
+                && await CorrectionMergeWasAuthorizedAsync(run.Repo, await ledger.HistoryAsync(run.Item, ct), after, ct) ? after.MergeCommitSha : null;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -1347,6 +1351,7 @@ public sealed partial class RunPipeline
         var entered = history.FindLastIndex(e => e.Step is null);
         var commit = history[entered].Detail;
         var done = history.Skip(entered + 1).Select(e => e.Step).ToHashSet();
+        await RecordCorrectionDeliveryAsync(run, commit, ct);
         if (run.Changeset is { } changeset && Plans.Changeset.Ordered(history, run.Repo) is { Count: > 1 } changesets)
         {
             var delivered = Plans.Changeset.Delivered(history).Select(d => d.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);

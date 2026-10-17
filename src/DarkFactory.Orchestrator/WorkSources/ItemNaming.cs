@@ -41,7 +41,9 @@ public sealed record ItemNaming(string Source, string Prefix, string Noun, EpicN
     public static readonly ItemNaming Kanban = new("kanban", "kb", "Kanban item", EpicNaming.Key) { Trusted = true };
 
     /// <summary>Every source's naming.</summary>
-    public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue, Kanban];
+    public static readonly ItemNaming Recovery = new("recovery", "rc", "recovery correction");
+
+    public static readonly IReadOnlyList<ItemNaming> All = [Shortcut, GitHubIssue, Kanban, Recovery];
 
     public string Format(int id) => $"{Prefix}-{id}";
 

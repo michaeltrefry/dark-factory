@@ -88,7 +88,8 @@ public sealed partial class RunPipeline(
     Plans.IPlanRunner? planner = null,
     IReadOnlyList<RepoRef>? configuredRepos = null,
     Worker.WorkerSlots? slots = null,
-    Func<CancellationToken, Task>? enterSandbox = null)
+    Func<CancellationToken, Task>? enterSandbox = null,
+    Recovery.HotFileRecovery? recovery = null, bool backgroundRecovery = false)
 {
     /// <summary>
     /// The worker slots (sc-25989, E6/E7; null unsandboxed: workers then run as the owner and share no user): one sandbox user
@@ -717,6 +718,14 @@ public sealed partial class RunPipeline(
     /// </summary>
     public const string ControlsUnreadablePaused = "controls-unreadable";
 
+    /// <summary>
+    /// Detail of the Paused row recorded when only an automatic hot-file recovery incident of the item's repository stopped the
+    /// run (no human Pause, usage pause or freeze). Such an item resumes by itself (its worker with <c>claude --resume</c>) once
+    /// the incident resolves and nothing else pauses it; no human Continue is needed. A human Pause beside it is recorded
+    /// <see cref="UserPaused"/> instead, and then both must lift.
+    /// </summary>
+    public const string RecoveryHeld = "recovery-held";
+
     /// <summary>A Pause or Stop control reached a run; the worker (if any) has ended.</summary>
     private sealed class ControlRequestedException(ControlState state, bool workerStillRunning = false)
         : Exception($"control: {state}")
@@ -727,6 +736,13 @@ public sealed partial class RunPipeline(
         public FreezeStatus? Frozen { get; init; }
         /// <summary>Set when the controls could not be read (<see cref="ControlsUnreadablePaused"/>): the last read's error.</summary>
         public string? ControlsUnreadable { get; init; }
+        /// <summary>
+        /// Set when a correction's full authorization at a boundary (worker entry, push, merge) refused or could not verify it — an
+        /// automatic recovery deferral, not a human's Pause: recorded <see cref="RecoveryHeld"/> unless a human Pause holds too.
+        /// </summary>
+        public bool CorrectionDeferred { get; init; }
+
+        public static ControlRequestedException Deferred() => new(ControlState.Paused) { CorrectionDeferred = true };
     }
 
     /// <summary>
@@ -758,6 +774,8 @@ public sealed partial class RunPipeline(
         /// (sc-25872), or null for the repository's default branch (an item of no plan, and a plan item's own changeset).
         /// </summary>
         public string? BaseBranch { get; init; }
+        public string? RequiredBase { get; init; }
+        public Recovery.RecoveryRedirect? Redirect { get; init; }
 
         /// <summary>A plan item's changeset (the item's branch is then the changeset branch); null for every other item.</summary>
         public Plans.Changeset? Changeset { get; init; }
@@ -917,7 +935,7 @@ public sealed partial class RunPipeline(
     {
         var paused = history.FindLastIndex(e => e.Step is null);
         var pausedFrom = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList()).PausedFrom;
-        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused or FreezePaused or ControlsUnreadablePaused }
+        return history[paused] is { State: WorkState.Paused, Detail: Interrupted or UserPaused or UsagePaused or FreezePaused or ControlsUnreadablePaused or RecoveryHeld }
             && pausedFrom is { } from && handled.Contains(from)
             && !history.Skip(paused + 1).Any(e => e.Step == Steps.Parked);
     }
@@ -932,7 +950,7 @@ public sealed partial class RunPipeline(
     {
         // Decide from the ledger (and the controls) before reading anything from the board.
         var known = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
-        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveAsync(known.ExternalId, known.EpicId, ct);
+        var knownControl = known is null ? ControlState.Running : await _controls.EffectiveWithoutRepositoryAsync(known.ExternalId, known.EpicId, ct);
         if (known is not null && knownControl == ControlState.Stopping)
         {
             // A stop is finished even while the factory is frozen: it starts no new work.
@@ -950,6 +968,9 @@ public sealed partial class RunPipeline(
         }
         if (known is not null)
         {
+            if (knownControl == ControlState.Running) await ObserveCorrectionMergeAsync(known, ct);
+            // Repository controls are checked only after the fresh spec and the ledger resolve the operation repository
+            // (resolvedControl, under the run lock); a Stop without them was finished above.
             if (knownControl == ControlState.Paused)
             {
                 log.WriteLine($"[{known.State}] {known.ExternalId} is paused by a control; nothing to do.");
@@ -995,6 +1016,21 @@ public sealed partial class RunPipeline(
         }
         // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
+        // Before the run lock (E12): a plan item may work in every repository it names; any other item in its own.
+        await AdvanceRecoveryAsync(source.PlansItems && Plans.PlanLabel.IsOn(story)
+            ? RepoResolver.ResolveAll(story.Description, defaultRepo) : [primary], ct);
+        if (await source.AuthorizeDispatchAsync(storyId, primary, ct) is { Claimed: false } refusal)
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, refusal.Refusal);
+        var correctionDelivered = Naming == ItemNaming.Recovery && known is not null
+            && (known.State is WorkState.Merge or WorkState.Watch
+                || known.State == WorkState.Paused && (await ledger.ContextAsync(known, ct)).PausedFrom == WorkState.Merge);
+        if (Naming == ItemNaming.Recovery && !correctionDelivered && (recovery is null || !await recovery.AuthorizeCorrectionAsync(Naming.Format(storyId), primary.FullName, ct)))
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, "Correction requires fresh incident-bound authorization.");
+        if (known is null && await RepositoryControlAsync(Naming.Format(storyId), spec.Epic?.Id, primary.FullName, ct) != ControlState.Running)
+        {
+            // A repository hold is not a factory-wide Deferred: the next item in this lane may target another repository.
+            return new RunOutcome(0, WorkState.Intake, null, null, $"repository {primary} held by hot-file recovery or a control");
+        }
         var item = await ledger.GetOrCreateAsync(Naming.Source, Naming.Format(storyId), story.Name, primary.FullName, IntakeDetail(story), ct, spec.Epic?.Id);
 
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
@@ -1012,6 +1048,14 @@ public sealed partial class RunPipeline(
         var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
+        if (known is not null && !correctionDelivered && item.State != WorkState.Planned && !Lifecycle.IsTerminal(item.State))
+        {
+            var resolvedControl = await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct);
+            if (resolvedControl == ControlState.Stopping) return await StopIdleLockedAsync(item, storyId, ct);
+            if (resolvedControl == ControlState.Paused)
+                return await OutcomeAsync(item, PausedMessage(item.ExternalId), ct);
+        }
+
         // A story a plan created records its plan (sc-25871), from the ledger's own record of what the plan created. Looked up
         // until the item is first claimed: a plan's story is linked before its claim (WithoutPlanAsync refuses one that is not),
         // so an item that was ever claimed without a link is no plan's story and is not looked up on every later run.
@@ -1024,11 +1068,20 @@ public sealed partial class RunPipeline(
         // merges into it; a plan item whose stories have all merged works on the changeset branch itself, against the default branch.
         var changeset = Plans.Changeset.Of(await ledger.HistoryAsync(item, ct), repo);
         var ofPlan = item.PlanItemId is { } plan ? await ledger.ChangesetOfAsync(plan, repo, ct) : (null, []);
+        Recovery.RecoveryRedirect? redirect = null;
+        try
+        {
+            if (recovery is not null && !(source.PlansItems && Plans.PlanLabel.IsOn(story)))
+                redirect = await recovery.RedirectAsync(item.ExternalId, ct);
+        }
+        catch (Recovery.RecoveryContinuationDeferredException ex) { return await OutcomeAsync(item, ex.Message, ct); }
         var run = new Run(spec, repo, item)
         {
             Primary = primary,
             Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
             BaseBranch = ofPlan.Changeset?.Branch,
+            RequiredBase = await source.DeliveryBaseAsync(storyId, ct),
+            Redirect = redirect,
             Changeset = changeset,
         };
         // Fail closed: a plan with a changeset has none on origin for this repository (the story's `Repo:` line names another one),
@@ -1047,6 +1100,10 @@ public sealed partial class RunPipeline(
                 + $"Its `Repo:` line must name {planned}."
             : null;
 
+        // Resolving the redirect may discover newer base/spec/head evidence and re-hold the incident.
+        if (!correctionDelivered && !Lifecycle.IsTerminal(item.State) && item.State is not (WorkState.Planned or WorkState.Merge or WorkState.Watch)
+            && await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct) != ControlState.Running)
+            return await OutcomeAsync(item, PausedMessage(item.ExternalId), ct);
         if (Lifecycle.IsTerminal(item.State))
         {
             log.WriteLine($"[{item.State}] {item.ExternalId} is {item.State}; nothing to do.");
@@ -1101,6 +1158,7 @@ public sealed partial class RunPipeline(
             {
                 throw new WorkerFailedException(noChangeset);
             }
+            await RestartRedirectedCodingAsync(run, ct);
             while (Handlers.TryGetValue(item.State, out var handler))
             {
                 // Pause/Stop: no new step starts once a control says so.
@@ -1170,6 +1228,27 @@ public sealed partial class RunPipeline(
                 return await OutcomeAsync(item, $"{item.ExternalId} is paused by the factory freeze ({frozenBy}); {FreezeTrigger.Remedy(frozenBy)}.",
                     CancellationToken.None);
             }
+            if (!userPaused && recovery is not null
+                && await recovery.HoldingAsync(item.ExternalId, item.Repo, CancellationToken.None) is { } incident)
+            {
+                // Only the automatic repository incident holds it: not a human's Pause, so no Continue is owed.
+                await ledger.RecordAsync(item, WorkState.Paused, null, RecoveryHeld, CancellationToken.None);
+                log.WriteLine($"[paused] {item.ExternalId} held by hot-file recovery of {incident.Repo} (generation {incident.Generation}, "
+                    + $"{incident.State}); its worktree and session are kept and it resumes by itself once the incident resolves");
+                return await OutcomeAsync(item, $"{item.ExternalId} is held by hot-file recovery of {incident.Repo} (generation "
+                    + $"{incident.Generation}, {incident.State}); it resumes by itself once the incident resolves "
+                    + "(`factory recovery status`).", CancellationToken.None);
+            }
+            if (!userPaused && request.CorrectionDeferred)
+            {
+                // A correction's boundary authorization refused or could not verify it (a busy repository lock, an unreadable
+                // capture): recovery's own deferral, which resumes by itself, never a human Pause owed a Continue.
+                await ledger.RecordAsync(item, WorkState.Paused, null, RecoveryHeld, CancellationToken.None);
+                log.WriteLine($"[paused] {item.ExternalId}: its correction authority could not be confirmed at a boundary; held by recovery, "
+                    + "its worktree and session kept, and it resumes by itself once the authority verifies again");
+                return await OutcomeAsync(item, $"{item.ExternalId} is held by hot-file recovery: its correction authority could not be "
+                    + "confirmed at a boundary; it resumes by itself once it verifies again (`factory recovery status`).", CancellationToken.None);
+            }
             await ledger.RecordAsync(item, WorkState.Paused, null, UserPaused, CancellationToken.None);
             log.WriteLine($"[paused] {item.ExternalId} paused by a control; its worktree and session are kept for Continue");
             return await OutcomeAsync(item, PausedMessage(item.ExternalId), CancellationToken.None);
@@ -1188,6 +1267,10 @@ public sealed partial class RunPipeline(
         // The factory's own failure (the planner's seat: its sweep, the MCP proxy, the session file's ACL) is not the item's: it
         // reaches the caller, which treats it as factory-wide (IntakeLoop.IsFactoryWide). The item stays where it is, nothing is
         // recorded against it, and the next run takes the step again; whatever threw it has already cleaned up after itself.
+        catch (Recovery.RecoveryContinuationDeferredException ex)
+        {
+            return await OutcomeAsync(item, ex.Message, ct);
+        }
         catch (Exception ex) when (ex is not FactoryUnavailableException)
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
@@ -1387,6 +1470,7 @@ public sealed partial class RunPipeline(
 
     private async Task ImplementAsync(Run run, CancellationToken ct)
     {
+        await RestartRedirectedCodingAsync(run, ct);
         var (spec, repo, item) = run;
         var story = spec.Story;
         var (branch, baseBranch) = (run.Branch, run.BaseBranch);
@@ -1432,7 +1516,9 @@ public sealed partial class RunPipeline(
         if (workspace is null)
         {
             // A plan's story starts from its plan's changeset branch (sc-25872), so it sees the stories that blocked it.
-            workspace = await workspaces.PrepareAsync(repo, branch, ct, baseBranch);
+            workspace = run.Redirect?.Commit is { } corrected
+                ? await workspaces.PrepareCorrectedAsync(repo, branch, corrected, ct, baseBranch)
+                : await workspaces.PrepareAsync(repo, branch, ct, baseBranch);
         }
         run.Workspace = workspace;
         log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}{(baseBranch is null ? "" : $" from {baseBranch}")}");
@@ -1441,7 +1527,8 @@ public sealed partial class RunPipeline(
         {
             try
             {
-                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint : BuildResumePrompt(story),
+                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint + (run.Redirect is { } redirected
+                    ? $"\nFresh attempt after incident {redirected.Incident}; corrected delivery commit {redirected.Commit}.\n{redirected.Context}" + (workspace.RecoveryConflicts.Count == 0 ? "" : "\nReconcile the delivered correction with the plan blocker changes in this fresh merge. Retain BOTH parents and their intended behavior; resolve every conflict marker, then build and test. Conflicted paths:\n" + string.Join("\n", workspace.RecoveryConflicts.Select(p => PromptFence.Block("file", p)))) : "") : BuildResumePrompt(story),
                     models, [SpecInput(story)], "implement", WorkerModelClass.Coding(story), ct);
             }
             catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
@@ -1454,19 +1541,43 @@ public sealed partial class RunPipeline(
 
         if (!attempt.Any(e => e.Step == Steps.Pushed))
         {
-            var grant = await GrantPushAsync(item, session, ct);
+            var grant = await GrantPushAsync(run, session, ct);
             if (!await workspaces.CommitAndPushAsync(repo, workspace, $"{story.Ref}: {story.PublicName}", grant, ct))
             {
                 throw new InvalidOperationException("Worker finished without changing the repository; nothing to review.");
             }
-            await ledger.CheckpointAsync(item, Steps.Pushed, session, workspace.Branch, ct);
+            if (workspace.RecoveryConflicts.Count > 0 && await workspaces.ConflictMarkersAsync(repo,
+                await workspaces.HeadAsync(workspace, ct), workspace.RecoveryConflicts, ct) is { Count: > 0 } unresolved)
+                throw new WorkerFailedException("Recovery restart left conflict markers in " + string.Join(", ", unresolved));
+            await RecordCorrectionPushAsync(run, ct);
+            await ledger.CheckpointAsync(item, Steps.Pushed, session, run.Redirect is null ? workspace.Branch : await workspaces.HeadAsync(workspace, ct), ct);
         }
 
         // A Stop or Pause that arrived during the push: no ready PR is opened for a stopped item.
         await ThrowIfControlledAsync(item, ct);
         // Returns the branch's already-open PR instead of opening a second one.
-        var prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
-            $"{story.Ref}: {story.PublicName}", await PullRequestBodyAsync(run, ct), ct);
+        string prUrl;
+        try
+        {
+            prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
+                $"{story.Ref}: {story.PublicName}", await PullRequestBodyAsync(run, ct), ct);
+        }
+        catch (Exception ex) when (source.Naming == ItemNaming.Recovery && !ct.IsCancellationRequested
+            && ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException or GitHubGatewayException)
+        {
+            // The POST may have succeeded. Keep the pushed checkpoint and exact correction identity: OpenAsync's
+            // branch lookup recovers its PR on restart. Never spend a new correction just because its answer was lost.
+            const string uncertain = "recovery-pr-uncertain";
+            var failures = (await ledger.HistoryAsync(item, ct)).Count(e => e.Step == uncertain);
+            await ledger.CheckpointAsync(item, uncertain, session, $"attempt {failures + 1}: {ex.GetType().Name}", ct);
+            if (failures >= 2)
+            {
+                await ledger.CheckpointAsync(item, Recovery.RecoveryCorrections.PrUncertainStep, session,
+                    "PR identity could not be reconciled; no replacement correction is authorized.", ct);
+                throw;
+            }
+            throw new Recovery.RecoveryContinuationDeferredException("Correction PR creation answer uncertain; the next run recovers the same branch's PR.");
+        }
         var branchUrl = BranchUrl(repo, workspace.Branch);
         if (!attempt.Any(e => e.Step == Steps.Linked && e.Detail == $"{prUrl} {branchUrl}"))
         {
@@ -1554,9 +1665,14 @@ public sealed partial class RunPipeline(
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>
     private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
-        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct) =>
-        (await RunSessionAsync(run, worker, workspace.Path, null, implementing: true, session, prompt, models,
+        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct)
+    {
+        if (run.RequiredBase is { } required && workspace.BaseBranch != required)
+            throw new InvalidOperationException($"Correction worktree base {workspace.BaseBranch} is not its granted delivery base {required}.");
+        await ThrowIfCorrectionUnauthorizedAsync(run.Item, ct); // the worker-entry authority boundary
+        return (await RunSessionAsync(run, worker, workspace.Path, null, implementing: true, session, prompt, models,
             inputs.Select(Taint.Of).OfType<string>().ToList(), label, modelClass, ct)).Session;
+    }
 
     /// <summary>
     /// <see cref="RunWorkerSessionAsync"/> for any session of the item: <paramref name="runner"/> in <paramref name="path"/>, tainted from
@@ -1787,11 +1903,17 @@ public sealed partial class RunPipeline(
     /// The push grant for the current worker attempt (E4): every session the attempt recorded (read fresh, so a session id that
     /// changed on resume is included) plus <paramref name="session"/>, none of them tainted.
     /// </summary>
-    private async Task<PushGrant> GrantPushAsync(WorkItem item, string? session, CancellationToken ct)
+    private async Task<PushGrant> GrantPushAsync(Run run, string? session, CancellationToken ct)
     {
-        var sessions = CurrentWorkerAttempt(await ledger.HistoryAsync(item, ct))
+        var sessions = CurrentWorkerAttempt(await ledger.HistoryAsync(run.Item, ct))
             .Where(e => e.Step == Steps.Session).Select(e => e.ClaudeSessionId).Append(session);
-        return await ledger.GrantPushAsync(sessions, ct);
+        var grant = await ledger.GrantPushAsync(sessions, ct);
+        if (Naming != ItemNaming.Recovery) return grant;
+        // The push boundary: structural checks before staging and the token, the full revalidation (one evidence capture) once,
+        // after the clone's lock, right before the remote write.
+        grant = grant.WithValidation(token => ThrowIfControlledAsync(run.Item, token), token => ValidateCorrectionPushAsync(run, token));
+        await grant.PrecheckAsync(ct);
+        return grant;
     }
 
     private async Task RemoveWorktreeAsync(Run run)
@@ -1835,14 +1957,63 @@ public sealed partial class RunPipeline(
         }
     }
 
-    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control; `factory continue` resumes it.";
+    private static string PausedMessage(string externalId) => $"{externalId} is paused by a control or repository recovery; only human Continue lifts a manual pause.";
 
+    private async Task<ControlState> RepositoryControlAsync(string externalId, long? epicId, string repository, CancellationToken ct)
+    {
+        var held = false;
+        if (recovery is not null)
+        {
+            // `factory run` advances recovery before it takes the item's run lock (AdvanceRecoveryAsync); here the hold is only read.
+            if (await recovery.HeldAsync(repository, ct) is { } incident)
+            {
+                // Structural: only a correction's own current grant excepts its own incident. The full evidence capture runs
+                // once per authority boundary (dispatch, worker entry, push, merge), never in this check.
+                held = !await recovery.GrantedAsync(externalId, repository, incident, ct);
+                if (backgroundRecovery) recovery.Schedule(repository, log, ct);
+                log.WriteLine($"[recovery] repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}");
+            }
+        }
+        // Read AFTER assessment: a Pause/Stop may have landed while it ran. Never synthesize Running from a safe answer.
+        var state = await _controls.EffectiveInRepositoryAsync(externalId, epicId, repository, ct);
+        return state == ControlState.Running && held ? ControlState.Paused : state;
+    }
+
+    /// <summary>
+    /// `factory run` (no background scheduler) advances the repositories' recovery inline, but before the item's run lock is
+    /// taken: an assessment can take up to <see cref="Recovery.HotFileRecovery.StageTimeout"/> and must not hold the item.
+    /// </summary>
+    private async Task AdvanceRecoveryAsync(IEnumerable<RepoRef> repositories, CancellationToken ct)
+    {
+        if (recovery is null || backgroundRecovery) return;
+        foreach (var repository in repositories.DistinctBy(r => r.Key)) await recovery.AdvanceAsync(repository.FullName, ct);
+    }
+
+    /// <summary>
+    /// In-loop and wait checks (before every step; every poll of a slot, CI or overlay wait): the composed effective controls
+    /// only. A correction's exception from its own incident hold is the structural grant predicate inside
+    /// <see cref="IControls.EffectiveAsync"/> (<see cref="Recovery.RecoveryCorrections"/>' Grants); no evidence is captured here.
+    /// </summary>
     private async Task ThrowIfControlledAsync(WorkItem item, CancellationToken ct)
     {
         if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var state)
         {
             throw new ControlRequestedException(state);
         }
+    }
+
+    /// <summary>
+    /// A correction's full revalidation (fresh evidence capture, current policy, its envelope) at the worker-entry boundary;
+    /// dispatch, push and merge call <see cref="Recovery.HotFileRecovery.AuthorizeCorrectionAsync"/> with their own facts.
+    /// Evidence acquisition awaits external reads: a human Stop arriving meanwhile wins even over a refused grant.
+    /// </summary>
+    private async Task ThrowIfCorrectionUnauthorizedAsync(WorkItem item, CancellationToken ct)
+    {
+        await ThrowIfControlledAsync(item, ct);
+        if (Naming != ItemNaming.Recovery || item.State is WorkState.Merge or WorkState.Watch) return;
+        var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(item.ExternalId, item.Repo, ct);
+        await ThrowIfControlledAsync(item, ct);
+        if (!authorized) throw ControlRequestedException.Deferred();
     }
 
     /// <summary>
@@ -1859,6 +2030,8 @@ public sealed partial class RunPipeline(
             log.WriteLine($"[frozen] {item.ExternalId}: {frozen.Message}");
             throw new ControlRequestedException(ControlState.Paused) { Frozen = frozen };
         }
+        // Detection can have persisted a repository incident during the evaluation above, and a human control may have moved.
+        await ThrowIfControlledAsync(item, ct);
     }
 
     /// <summary>The freeze evaluator's answer, its notes (what it passed over, e.g. a base branch GitHub no longer has) logged.</summary>
@@ -1913,8 +2086,8 @@ public sealed partial class RunPipeline(
     private async Task<bool> UserPausedAsync(WorkItem item)
     {
         List<string> scopes = ItemNaming.EpicOf(item.ExternalId, item.EpicId) is { } epic
-            ? [ControlScope.Factory, ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
-            : [ControlScope.Factory, ControlScope.Item(item.ExternalId)];
+            ? [ControlScope.Factory, ControlScope.Repository(RepoRef.Parse(item.Repo)), ControlScope.Epic(epic), ControlScope.Item(item.ExternalId)]
+            : [ControlScope.Factory, ControlScope.Repository(RepoRef.Parse(item.Repo)), ControlScope.Item(item.ExternalId)];
         if (item.PlanItemId is { } plan && await ledger.ItemAsync(plan, CancellationToken.None) is { } planItem)
         {
             scopes.Add(ControlScope.Item(planItem.ExternalId));
@@ -1944,6 +2117,12 @@ public sealed partial class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        return await StopIdleLockedAsync(item, storyId, ct);
+    }
+
+    /// <summary>The idle stop when this flow already holds the item's run lock.</summary>
+    private async Task<RunOutcome> StopIdleLockedAsync(WorkItem item, int storyId, CancellationToken ct)
+    {
         var repo = RepoRef.Parse(item.Repo);
         Workspace? workspace = null;
         if (!Lifecycle.IsTerminal(item.State))
@@ -2229,7 +2408,7 @@ public sealed partial class RunPipeline(
         // Not the slot's bookkeeping (the item's slot, sc-25989, and the run's use of it, sc-25991): those rows are written as a
         // worker phase starts, before the attempt has made anything, so an attempt holding only them is a fresh one — not a
         // resume that would look for a worktree and record it lost.
-        return history.Skip(start).Where(e => !SlotUse.IsBookkeeping(e.Step)).ToList();
+        return history.Skip(start).Where(e => !SlotUse.IsBookkeeping(e.Step) && e.Step != Recovery.RecoveryRedirect.Started).ToList();
     }
 
     /// <summary>

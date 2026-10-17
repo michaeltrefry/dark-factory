@@ -32,13 +32,37 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
     /// Returns what happened; not <see cref="ControlResult.Ok"/> when the stop is left unfinished — also for a plan item whose run is
     /// active, which finishes the stop only when its evaluation ends.
     /// </summary>
+    public async Task<ControlResult> DraftRepositoryAsync(int storyId, RepoRef repository, CancellationToken ct)
+    {
+        var id = source.Naming.Format(storyId);
+        if (await ledger.FindAsync(source.Naming.Source, id, ct) is not { } item)
+            return new ControlResult(true, $"{id}: no coordinator in the ledger to draft.");
+        await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
+        if (runLock is null)
+            return new ControlResult(false, $"{id}: repository stop NOT finished: its run is active; the repository stays manually paused. Retry `factory stop --repo {repository}` after that run stops at its control boundary.");
+        await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        var history = await ledger.HistoryAsync(item, ct);
+        if (RunPipeline.CrashedWorkerMayBeRunning(history))
+            return new ControlResult(false, $"{id}: repository stop NOT finished: a crashed run may have left a worker. The repository stays manually paused; stop that worker before retrying the repository Stop.");
+        // A coordinator is not cancelled, and no item Stopping control is written: those would cascade to other repositories.
+        foreach (var changeset in Changeset.All(history).Where(c => RepoRef.Parse(c.Repo).Is(repository)))
+        {
+            var urls = await pullRequests.ConvertOpenToDraftAsync(repository, changeset.Branch, ct);
+            await ledger.CheckpointAsync(item, "repository-prs-drafted", null, $"{repository}: {string.Join(' ', urls)}", ct);
+        }
+        return new ControlResult(true, $"{id}: only {repository}'s changeset PRs drafted; coordinator retained, other repositories unchanged.");
+    }
+
     public async Task<ControlResult> StopAsync(int storyId, CancellationToken ct)
     {
         var id = source.Naming.Format(storyId);
         if (await ledger.FindAsync(source.Naming.Source, id, ct) is not { } item)
         {
+            // Internal sources can own runnable identities before WorkLedger creates their intake row.
+            var settled = await source.StopBeforeIntakeAsync(storyId, ct);
             await controls.ClearAsync(ControlScope.Item(id), ct);
-            return new ControlResult(true, $"{id} is not in the factory ledger; nothing to stop.");
+            return new ControlResult(true, settled ? $"{id} stopped before intake; it cannot be dispatched."
+                : $"{id} is not in the factory ledger; nothing to stop.");
         }
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)

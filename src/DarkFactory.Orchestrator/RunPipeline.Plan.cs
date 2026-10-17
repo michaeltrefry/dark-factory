@@ -453,6 +453,14 @@ public sealed partial class RunPipeline
                 log.WriteLine($"[{item.State}] {item.ExternalId} is {control} by a control; releasing nothing more");
                 break;
             }
+            var targetRepo = repos?.RepoOf(story) ?? primary.FullName;
+            if (await RepositoryControlAsync(story, item.EpicId, targetRepo, ct) != ControlState.Running)
+            {
+                log.WriteLine($"[{item.State}] {story}: repository {targetRepo} or its item control holds release");
+                continue; // Another repository's eligible child can still be released.
+            }
+            // Recovery may have awaited an assessment; a new parent Pause/Stop still wins at the write boundary.
+            if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running) break;
             var moved = await source.MakeReadyAsync(IdOf(story), ct);
             if (moved == ReadyResult.Archived)
             {
@@ -586,6 +594,8 @@ public sealed partial class RunPipeline
         List<LedgerEntry> since, bool several, CancellationToken ct)
     {
         var repo = RepoRef.Parse(changeset.Repo);
+        if (await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct) != ControlState.Running)
+            return await OutcomeAsync(item, $"repository {repo} held; its changeset is not delivered", ct);
         var empty = several ? null : since.LastOrDefault(e => e.Step == Steps.ChangesetEmpty)?.Detail;
         var how = ChangesetDelivery.Empty;
         // A changeset pull request of this plan that someone merged by hand (an escalated one, say): the changeset is delivered.
@@ -596,15 +606,18 @@ public sealed partial class RunPipeline
         if (empty is null && gate is not null && linked is not null
             && (await Gate.GitHub.GetPullAsync(repo, GitHubGate.ParsePullUrl(linked).Number, ct)).Merged)
         {
+            if (await DeliveryHeldAsync()) return await OutcomeAsync(item, null, ct);
             (empty, how) = (Plans.Changeset.MergedOutside(linked), ChangesetDelivery.MergedOutside);
             await RecordEmptyAsync(item, since, empty, ct);
         }
         // Without a gate stage nothing can read the difference (nor review the pull request: the item parks at Review).
         if (empty is null && gate is not null && string.IsNullOrWhiteSpace(await Gate.GitHub.GetDiffAsync(repo, changeset.Base, changeset.Branch, ct)))
         {
+            if (await DeliveryHeldAsync()) return await OutcomeAsync(item, null, ct);
             empty = $"{(several ? $"{repo}: " : "")}{changeset.Branch} does not differ from {changeset.Base}: no changeset pull request";
             await RecordEmptyAsync(item, since, empty, ct);
         }
+        if (empty is not null && await DeliveryHeldAsync()) return await OutcomeAsync(item, null, ct);
         if (empty is not null && several)
         {
             await ledger.CheckpointAsync(item, Steps.ChangesetDelivered, null,
@@ -616,11 +629,14 @@ public sealed partial class RunPipeline
         {
             return await ClosePlanAsync(item, storyId, stories, known, since, empty, ct);
         }
-        if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var control)
+        if (await _controls.EffectiveInRepositoryAsync(item.ExternalId, item.EpicId, repo.FullName, ct) is not ControlState.Running and var control)
         {
             log.WriteLine($"[{item.State}] {item.ExternalId} is {control} by a control; its changeset pull request is not opened");
             return await OutcomeAsync(item, null, ct);
         }
+        async Task<bool> DeliveryHeldAsync() =>
+            await _controls.EffectiveInRepositoryAsync(item.ExternalId, item.EpicId, repo.FullName, ct) != ControlState.Running;
+
         var prUrl = await pullRequests.OpenAsync(repo, changeset.Branch, changeset.Base, 
             $"{item.ExternalId}: {UntrustedText.Inert(item.Title)} (changeset of {mine.Count} stories{(several ? $" in {repo}" : "")})",
             LedgerReport.ChangesetPullRequestBody(item.ExternalId, null, changeset, PlanStoryReports(mine, known), Plans.Changeset.CurrentPass(history),
@@ -696,6 +712,8 @@ public sealed partial class RunPipeline
         Dictionary<string, (WorkItem Item, List<LedgerEntry> History)> known, List<LedgerEntry> since, string? note, CancellationToken ct,
         IReadOnlyList<ChangesetState>? changesets = null)
     {
+        if (await _controls.EffectiveWithoutRepositoryAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running)
+            return await OutcomeAsync(item, null, ct);
         if (!since.Any(e => e.Step == Steps.MergedReported))
         {
             await source.ReportStateAsync(storyId, BoardState.Merged, null, ct);

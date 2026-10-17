@@ -27,6 +27,9 @@ public sealed class GitHubPullRequests(HttpClient http, GitHubApp app) : IPullRe
     {
         var token = (await app.CreateInstallationTokenAsync(repo, ct)).Token;
 
+        // Reconcile a previous accepted write before issuing any new POST (including after a lost answer).
+        if ((await ListOpenAsync(repo, head, token, ct)).FirstOrDefault() is { } open) return open.HtmlUrl;
+
         using var create = GitHubApp.Request(HttpMethod.Post, $"repos/{repo.Owner}/{repo.Name}/pulls", "Bearer", token);
         create.Content = JsonContent.Create(new { title, head, @base = baseBranch, body });
         using var response = await http.SendAsync(create, ct);

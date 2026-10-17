@@ -39,7 +39,14 @@ Claude Code headless workers through the Weave router.
   remote URL names (`RepoOf`, sc-25981); `KanbanWrites` builds the one MCP client that holds the orchestrator's full-scope Kanban
   token (sc-25981); `GitHubCli` is the only `gh` run),
   and KanbanBoard as a third work source (`Kanban/`, sc-25981: `KanbanWorkSource`, its typed MCP caller `KanbanBoard.cs`, and
-  `KanbanKeys.cs` — the ledger's `kb-<n>` keys of items and of epics, the watch scope `KanbanScope`, the web links `KanbanLinks` and the dashboard's `KanbanLedgerLinks`). `RepoRef` and
+  `KanbanKeys.cs` — the ledger's `kb-<n>` keys of items and of epics, the watch scope `KanbanScope`, the web links `KanbanLinks` and the dashboard's `KanbanLedgerLinks`),
+  and autonomous hot-file recovery (`Recovery/`, epic sc-26335: `HotFileRecovery` — detection, the repository hold, the
+  assessment stage and its scheduler, the correction grant checks —, its budgets and refreshes `RecoveryProgress.cs`, post-delivery
+  reassessment and redirects `RecoveryContinuation.cs`, the immutable evidence `RecoverySnapshot.cs`, the assessor
+  `RouterHotFileAssessor.cs` with its pinned read-only tools `RecoveryAssessmentTools.cs` and the answer's parser
+  `RecoveryDecision.cs`, the correction items `RecoveryCorrections.cs` and their internal work source `RecoveryWorkSource.cs`
+  (`rc-<n>`), the operator read model `RecoveryStatus.cs`, the human re-arm `RecoveryReassessment.cs` and the incident state
+  rows `IncidentTransitions.cs`; pipeline side `RunPipeline.Recovery.cs`; "Hot-file recovery" under the invariants). `RepoRef` and
   `RepoResolver` (`RepoRef.cs`) are in the root namespace: every source and the pipeline use them.
 - `src/DarkFactory.Analyzers` — the gateway lint (sc-25390), a Roslyn analyzer every build of the orchestrator and of
   `tests/DarkFactory.AcceptanceTests` runs (CI's `build-test` included), all errors: DF0001 an HTTP client/handler (made,
@@ -251,7 +258,9 @@ dotnet run --project src/DarkFactory.Orchestrator -- kanban key <item GUID>   # 
 dotnet run --project src/DarkFactory.Orchestrator -- kanban key --epic <epic GUID>   # prints the epic's key kb-<n> (given now if it has none), so `pause|stop --epic kb-<n>` works before any item of the epic was read
 dotnet run --project src/DarkFactory.Orchestrator -- work          # long-running host: dashboard + session hub on 127.0.0.1 + the intake loop (polls every configured work source)
 dotnet run --project src/DarkFactory.Orchestrator -- dashboard set-password   # dashboard login (hash → keychain)
-dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N (a Shortcut epic) | kb-N (a Kanban epic's key), or --item sc-N | gh-N | kb-N
+dotnet run --project src/DarkFactory.Orchestrator -- pause --factory          # also continue/stop; --epic N (a Shortcut epic) | kb-N (a Kanban epic's key), or --item sc-N | gh-N | kb-N | rc-N, or --repo owner/name
+dotnet run --project src/DarkFactory.Orchestrator -- recovery status          # repository hot-file incidents from the ledger only (--page N); never advances recovery
+dotnet run --project src/DarkFactory.Orchestrator -- recovery reassess --repo owner/name   # human-only re-arm of an ESCALATED incident: fresh assessment, fresh budgets; clears no control
 dotnet run --project src/DarkFactory.Orchestrator -- continue --freeze        # clear the automatic freeze (also --usage)
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup
 dotnet run --project src/DarkFactory.Orchestrator -- github-app setup --gate   # the merge gate's own App (then re-run protect)
@@ -282,7 +291,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
 | `Review:Models`, `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models`, `Review:Confirm:Models` | retired (sc-25626, epic E8): no reviewer or second-opinion model is pinned — every panel call names the router's `high` model class. Any of them set (even empty) is refused at start-up (`FactoryOptions.RejectReviewModelSettings`, `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) rather than silently ignored |
-| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call, its whole answer stream included) |
+| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call, its whole answer stream included; for the hot-file assessor, each turn of its conversation, whose whole is bounded by its own 30 minutes, sc-26444) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
@@ -294,7 +303,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `Intake:MaxConcurrentRuns` | `1` (a whole number 1–8, `IntakeOptions.MaxConcurrentRunsLimit`: how many items `factory work` runs at once; 1 runs them one after another. Runs overlap outside the worker phases — "Worker phases" below; sc-25988 — and, with `Worker:Slots` above 1, inside them too, one per slot) |
 | `Usage:PollSeconds` | `60` (> 0: `factory work` reads the router's subscription usage; also read at each intake poll) |
 | `Freeze:MaxConsecutiveFailures` | `3` (≥ 1: distinct items escalated in a row, no factory merge between, that freeze the factory) |
-| `Freeze:HotFileMerges`, `Freeze:HotFileWindowHours` | `3` (≥ 2), `24` (> 0): factory merges changing one file within the window that freeze it |
+| `Freeze:HotFileMerges`, `Freeze:HotFileWindowHours` | `8` (≥ 2), `24` (> 0; inclusive at the window's edge): distinct factory merges changing one normalized file of one repository and exact base branch within the window that open a per-repository hot-file incident (epic sc-26335, "Hot-file recovery" under the invariants): that repository alone is held and assessed autonomously; merges into a `factory/changeset-*` branch do not count (the changeset's delivery merge does). The global `hot-file` freeze is written only by a factory built without recovery (`FactoryFreeze` with no `HotFileRecovery`); a legacy global hot-file freeze row is left for a human's `continue --freeze` |
 | `Freeze:CostRisingRounds` | `2` (≥ 1): consecutive rises of an item's cost per round (implement, then each fix round) that freeze it |
 | `Freeze:CheckFailedEvaluations`, `Freeze:CheckFailedMinutes` | `10` (≥ 1), `30` (> 0): a freeze check failing that many evaluations in a row (counted per process, `FreezeCheckFailures.Process`), or for that long, is written as a `check-failed` freeze |
 | `Controls:MaxReadFailures` | `10` (≥ 1): failed reads in a row of an item's controls while its worker or the gate's test runs go on; the next counts as a Pause (`controls-unreadable`) |
@@ -419,12 +428,14 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the item (Escalated + comment, E10); Shortcut (null) waits for the story to be ready again. Wording a human acts on comes
   from the source (`IWorkSource.ScopeReturnHint`, `ItemNaming.Noun`), never Shortcut terms on a GitHub issue. Only Paused rows with detail `interrupted` (`RunPipeline.Interrupted`),
   `user-paused` (`RunPipeline.UserPaused`, a Pause control), `usage-paused` (`RunPipeline.UsagePaused`, the usage pause),
-  `freeze-paused` (`RunPipeline.FreezePaused`, the automatic freeze) or `controls-unreadable` (`RunPipeline.ControlsUnreadablePaused`)
-  auto-resume (`RunPipeline.InFlightAsync`), all but the first only once no control pauses the item and the controls can be read
+  `freeze-paused` (`RunPipeline.FreezePaused`, the automatic freeze), `controls-unreadable` (`RunPipeline.ControlsUnreadablePaused`)
+  or `recovery-held` (`RunPipeline.RecoveryHeld`, only an automatic repository hot-file incident held it) auto-resume (`RunPipeline.InFlightAsync`), all but the first only once no control pauses the item and the controls can be read
   (the usage pause lifts at its `ResumeAt`, the freeze at a human's Continue); a parked item never does. The same pauses keep a
   queued item's merge-queue place (`MergeQueue.Member`). `InFlightAsync` lists the items being stopped first. Resumes re-check
   the scope.
-- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`, `kb-<key>`: the ledger `Source`, external id, `factory/<id>` branch,
+- Work sources are named by `ItemNaming` (`sc-<story>`, `gh-<key>`, `kb-<key>`, and `rc-<n>` — the internal recovery source's
+  correction items, backed by the ledger's `recovery_corrections`, no board or credential, untrusted like a planner's text, never
+  planning: "Hot-file recovery" below —: the ledger `Source`, external id, `factory/<id>` branch,
   `factory-<id>` worktree, `item:<id>` control scope); `factory run`/`--item` take any of them. The intake loop lists every source
   in turn (`IntakeLane`: a lane's preparation, the issue triage, runs before any item the poll starts), then starts the poll's
   items into the run capacity left by runs still in flight from earlier polls, up to `Intake:MaxConcurrentRuns` at once (a poll
@@ -484,7 +495,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   cascade runs on the plan item's own source (its stories are that source's). The dashboard's controls use the same registry.
   An invalid scope's message names every source's item scope (`item:sc-<id>, item:gh-<key> or item:kb-<n>`).
   Tests (`WorkSourceRegistryTests`) build their options from explicit settings with no keychain and no process environment
-  (`FactoryOptions`' `environment` parameter, tests only), so none is skipped on a machine whose shell carries a source's token. `IItemStops` has one member, `StopAsync(ItemRef)`. Epic scopes
+  (`FactoryOptions`' `environment` parameter, tests only), so none is skipped on a machine whose shell carries a source's token. `IItemStops` stops one item with `StopAsync(ItemRef)` and drafts a retained coordinator's selected-repository changesets with `DraftRepositoryAsync`. Epic scopes
   carry their source (sc-25985, under Controls below): `--epic N` is a Shortcut epic, `--epic kb-N` a Kanban epic, each reaching
   only its own source's items, and an item whose epic the ledger lacks is looked up
   on its own board (`ControlActions`' `sources`), one not configured being reported as unknown.
@@ -884,6 +895,133 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   the last page's last `updated_at`). A request GitHub refuses for good (`GitHubRequestException.Permanent`: a 4xx that is not
   a rate limit, 401 or 408) is recorded `github-refused` on the item and the dashboard and does not hold the repo's cursor; the
   issue is taken up again when it next changes.
+- Repository manual controls (sc-26337): `pause|continue|stop --repo owner/name` uses the canonical case-insensitive
+  `repo:owner/name` scope, persisted as untruncated text separately from automatic incidents. A repository Stop leaves a
+  human Pause until explicit human Continue, cancels the repository's active items, and drafts only that repository's
+  changeset PRs. It does NOT turn a multi-repository coordinator into an unrestricted plan Stop: the coordinator stays
+  nonterminal so independent children in other repositories can continue; cancelled children keep the original plan
+  incomplete, and their dependents are not released. Unstarted work and retained coordinator delivery in the stopped
+  repository remain held by its manual Pause. Continue lifts that Pause only, never resurrects cancelled items or clears
+  an incident. Scoped drafting takes the coordinator's run lock; an active run or possible crashed worker leaves Stop
+  explicitly unfinished, the repository paused, and names the required retry rather than drafting underneath it. Item,
+  epic and factory Stops retain their existing full-cascade semantics. Dispatch resolves a fresh spec and any recorded
+  changeset pass before evaluating repository recovery, while human/global/plan controls and Stop take precedence.
+- Hot-file recovery (epic sc-26335, E1–E12; `Recovery/`, `RunPipeline.Recovery.cs`): `Freeze:HotFileMerges` (8) distinct
+  factory Merge rows touching one normalized file of one repository (case-insensitive key) and exact base within
+  `Freeze:HotFileWindowHours` (24, inclusive) open a `hot_file_incidents` row for THAT repository only — never the global freeze
+  row, never another repository; several hot files coalesce into one incident with their own trigger tuples, and other
+  repositories recover independently. Lifecycle (`HotFileIncident.State`): Held → Assessing → Resolved (safe), or → Unsafe →
+  Correcting → (delivery) Reassessing → … → Resolved; pending-only unsafe → redirect + Refreshing → Reassessing; inconclusive or
+  unusable → Held and retried; any exhausted branch → Escalated (sticky). Every state change, and every new generation, is an
+  append-only ledger row `recovery-incident-state` saved in the same transaction (`IncidentTransitions`, hooked into
+  `LedgerDbContext.SaveChanges`; anchored on the first contributing merge's item; typed deferred, a resolution passed — never
+  escalated, so no item's escalation metric counts an incident). Durability: the repository's advisory lock
+  (`HotFileRecovery.LockKey`) serializes detection, dispatch and acceptance across processes; `Version` CAS tokens; an
+  attempt is reserved (`recovery_assessment_attempts`, leased `StageTimeout` 40 min: a 5-minute capture, the assessor's own
+  30-minute conversation deadline and 5 minutes for cost accounting and the revalidating capture; sc-26444) and committed BEFORE dispatch, so a crash spends it (`Uncertain`) and nothing replays endlessly; usage
+  waits and shutdown spend none. Bounds (E11): 3 assessment sessions per evidence generation, 2 correction PR attempts per
+  generation (`RecoveryCorrections.CorrectionLimit`; attempt numbers stay monotone per incident, a generation counts from the
+  last attempt before it, `BaselineAsync`), 3 evidence refreshes per incident (reset only by a human re-arm); a failed or inconclusive assessment
+  retries after 30 s, then 120 s; at most one assessment per repository and two across processes (two advisory seats beside a
+  process limiter); snapshots refuse more than 50 contributing merges, 100 pending items or 2 MiB as incomplete, never safe. A capture's body
+  is stored once per content hash in `recovery_materials` (`RecoveryMaterial`, migration `RecoveryMaterials`) before any
+  router call (two concurrent captures of one material: the loser of the key race finds it stored and goes on), and its
+  `recovery-snapshot` ledger row is a small `RecoveryCapture` naming that hash (with what was missing), written once per item
+  (on Postgres the check and the insert are serialized per item by a transaction-scoped two-key advisory lock, never a run lock),
+  so captures at every authority boundary never add multi-MiB rows to an item's history; the full material stays in the
+  assessment's own answer.
+  Assessment (E4/E5): a fresh router session on `high` (`RouterHotFileAssessor`, the compiled-in `hot-file-assessment`
+  prompt, read-only tools pinned to snapshot commits; the request carries an index of the evidence — each entry's id,
+  category, provenance, commits, SHA-256 and size, `RouterHotFileAssessor.Index` — and the model reads each body through
+  `read_evidence`, so the tool budget is not spent on inline material), its answer bound to incident, generation, snapshot, repo and evidence
+  hash and parsed strictly (`RecoveryDecision`). A safe or unsafe answer counts only over evidence it read whole
+  (`RouterHotFileAssessor.Unread`, sc-26335): every id it cites, top level and per finding, and for a safe answer every
+  `merged-diff` entry of the incident, must have been read in full — every one of its pages served by a successful
+  `read_evidence` whose result reached the model uncut (`RecoveryAssessmentTools.FullyRead`); otherwise the answer is
+  inconclusive, naming the unread ids, and the prompt says so. Paged evidence (sc-26444; each entry paged once per assessment
+  and shared by the index, the up-front check and every read, `EvidencePages`): `read_evidence(id, page)` serves one
+  page — at most `RecoveryAssessmentTools.PageBytes` (50,000) UTF-8 bytes of the entry's content, never splitting a character,
+  behind a one-line JSON header (id, category, provenance, commits, hash, page, pages, byte offset, bytes, total bytes), so no
+  page reaches the 60,000-byte per-result cap; the index gives each entry's `Pages`, and an entry counts as read once its pages
+  together cover the whole content (a page skipped, cut or failed leaves it unread). The assessor has
+  its own explicit limits, stated in the request (`limits`) and apart from the reviewer panel's (8 turns, 24 calls, 200,000
+  characters: unchanged): `MaxSessionChars` 400,000 characters of tool results less the request (every turn resends the
+  conversation, so this is what the model holds at the end — about 100,000–130,000 tokens, inside the high class's smallest
+  200,000-token context with the prompt and answer), `MaxSessionTokens` 140,000 estimated tokens of tool results less the request's
+  (`EstimatedTokens`: an ASCII character a third of a token, any other character a whole one — characters are not tokens, and
+  dense or non-Latin text near a token a character would otherwise pass the character budget and be refused 400/413 by the
+  router in a late turn; at run time a result that would pass the remaining token budget is answered an error, served nothing),
+  `MaxToolCalls` 80 (a page per call), `MaxTurns` 12 with tools — the twelfth answers its calls "not run" (the turn cap), so
+  the request's `limits` state `toolTurns` 11 (`ToolTurns`). Time (E11 as amended by sc-26444): the panel's `Review:TimeoutMinutes`
+  (10 min) bounds the whole of a review session, but each TURN of an assessment — with the stream's 2-minute idle bound — while
+  the assessment conversation as a whole has its own deadline, `RecoveryAssessmentTools.ConversationTimeout` (30 min: 13 turns
+  each resending up to about 140,000 tokens), and `StageTimeout` is sized from it; so a live conversation goes on past 10
+  minutes while any stalled turn fails, and an incident the up-front check passes is not spent on timeouts of its length.
+  They do not reach the snapshot's 2 MiB bound —
+  no single conversation can hold 2 MiB (500,000+ tokens) — so before any router call `RouterHotFileAssessor.Unreadable` sums
+  the pages every merged diff takes and holds them to each budget LESS a reserve kept for the other reads a safe answer needs
+  (requirements, executed results, pending work, `read_file` of code): a quarter of the calls (`ReservedCalls` 20, so diffs
+  may take 60 — a first page of each of up to 50 merged diffs), of the characters (`ReservedChars` 100,000) and of the tokens
+  (`ReservedTokens` 35,000). Past any of them the answer is inconclusive with that reason and
+  `HotFileAssessment.Oversized`, no session is opened, and the recovery escalates the incident at once ("Assessment cannot read
+  the required evidence: …") rather than spend its remaining attempts on the same evidence: a change too large to read in one
+  session is one a human must review. Only the exact current safe answer resolves, acknowledging exactly its
+  (merge row, base, file) tuples beyond the window and restarts (a later merge of a reviewed file opens a new generation).
+  Correction (E7/E8): an accepted unsafe merged finding materializes ONE `rc-<n>` work item per attempt in exactly the
+  incident's repository and recorded base (`RecoveryWorkSource`, internal, no board credential; its spec is planner-like data),
+  with a ≤ 20-path envelope checked against the current policy and floors. Its grant (`RecoveryCorrections.Grants`: Pending or
+  Claimed, the repository, the item not Cancelled, its own incident Correcting at the same generation and evidence hash, no
+  other unresolved incident in the repository, no stopped ancestor) excepts it from its OWN incident's hold only. The full
+  revalidation — a fresh evidence capture, the current policy, the envelope and the diff (`AuthorizeCorrectionAsync`) — runs
+  once at each authority boundary: dispatch (`RunAsync`), worker entry (`RunWorkerSessionAsync`), push (after the clone's lock,
+  right before the remote write; the pre-staging and pre-token checks are structural, `PushGrant.PrecheckAsync`) and merge (after
+  the write token, then re-read: S6). Every in-loop and wait check (each step, each poll of a slot, CI or overlay wait) is the
+  structural `EffectiveAsync` composition only, which already contains the grant predicate — no capture (`RecoveryCorrectionPipelineTests.A_correction_captures_evidence_once_…`).
+  The correction then runs the ordinary panel, CI, new-tests, taint, gate and merge queue unweakened; a gate merge is not a safe
+  verdict: the delivered commit is reassessed afresh (E10), and affected pending work restarts fresh from the corrected base
+  (`RecoveryRedirect`). A disposition is revalidated against fresh evidence (`HotFileRecovery.RedirectAsync`) only while the
+  item has not yet acted on it and its incident is the repository's newest: once its exact `recovery-restarted` row exists it
+  is returned as recorded with no capture, lock or write (another item's merge moving the base, or another pending item
+  advancing, says nothing about a restart already made); one the item outgrew without restarting (Merge, Watch, Done,
+  Cancelled, a plan coordinator) is void; one of an older incident is returned without capture when the newest incident is
+  resolved and deferred while it is not. The newest incident's own unconsumed disposition is revalidated only against what
+  authorizes that restart (`HotFileRecovery.RedirectStillAuthorized`): the incident's snapshot, repository and generation, the
+  redirect's base and commit (the disposition the safe answer saw, or for one recorded with it one of the incident's merge
+  commits), and the item's own pending evidence (only a claim or an unpause may be added) and its own spec. Another item
+  merging or advancing, or a delivery base tip moving, does not reopen it (it would race the same way after every safe
+  answer until the refresh budget escalated it); only a mismatch of those may send that incident back to Refreshing, so an
+  old generation is never reopened. Every unresolved incident of a repository holds it, and
+  every one is advanced (`AdvanceAsync`, oldest generation first) and re-armed (`reassess` re-arms each escalated incident,
+  each to the next generation after all of the repository's). Held work: an item a hold stops mid-run is recorded `recovery-held` when only the incident holds it
+  (resumes by itself once it resolves; dashboard phase "held by repository recovery"), and so is a correction whose boundary
+  authorization refused or could not verify it (a busy repository lock, a capture that cannot be read:
+  `ControlRequestedException.CorrectionDeferred`); `user-paused` only when a human Pause holds it too (then both must lift).
+  Such a deferral (no proof the grant is stale; a busy lock is waited for first, `HotFileRecovery.LockWait` 5 s on the injected
+  clock, at most 100 tries) is counted on the correction (`recovery_corrections.Deferrals`, migration
+  `RecoveryCorrectionDeferrals`), each its own refusal row (count and time), and no boundary is tried again before `RetryAt`
+  (30 s, then 120 s): a poll inside the backoff captures and writes nothing; after `HotFileRecovery.DeferralLimit` (3) in a row
+  the incident escalates naming the reason and `factory recovery reassess`. Only progress past the boundaries — the push, the
+  authorized merge (`HotFileRecovery.ProgressedAsync`) — resets the count, never a verified check alone (dispatch verifying
+  and worker entry deferring still escalate).
+  Recovery's own ledger rows are never evidence: one rule, `RecoverySnapshot.IsBookkeeping` (every `recovery-` step, and the
+  slot rows), so rows anchored on a pending item (a Planned coordinator) cannot revoke the grant they record. Human supremacy (E2): no recovery stage writes a control; a safe answer never synthesizes Running;
+  a Stop is never undone; `continue --repo` lifts only that Pause, not an incident. Re-arm (E11): an Escalated incident holds
+  its repository until a human runs `factory recovery reassess --repo owner/name` (owner CLI) or the dashboard incident panel's
+  Reassess (login + antiforgery, `DashboardControls.ReassessPath`; a refusal answers 409 with its reason, nothing written): the SAME incident moves to a new generation over its
+  recorded merges with fresh budgets (assessments, refreshes and corrections), revoking the old generation's waiting
+  correction grants, with one audited `recovery-reassess` ledger row (who, when, incident, old and new generation), under the
+  repository lock; it clears no Pause or Stop, leaves the freeze, usage and other incidents byte-identical, and a stopped
+  correction still refuses a replacement. Nothing else may call it (`RecoveryReassessTests.Only_the_cli_and_the_dashboard_post_…`
+  scans the source). Drivers (E12): `factory work` schedules each candidate repository (an unresolved incident or a merge
+  inside the window, `CandidateReposAsync`: a fixed number of queries) off the poll task, not in a worker slot; `factory run`
+  advances its item's repositories inline before taking the item's run lock. Upgrade: a legacy global `hot-file` freeze row is
+  never cleared or acknowledged by recovery; status and the dashboard name it. Operators: `factory recovery status [--page N]`
+  and the dashboard's repository recovery panel read the ledger only (`RecoveryStatusReader`: state, generation, `assessment
+  n/3, correction n/2, refresh n/3`, hot files, evidence, the fresh session, corrections with repo-scoped PRs, held and
+  redirected work, applicable controls, the named remedy); an idle dashboard tick polls only that panel. Tests: `HotFileRecoveryTests`,
+  `Recovery*Tests` (assessment, snapshot, work source, correction pipeline and crash, redirect, refresh, reassessment, continuation,
+  control, dashboard, status, Postgres, re-arm), `RecoveryAcceptanceTests` (AT1–AT7 integrated), live AT8
+  `HotFileRecoveryAcceptanceTests` with `HotFileLiveTests` (docs/acceptance.md, "Autonomous hot-file recovery").
 - Controls (`Controls/`): Pause/Continue/Stop rows in the ledger's `controls` table (scope `factory` | `epic:<id>` |
   `epic:kb-<key>` | `item:sc-<id>` | `item:gh-<key>` | `item:kb-<key>`; `WorkItem.EpicId` maps items to epics, within the item's
   own source — epic scopes, sc-25985, at the end of this bullet; a plan item's `item:` scope also holds its stories, through

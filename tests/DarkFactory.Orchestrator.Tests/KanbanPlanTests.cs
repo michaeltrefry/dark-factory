@@ -539,7 +539,7 @@ public class SourceTrustTests
     [Fact]
     public void Trust_is_declared_by_each_source_and_a_source_that_does_not_say_is_not_trusted()
     {
-        Assert.Equal([("shortcut", true), ("github", false), ("kanban", true)], ItemNaming.All.Select(n => (n.Source, n.Trusted)));
+        Assert.Equal([("shortcut", true), ("github", false), ("kanban", true), ("recovery", false)], ItemNaming.All.Select(n => (n.Source, n.Trusted)));
         Assert.False(new ItemNaming("elsewhere", "el", "item").Trusted); // fail closed
     }
 

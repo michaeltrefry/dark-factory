@@ -451,6 +451,56 @@ public sealed class DashboardHostTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Reassess_posts_need_the_login_and_the_antiforgery_token_and_rearm_only_the_escalated_incident()
+    {
+        long incidentId;
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            var item = await new WorkLedger(db, TimeProvider.System).GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-31", "Merged", "acme/widgets", null, CancellationToken.None);
+            var snapshot = new Recovery.HotFileSnapshot("s1", "acme/widgets", 1, [new(1, item.Id, new string('a', 40), "main", ["src/hot.cs"])], "hash");
+            var incident = new Recovery.HotFileIncident { Repo = "acme/widgets", Generation = 1, State = "Escalated", Error = "Assessment budget exhausted",
+                Snapshot = System.Text.Json.JsonSerializer.Serialize(snapshot), EvidenceHash = "hash", Attempts = 3, CreatedAt = DateTimeOffset.UtcNow, Version = 1 };
+            db.HotFileIncidents.Add(incident);
+            db.Controls.Add(new Control { Scope = "repo:acme/widgets", State = Controls.ControlState.Paused, ChangedBy = "human", ChangedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+            incidentId = incident.Id;
+        }
+        await using var app = await StartAsync();
+        var form = new Dictionary<string, string> { ["repo"] = "acme/widgets" };
+        using (var anonymous = DashboardLogin.Client(app.Address()))
+        {
+            using var refused = await DashboardLogin.PostAsync(anonymous, DashboardControls.ReassessPath, form, await DashboardLogin.TokenAsync(anonymous));
+            Assert.Equal(HttpStatusCode.Redirect, refused.StatusCode);
+            Assert.StartsWith($"{app.Address()}/login", refused.Headers.Location!.ToString());
+        }
+        var cookies = await DashboardLogin.LoginAsync(app.Address());
+        using var http = DashboardLogin.Client(app.Address(), cookies);
+        using (var noToken = await DashboardLogin.PostAsync(http, DashboardControls.ReassessPath, form, null))
+            Assert.Equal(HttpStatusCode.BadRequest, noToken.StatusCode);
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+            Assert.Equal("Escalated", (await db.HotFileIncidents.SingleAsync()).State);
+
+        var page = await http.GetStringAsync("/");
+        Assert.Matches("<form[^>]*action=\"recovery/reassess\"[^>]*data-repo=\"acme/widgets\"", page);
+        Assert.Contains("factory recovery reassess --repo acme/widgets", page);
+        using var rearmed = await DashboardLogin.PostAsync(http, DashboardControls.ReassessPath, form, DashboardLogin.TokenFrom(page));
+        Assert.Equal(HttpStatusCode.Redirect, rearmed.StatusCode);
+        await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))
+        {
+            var incident = await db.HotFileIncidents.SingleAsync();
+            Assert.Equal((incidentId, 2, "Held", 0), (incident.Id, incident.Generation, incident.State, incident.Attempts));
+            Assert.Contains("by dashboard", (await db.LedgerEntries.SingleAsync(e => e.Step == Recovery.RecoveryReassessment.Step)).Detail);
+            // The human repository Pause is untouched.
+            Assert.Equal(Controls.ControlState.Paused, (await db.Controls.SingleAsync(c => c.Scope == "repo:acme/widgets")).State);
+        }
+        // A refused re-arm (the incident is Held now) says why instead of returning to a page that looks unchanged.
+        using var refusedAgain = await DashboardLogin.PostAsync(http, DashboardControls.ReassessPath, form, DashboardLogin.TokenFrom(await http.GetStringAsync("/")));
+        Assert.Equal(HttpStatusCode.Conflict, refusedAgain.StatusCode);
+        Assert.Contains("not Escalated", await refusedAgain.Content.ReadAsStringAsync());
+        Assert.Contains("nothing was written", await refusedAgain.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task Stop_from_the_dashboard_asks_for_confirmation_and_marks_the_item_stopping()
     {
         await using (var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(_db!.ConnectionString)))

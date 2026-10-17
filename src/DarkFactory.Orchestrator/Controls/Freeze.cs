@@ -55,13 +55,13 @@ public static class FreezeTrigger
 }
 
 /// <summary>
-/// The freeze thresholds (<c>Freeze:*</c>). Defaults: 3 items escalated in a row; one file changed by 3 factory merges within 24
+/// The freeze thresholds (<c>Freeze:*</c>). Defaults: 3 items escalated in a row; one file changed by 8 factory merges within 24
 /// hours; an item's cost per round rising 2 rounds in a row (implement → fix 1 → fix 2, each round dearer than the one before).
 /// </summary>
 public sealed record FreezeOptions
 {
     public const int DefaultMaxConsecutiveFailures = 3;
-    public const int DefaultHotFileMerges = 3;
+    public const int DefaultHotFileMerges = 8;
     public const double DefaultHotFileWindowHours = 24;
     public const int DefaultCostRisingRounds = 2;
 
@@ -213,8 +213,16 @@ public sealed record MergeFiles(string Base, IReadOnlyList<string> Files,
 /// </para>
 /// </summary>
 public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, IControls controls, FreezeOptions options, TimeProvider time,
-    IGateGitHub? github = null, IReadOnlyCollection<string>? repos = null, FreezeCheckFailures? failures = null)
+    IGateGitHub? github = null, IReadOnlyCollection<string>? repos = null, FreezeCheckFailures? failures = null,
+    Recovery.HotFileRecovery? recovery = null, bool scheduleRecovery = false) : IAsyncDisposable
 {
+    public async ValueTask DisposeAsync()
+    {
+        if (recovery is not null) await recovery.DisposeAsync();
+    }
+
+    internal Recovery.HotFileRecovery? Recovery => recovery;
+
     private sealed record Hit(string Trigger, string Detail);
 
     /// <summary>A check that could not run: which (<c>ledger</c>, <c>main-red owner/name@base</c>) and why.</summary>
@@ -247,6 +255,8 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
     /// </summary>
     public async Task<FreezeStatus> CheckAsync(CancellationToken ct, bool fresh = false)
     {
+        // Detection/assessment are repo-local, off intake's task, and independent of every manual/global control.
+        if (scheduleRecovery && recovery is not null) await recovery.ScheduleAsync(Console.Error, ct);
         Control? row;
         try
         {
@@ -352,7 +362,7 @@ public sealed class FactoryFreeze(IDbContextFactory<LedgerDbContext> contexts, I
                     .ToListAsync(ct);
                 names = await db.WorkItems.AsNoTracking().ToDictionaryAsync(i => i.Id, i => (i.ExternalId, i.Repo, i.State), ct);
                 hit = ConsecutiveFailures(transitions, names)
-                    ?? await HotFileAsync(db, transitions, names, ct)
+                    ?? (recovery is null ? await HotFileAsync(db, transitions, names, ct) : null)
                     ?? await CostRisingAsync(db, since, names, ct);
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)

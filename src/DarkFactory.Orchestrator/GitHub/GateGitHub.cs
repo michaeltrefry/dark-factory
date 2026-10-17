@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Gate;
@@ -15,6 +16,9 @@ public sealed record MergeResult(bool Merged, string? CommitSha, bool HeadMoved,
 public interface IGateGitHub
 {
     Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct);
+
+    /// <summary>Correction crash recovery requires positive provenance from this authenticated gate App, not merely a gated head.</summary>
+    Task<bool> IsGateMergeAsync(RepoRef repo, PullFacts pull, CancellationToken ct) => Task.FromResult(false);
 
     /// <summary>The unified diff of <paramref name="headSha"/> against its merge base with <paramref name="baseSha"/>.</summary>
     Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct);
@@ -30,6 +34,9 @@ public interface IGateGitHub
 
     /// <summary>Every check run, commit status and check suite of <paramref name="sha"/>.</summary>
     Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct);
+
+    /// <summary>Snapshot acquisition reads every CI page, or reports incomplete; ordinary gate polling is unchanged.</summary>
+    Task<CiFacts> GetRecoveryCiAsync(RepoRef repo, string sha, CancellationToken ct) => GetCiAsync(repo, sha, ct);
 
     /// <summary>
     /// The GitHub Actions workflow files of the repository's default branch (sc-25873: <see cref="CiTriggers"/> reads their
@@ -52,8 +59,12 @@ public interface IGateGitHub
     /// </summary>
     Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct);
 
-    /// <summary>Merges PR <paramref name="number"/> only if its head is still <paramref name="headSha"/> (GitHub enforces it).</summary>
-    Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct);
+    /// <summary>
+    /// Merges PR <paramref name="number"/> only if its head is still <paramref name="headSha"/> (GitHub enforces it).
+    /// When supplied, <paramref name="authorize"/> must succeed after minting the write token, immediately before sending
+    /// the merge PUT. A refused callback sends nothing; ordinary merges supply none.
+    /// </summary>
+    Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null);
 }
 
 /// <summary>
@@ -101,14 +112,28 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
 
     private const int PageSize = 100;
 
-    public async Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
+    private async Task<PullDto> ReadPullAsync(RepoRef repo, int number, CancellationToken ct)
     {
         using var request = GitHubApp.Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/pulls/{number}", "Bearer", await ReadTokenAsync(repo, ct));
         using var response = await http.SendAsync(request, ct);
         await GitHubApp.EnsureSuccess(response, $"read pull request #{number}", ct);
-        var pull = (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
+        return (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
+    }
+
+    public async Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
+    {
+        var pull = await ReadPullAsync(repo, number, ct);
         return new PullFacts(pull.Number, pull.HtmlUrl, pull.State == "open", pull.Merged, pull.Draft, pull.Head.Sha, pull.Base.Ref, pull.Base.Sha,
             pull.MergeCommitSha, pull.ChangedFiles, pull.Base.Repo?.DefaultBranch);
+    }
+
+    public async Task<bool> IsGateMergeAsync(RepoRef repo, PullFacts pull, CancellationToken ct)
+    {
+        var current = await ReadPullAsync(repo, pull.Number, ct);
+        return pull.Merged && pull.MergeCommitSha is not null && current.Merged && current.Number == pull.Number
+            && current.MergeCommitSha == pull.MergeCommitSha && current.Head.Sha == pull.HeadSha && current.Base.Ref == pull.BaseRef
+            && current.MergedBy is { Type: "Bot", Login: { } login }
+            && string.Equals(login, await gateApp.SlugAsync(ct) + "[bot]", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
@@ -238,6 +263,47 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
             suites.CheckSuites.Select(s => new CheckSuiteFact(s.App?.Slug ?? "unknown", s.Status == "completed", s.Conclusion, s.LatestCheckRunsCount)).ToList());
     }
 
+    public async Task<CiFacts> GetRecoveryCiAsync(RepoRef repo, string sha, CancellationToken ct)
+    {
+        var token = await ReadTokenAsync(repo, ct);
+        var prefix = $"repos/{repo.Owner}/{repo.Name}/commits/{sha}/";
+        var runs = await Pages<CheckRunsDto, CheckRunDto>("check-runs", p => (p.TotalCount, p.CheckRuns), r => r.Id);
+        var statuses = await Pages<CombinedStatusDto, StatusDto>("status", p => (p.TotalCount, p.Statuses), s => s.Id);
+        var suites = await Pages<CheckSuitesDto, CheckSuiteDto>("check-suites", p => (p.TotalCount, p.CheckSuites), s => s.Id);
+        return new CiFacts(sha, runs.Select(r => new CheckFact(r.Name, r.Status == "completed", r.Conclusion, r.Id))
+            .Concat(statuses.Select(s => new CheckFact(s.Context, s.State != "pending", s.State == "error" ? "failure" : s.State))).ToArray(),
+            Suites: suites.Select(s => new CheckSuiteFact(s.App?.Slug ?? "unknown", s.Status == "completed", s.Conclusion, s.LatestCheckRunsCount)).ToArray());
+
+        async Task<List<TItem>> Pages<TPage, TItem>(string endpoint, Func<TPage, (int Total, List<TItem> Items)> unpack, Func<TItem, long?> identity)
+        {
+            var all = new List<TItem>();
+            var identities = new HashSet<long>();
+            int? total = null;
+            // A bound is an acquisition failure, never a smaller complete list. The snapshot deadline also bounds reads.
+            for (var page = 1; page <= 50; page++)
+            {
+                using var request = GitHubApp.Request(HttpMethod.Get, prefix + endpoint + $"?per_page={PageSize}&page={page}", "Bearer", token);
+                using var response = await http.SendAsync(request, ct);
+                await GitHubApp.EnsureSuccess(response, $"read recovery {endpoint} page {page} of {sha}", ct);
+                using var pageJson = await System.Text.Json.JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                if (!pageJson.RootElement.TryGetProperty("total_count", out var countField) || !countField.TryGetInt32(out _))
+                    throw new InvalidOperationException("Recovery CI page has no total_count; completeness is unknown.");
+                var body = pageJson.RootElement.Deserialize<TPage>() ?? throw new InvalidOperationException("Missing recovery CI page.");
+                var result = unpack(body);
+                if (result.Total < 0 || total is { } count && count != result.Total || result.Items is null)
+                    throw new InvalidOperationException("Recovery CI page totals changed or are missing.");
+                total = result.Total;
+                foreach (var item in result.Items)
+                    if (identity(item) is not { } id || id <= 0 || !identities.Add(id))
+                        throw new InvalidOperationException("Recovery CI page has a missing or duplicate stable identity.");
+                all.AddRange(result.Items);
+                if (all.Count == total) return all;
+                if (all.Count > total || result.Items.Count == 0) throw new InvalidOperationException("Recovery CI page is missing or inconsistent.");
+            }
+            throw new InvalidOperationException("Recovery CI exceeds 50 pages.");
+        }
+    }
+
     public async Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct)
     {
         if (check.Id is not { } id)
@@ -340,11 +406,12 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         return new BaseComparison(compare.BaseCommit.Sha, compare.BehindBy);
     }
 
-    public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+    public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
     {
         var token = (await gateApp.CreateInstallationTokenAsync(repo, ct, MergePermissions)).Token;
         using var request = GitHubApp.Request(HttpMethod.Put, $"repos/{repo.Owner}/{repo.Name}/pulls/{number}/merge", "Bearer", token);
         request.Content = JsonContent.Create(new { sha = headSha, merge_method = "merge" });
+        if (authorize is not null) await authorize(ct);
         using var response = await http.SendAsync(request, ct);
         if (response.StatusCode == HttpStatusCode.Conflict)
         {
@@ -376,7 +443,10 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha,
         [property: JsonPropertyName("changed_files")] int? ChangedFiles,
         [property: JsonPropertyName("head")] RefDto Head,
-        [property: JsonPropertyName("base")] RefDto Base);
+        [property: JsonPropertyName("base")] RefDto Base,
+        [property: JsonPropertyName("merged_by")] MergeUserDto? MergedBy = null);
+
+    private sealed record MergeUserDto([property: JsonPropertyName("login")] string? Login, [property: JsonPropertyName("type")] string? Type);
 
     private sealed record RefDto(
         [property: JsonPropertyName("ref")] string Ref,
@@ -415,7 +485,8 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("status")] string? Status,
         [property: JsonPropertyName("conclusion")] string? Conclusion,
         [property: JsonPropertyName("latest_check_runs_count")] int LatestCheckRunsCount,
-        [property: JsonPropertyName("app")] AppDto? App);
+        [property: JsonPropertyName("app")] AppDto? App,
+        [property: JsonPropertyName("id")] long? Id = null);
 
     private sealed record AppDto([property: JsonPropertyName("slug")] string? Slug);
 
@@ -425,7 +496,8 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
 
     private sealed record StatusDto(
         [property: JsonPropertyName("context")] string Context,
-        [property: JsonPropertyName("state")] string State);
+        [property: JsonPropertyName("state")] string State,
+        [property: JsonPropertyName("id")] long? Id = null);
 
     private sealed record ContentEntryDto(
         [property: JsonPropertyName("name")] string Name,

@@ -190,6 +190,11 @@ public class RunPipelineTests
             Bases.Add((branch, baseBranch));
             return Task.FromResult(new Workspace($"{Root}/{branch}", branch, baseBranch ?? "main", $"/clone/.git/worktrees/{branch}"));
         }
+        public Task<Workspace> PrepareCorrectedAsync(RepoRef repo, string branch, string correctedCommit, CancellationToken ct, string? baseBranch = null)
+        {
+            Calls.Add($"corrected {repo} {correctedCommit}");
+            return PrepareAsync(repo, branch, ct, baseBranch);
+        }
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null)
         {
             Calls.Add($"reopen {repo} {branch}");
@@ -217,9 +222,12 @@ public class RunPipelineTests
             return Task.FromResult(RemoteBranches[branch]);
         }
         /// <summary>The grant of each push: the worker sessions it publishes (E4).</summary>
+        public Func<IReadOnlyList<string>> CorrectionPaths { get; set; } = () => throw new NotSupportedException();
+        public Task<IReadOnlyList<string>> CorrectionPathsAsync(Workspace workspace, string baseSha, CancellationToken ct) => Task.FromResult(CorrectionPaths());
         public List<PushGrant> Grants { get; } = [];
         public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {
+            await grant.ValidateAsync(ct);
             Grants.Add(grant);
             Calls.Add($"push {repo} {workspace.Branch} {message}");
             if (OnPush is not null)

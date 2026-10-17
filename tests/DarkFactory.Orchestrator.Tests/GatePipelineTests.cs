@@ -36,9 +36,12 @@ public class GatePipelineTests
         public string Head { get; set; } = Sha1;
         public bool Open { get; set; } = true;
         public bool Merged { get; set; }
+        public bool MergedByGate { get; set; }
+        public Task<bool> IsGateMergeAsync(RepoRef repo, PullFacts pull, CancellationToken ct) => Task.FromResult(Merged && MergedByGate);
         public string? MergeCommitSha { get; set; }
         public string? PolicyText { get; set; } = Policy;
         public const string BaseSha = "base0";
+        public string ExpectedPolicySha { get; set; } = BaseSha;
         /// <summary>GitHub's changed_files for the PR; by default the file count of <see cref="Diff"/> at the head.</summary>
         public int? ChangedFiles { get; set; }
         public Dictionary<string, CiFacts> Ci { get; } = new();
@@ -48,12 +51,14 @@ public class GatePipelineTests
         /// <summary>When set, the merge finds the head moved to this commit (GitHub's 409).</summary>
         public string? HeadMovesBeforeMerge { get; set; }
         private int _reads;
+        public string PullBaseRef { get; set; } = "main";
+        public string PullBaseSha { get; set; } = BaseSha;
 
         public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
         {
             Calls.Add($"pull {number}");
             OnPullRead?.Invoke(++_reads);
-            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, "main", BaseSha, MergeCommitSha,
+            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, PullBaseRef, PullBaseSha, MergeCommitSha,
                 ChangedFiles ?? DiffPaths.Parse(Diff(Head)).Files));
         }
 
@@ -93,7 +98,7 @@ public class GatePipelineTests
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct)
         {
             // The policy is read at the base commit the diff is read against, never at the moving base branch.
-            Assert.Equal(BaseSha, baseRef);
+            Assert.Equal(ExpectedPolicySha, baseRef);
             Calls.Add($"policy {baseRef}");
             return Task.FromResult(PolicyText);
         }
@@ -123,8 +128,9 @@ public class GatePipelineTests
         /// <summary>Runs as the merge call starts, e.g. to press Ctrl-C while it is in flight.</summary>
         public Action? OnMergeCall { get; set; }
 
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+        public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
         {
+            if (authorize is not null) await authorize(ct);
             Calls.Add($"merge {number} {headSha}");
             OnMergeCall?.Invoke();
             if (HeadMovesBeforeMerge is { } moved)
@@ -134,19 +140,20 @@ public class GatePipelineTests
             }
             if (headSha != Head)
             {
-                return Task.FromResult(new MergeResult(false, null, true, "Head branch was modified."));
+                return new MergeResult(false, null, true, "Head branch was modified.");
             }
             if (MergeThrows is { } failure && !MergesBeforeThrowing)
             {
                 throw failure;
             }
             Merged = true;
+            MergedByGate = true;
             MergeCommitSha = MergeCommit;
             if (MergeThrows is { } late)
             {
                 throw late;
             }
-            return Task.FromResult(new MergeResult(true, MergeCommit, false, "Pull Request successfully merged"));
+            return new MergeResult(true, MergeCommit, false, "Pull Request successfully merged");
         }
 
         public static CiFacts Green(string sha) => new(sha, [new CheckFact("build-test", true, "success")]);
