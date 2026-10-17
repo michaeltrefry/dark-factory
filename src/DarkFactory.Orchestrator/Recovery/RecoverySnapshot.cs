@@ -129,8 +129,36 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                     });
                 });
             }
+            // Settled repairs and dispositions belong to the next independent assessment.
+            var incident = await db.HotFileIncidents.AsNoTracking().SingleOrDefaultAsync(i => i.Repo == trigger.Repo && i.Generation == trigger.Generation, token);
+            var incidentId = incident?.Id;
+            var dispositions = incident is null ? [] : await RecoveryRedirect.LatestAsync(db, incident, token);
+            var repairs = await db.RecoveryCorrections.AsNoTracking().Where(c => c.IncidentId == incidentId
+                && (c.State == "Merged" || c.State == "Failed")).OrderBy(c => c.Id).ToListAsync(token);
+            if (incident?.State == "Correcting")
+            {
+                // Accepting an assessment writes its own derived dispositions. They cannot revoke that assessment's grant:
+                // retain the input dispositions while checking all live source/head/spec/result evidence below. The next
+                // post-delivery assessment reads the newly persisted dispositions, rather than this input projection.
+                foreach (var prior in RecoverySnapshot.FromDetail(HotFileAssessment.FromDetail(incident.Answer)?.Material)?.Evidence
+                    .Where(e => e.Category == "disposition") ?? [])
+                    Add(prior.Category, prior.Id, prior.Provenance, prior.Commit, JsonSerializer.Deserialize<JsonElement>(prior.Content));
+            }
+            else if (incident is not null)
+                foreach (var disposition in dispositions)
+                    Add("disposition", $"redirect:{disposition.Item}", $"incident:{incidentId}; affected:{disposition.Item}", disposition.Commit, disposition);
+            foreach (var repair in repairs)
+            {
+                var repairId = ItemNaming.Recovery.Format(repair.Id);
+                var work = await db.WorkItems.SingleOrDefaultAsync(i => i.ExternalId == repairId, token);
+                if (work is null) { Missing("recovery", "Repair has no ledger item."); continue; }
+                var rows = await Rows(work.Id);
+                Add("recovery", $"repair:{repair.Id}", $"incident:{repair.IncidentId}; attempt:{repair.Attempt}",
+                    rows.LastOrDefault(e => e.Step == null && e.State == WorkState.Merge)?.Detail,
+                    new { repair.Id, repair.IncidentId, repair.Attempt, repair.State, rows = Results(rows) });
+            }
             var known = await db.WorkItems.AsNoTracking().OrderBy(i => i.Id).ToListAsync(token);
-            var items = known.Where(i => i.Source != ItemNaming.Recovery.Source && Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
+            var items = known.Where(i => i.Source != ItemNaming.Recovery.Source && (Pending(i) || dispositions.Any(d => d.Item == i.ExternalId)) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
             // Backlog/released children have no item row until intake sees them. A parent may currently be in another repo.
             var plans = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RunPipeline.Steps.PlanStories)
                 .OrderBy(e => e.Id).ToListAsync(token);
@@ -181,26 +209,25 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                     var effective = item.State == WorkState.Paused
                         ? TransitionContext.From(rows.Where(r => r.Step is null).Select(r => r.State).ToList()).PausedFrom : item.State;
                     // A previous PR cannot represent retained edits in this coding attempt; do not inspect worker files.
-                    if (effective is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing
+                    var unpublished = effective is WorkState.Implement or WorkState.Fixing or WorkState.CIHealing
                         && attempt.Any(r => r.Step == RunPipeline.Steps.WorkerStarted)
                         && (attempt.LastOrDefault(r => r.Step == RunPipeline.Steps.Pushed)?.Id ?? 0)
-                            < attempt.Last(r => r.Step == RunPipeline.Steps.WorkerStarted).Id)
-                        throw new InvalidOperationException("Unpublished coding work has no reproducible pending head.");
+                            < attempt.Last(r => r.Step == RunPipeline.Steps.WorkerStarted).Id;
                     await ChangesetHeads(item, rows);
                     var itemRepo = RepoRef.Parse(item.Repo);
                     var link = (effective == WorkState.Implement ? attempt : rows).LastOrDefault(e => e.Step == RunPipeline.Steps.Linked)?.Detail;
                     PullFacts? pull = null;
-                    if (link is not null)
+                    if (link is not null && !unpublished)
                     {
                         var number = PullNumber(link, itemRepo);
                         pull = await github.GetPullAsync(itemRepo, number, token);
                         if (pull.Number != number || string.IsNullOrWhiteSpace(pull.HeadSha)) throw new InvalidOperationException("Missing/wrong pending PR head.");
                     }
-                    else if (item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge)
+                    else if (!unpublished && item.State is WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge)
                         throw new InvalidOperationException("Missing pending PR link.");
                     string? head = pull?.HeadSha;
                     var pushed = attempt.LastOrDefault(r => r.Step == RunPipeline.Steps.Pushed)?.Detail;
-                    if (pull is null && pushed is not null)
+                    if (!unpublished && pull is null && pushed is not null)
                     {
                         // Initial Implement's pushed checkpoint names the branch; fix rounds may record a commit.
                         // Resolve the remote branch in either case, never treat the checkpoint text as an immutable head.
@@ -209,13 +236,14 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                         head = (await github.CompareAsync(itemRepo, branch, branch, token)).BaseSha;
                         if (string.IsNullOrWhiteSpace(head)) throw new InvalidOperationException("Missing pending branch tip.");
                     }
-                    else if (pull is null && effective == WorkState.Implement && attempt.Any(r => r.Step == RunPipeline.Steps.WorkerStarted))
-                        throw new InvalidOperationException("Unpublished coding work has no reproducible pending head.");
+
                     var reference = Reference(item);
+                    var semanticVersion = item.Version - rows.Count(r => SlotUse.IsBookkeeping(r.Step));
                     var blockers = await sources(reference.Naming).BlockersAsync(reference.Id, token);
-                    Add("pending", $"pending:{EvidenceKey(item)}", $"ledger:{item.Id}@{item.Version}; {item.ExternalId}", head,
-                        new { item.Id, item.ExternalId, item.State, item.Version, item.PlanItemId, item.EpicId, pull, blockers,
-                            head, headState = head is null ? "not-pushed" : "published",
+                    Add("pending", $"pending:{EvidenceKey(item)}", $"ledger:{item.Id}@{semanticVersion}; {item.ExternalId}", head,
+                        new { item.Id, item.ExternalId, item.State, Version = semanticVersion, item.PlanItemId, item.EpicId, pull, blockers,
+                            head, headState = unpublished ? "unpublished-unreviewed" : head is null ? "not-pushed" : "published",
+                            requiredDiscardRestart = unpublished,
                             rows = Results(rows) }, pull?.BaseSha);
                 });
             }
@@ -319,7 +347,8 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         return rows.Skip(start).ToList();
     }
 
-    private static object Results(IEnumerable<LedgerEntry> rows) => rows.Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }).ToArray();
+    private static object Results(IEnumerable<LedgerEntry> rows) => rows.Where(r => !SlotUse.IsBookkeeping(r.Step) && r.Step != RecoveryRedirect.Step && r.Step != HotFileAssessment.Step && r.Step != RecoverySnapshot.Step)
+        .Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }).ToArray();
     private static ItemRef Reference(WorkItem item) => ItemNaming.ParseAny(item.ExternalId)
         ?? throw new InvalidOperationException("Unknown evidence work source.");
     private static int PullNumber(string? link, RepoRef repo)

@@ -155,7 +155,7 @@ public sealed partial class RunPipeline
             PullFacts pull;
             if (approved is { } a)
             {
-                (history, pull) = (await ledger.HistoryAsync(run.Item, ct), a.Pull);
+                (history, pull) = (SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct)), a.Pull);
             }
             else
             {
@@ -429,7 +429,7 @@ public sealed partial class RunPipeline
         {
             try
             {
-                var history = await ledger.HistoryAsync(run.Item, ct);
+                var history = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct));
                 var (policy, policyError) = await ReadPolicyAsync(run, pull, ct);
                 string? diff = null, diffError = null;
                 try

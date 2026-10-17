@@ -760,6 +760,7 @@ public sealed partial class RunPipeline(
         /// </summary>
         public string? BaseBranch { get; init; }
         public string? RequiredBase { get; init; }
+        public Recovery.RecoveryRedirect? Redirect { get; init; }
 
         /// <summary>A plan item's changeset (the item's branch is then the changeset branch); null for every other item.</summary>
         public Plans.Changeset? Changeset { get; init; }
@@ -1049,12 +1050,20 @@ public sealed partial class RunPipeline(
         // merges into it; a plan item whose stories have all merged works on the changeset branch itself, against the default branch.
         var changeset = Plans.Changeset.Of(await ledger.HistoryAsync(item, ct), repo);
         var ofPlan = item.PlanItemId is { } plan ? await ledger.ChangesetOfAsync(plan, repo, ct) : (null, []);
+        Recovery.RecoveryRedirect? redirect = null;
+        try
+        {
+            if (recovery is not null && !(source.PlansItems && Plans.PlanLabel.IsOn(story)))
+                redirect = await recovery.RedirectAsync(item.ExternalId, ct);
+        }
+        catch (Recovery.RecoveryContinuationDeferredException ex) { return await OutcomeAsync(item, ex.Message, ct); }
         var run = new Run(spec, repo, item)
         {
             Primary = primary,
             Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
             BaseBranch = ofPlan.Changeset?.Branch,
             RequiredBase = await source.DeliveryBaseAsync(storyId, ct),
+            Redirect = redirect,
             Changeset = changeset,
         };
         // Fail closed: a plan with a changeset has none on origin for this repository (the story's `Repo:` line names another one),
@@ -1073,6 +1082,10 @@ public sealed partial class RunPipeline(
                 + $"Its `Repo:` line must name {planned}."
             : null;
 
+        // Resolving the redirect may discover newer base/spec/head evidence and re-hold the incident.
+        if (!correctionDelivered && !Lifecycle.IsTerminal(item.State) && item.State is not (WorkState.Planned or WorkState.Merge or WorkState.Watch)
+            && await RepositoryControlAsync(item.ExternalId, item.EpicId, repo.FullName, ct) != ControlState.Running)
+            return await OutcomeAsync(item, PausedMessage(item.ExternalId), ct);
         if (Lifecycle.IsTerminal(item.State))
         {
             log.WriteLine($"[{item.State}] {item.ExternalId} is {item.State}; nothing to do.");
@@ -1127,6 +1140,7 @@ public sealed partial class RunPipeline(
             {
                 throw new WorkerFailedException(noChangeset);
             }
+            await RestartRedirectedCodingAsync(run, ct);
             while (Handlers.TryGetValue(item.State, out var handler))
             {
                 // Pause/Stop: no new step starts once a control says so.
@@ -1214,6 +1228,10 @@ public sealed partial class RunPipeline(
         // The factory's own failure (the planner's seat: its sweep, the MCP proxy, the session file's ACL) is not the item's: it
         // reaches the caller, which treats it as factory-wide (IntakeLoop.IsFactoryWide). The item stays where it is, nothing is
         // recorded against it, and the next run takes the step again; whatever threw it has already cleaned up after itself.
+        catch (Recovery.RecoveryContinuationDeferredException ex)
+        {
+            return await OutcomeAsync(item, ex.Message, ct);
+        }
         catch (Exception ex) when (ex is not FactoryUnavailableException)
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.
@@ -1413,6 +1431,7 @@ public sealed partial class RunPipeline(
 
     private async Task ImplementAsync(Run run, CancellationToken ct)
     {
+        await RestartRedirectedCodingAsync(run, ct);
         var (spec, repo, item) = run;
         var story = spec.Story;
         var (branch, baseBranch) = (run.Branch, run.BaseBranch);
@@ -1458,7 +1477,9 @@ public sealed partial class RunPipeline(
         if (workspace is null)
         {
             // A plan's story starts from its plan's changeset branch (sc-25872), so it sees the stories that blocked it.
-            workspace = await workspaces.PrepareAsync(repo, branch, ct, baseBranch);
+            workspace = run.Redirect?.Commit is { } corrected
+                ? await workspaces.PrepareCorrectedAsync(repo, branch, corrected, ct, baseBranch)
+                : await workspaces.PrepareAsync(repo, branch, ct, baseBranch);
         }
         run.Workspace = workspace;
         log.WriteLine($"[implement] worktree {workspace.Path} on {workspace.Branch}{(baseBranch is null ? "" : $" from {baseBranch}")}");
@@ -1467,7 +1488,8 @@ public sealed partial class RunPipeline(
         {
             try
             {
-                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint : BuildResumePrompt(story),
+                session = await RunWorkerSessionAsync(run, workspace, session, resume => resume is null ? BuildPrompt(spec, repo) + stuckHint + (run.Redirect is { } redirected
+                    ? $"\nFresh attempt after incident {redirected.Incident}; corrected delivery commit {redirected.Commit}.\n{redirected.Context}" + (workspace.RecoveryConflicts.Count == 0 ? "" : "\nReconcile the delivered correction with the plan blocker changes in this fresh merge. Retain BOTH parents and their intended behavior; resolve every conflict marker, then build and test. Conflicted paths:\n" + string.Join("\n", workspace.RecoveryConflicts.Select(p => PromptFence.Block("file", p)))) : "") : BuildResumePrompt(story),
                     models, [SpecInput(story)], "implement", WorkerModelClass.Coding(story), ct);
             }
             catch (WorkerStuckException stuckSession) when (!WorkerStillRunning.IsMarked(stuckSession))
@@ -1485,8 +1507,11 @@ public sealed partial class RunPipeline(
             {
                 throw new InvalidOperationException("Worker finished without changing the repository; nothing to review.");
             }
+            if (workspace.RecoveryConflicts.Count > 0 && await workspaces.ConflictMarkersAsync(repo,
+                await workspaces.HeadAsync(workspace, ct), workspace.RecoveryConflicts, ct) is { Count: > 0 } unresolved)
+                throw new WorkerFailedException("Recovery restart left conflict markers in " + string.Join(", ", unresolved));
             await RecordCorrectionPushAsync(run, ct);
-            await ledger.CheckpointAsync(item, Steps.Pushed, session, workspace.Branch, ct);
+            await ledger.CheckpointAsync(item, Steps.Pushed, session, run.Redirect is null ? workspace.Branch : await workspaces.HeadAsync(workspace, ct), ct);
         }
 
         // A Stop or Pause that arrived during the push: no ready PR is opened for a stopped item.
@@ -2298,7 +2323,7 @@ public sealed partial class RunPipeline(
         // Not the slot's bookkeeping (the item's slot, sc-25989, and the run's use of it, sc-25991): those rows are written as a
         // worker phase starts, before the attempt has made anything, so an attempt holding only them is a fresh one — not a
         // resume that would look for a worktree and record it lost.
-        return history.Skip(start).Where(e => !SlotUse.IsBookkeeping(e.Step)).ToList();
+        return history.Skip(start).Where(e => !SlotUse.IsBookkeeping(e.Step) && e.Step != Recovery.RecoveryRedirect.Started).ToList();
     }
 
     /// <summary>

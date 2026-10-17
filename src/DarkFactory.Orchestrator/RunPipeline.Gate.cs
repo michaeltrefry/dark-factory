@@ -67,7 +67,7 @@ public sealed partial class RunPipeline
 
     private async Task<(List<LedgerEntry> History, PullFacts Pull)> ReadPullAsync(Run run, CancellationToken ct)
     {
-        var history = await ledger.HistoryAsync(run.Item, ct);
+        var history = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct));
         var url = LinkedPullRequestUrl(history) ?? throw new InvalidOperationException($"{run.Item.ExternalId} has no pull request in its ledger.");
         var (linked, number) = GitHubGate.ParsePullUrl(url);
         // An item's pull request is in the item's repository (sc-25873). The number alone names a different pull request in any
@@ -623,7 +623,7 @@ public sealed partial class RunPipeline
         bool requestAgain = false, CancellationToken? wait = null)
     {
         await ThrowIfControlledAsync(run.Item, ct);
-        var row = (await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
+        var row = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
             && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha);
         if (!requestAgain && CodeGraphOverlay.FromDetail(row?.Detail) is { IsReady: true } recorded)
         {
@@ -1312,7 +1312,7 @@ public sealed partial class RunPipeline
     /// (<see cref="Plans.Changeset.CurrentPass"/>): the gate passing an earlier repository's changeset says nothing about this one.
     /// </summary>
     internal static string? GatePassedAt(IReadOnlyList<LedgerEntry> history, PullFacts pull) =>
-        pull.Merged && Plans.Changeset.CurrentPass(history).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
+        pull.Merged && Plans.Changeset.CurrentPass(SinceRecoveryRestart(history)).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 
     /// <summary>
     /// After a merge call failed: re-reads the PR and returns its merge commit when GitHub merged it at the gated head;

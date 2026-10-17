@@ -11,6 +11,7 @@ namespace DarkFactory.Orchestrator.Tests.Support;
 internal sealed class FakeTestRunner : IGateTestRunner
 {
     public const string BaseSha = "base0";
+    public string BaseCommit { get; set; } = BaseSha;
     public const string Project = "tests/Widgets.Tests/Widgets.Tests.csproj";
     public const string NewTestFile = "tests/Widgets.Tests/WordCountTests.cs";
     public const string NewTest = "Widgets.Tests.WordCountTests.Whitespace_is_not_a_word";
@@ -88,7 +89,7 @@ internal sealed class FakeTestRunner : IGateTestRunner
     /// <summary>A compiler error at <paramref name="line"/> of <paramref name="path"/> (column 5).</summary>
     public static BuildError CompilerError(string path, int line, string code = "CS0117") => new(path, line, 5, code, "does not compile");
 
-    private Dictionary<string, string> FilesAt(string sha) => sha == BaseSha ? BaseFiles : HeadFiles(sha);
+    private Dictionary<string, string> FilesAt(string sha) => sha == BaseCommit ? BaseFiles : HeadFiles(sha);
 
     public Task<IReadOnlyList<ChangedFile>> ChangesAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
     {

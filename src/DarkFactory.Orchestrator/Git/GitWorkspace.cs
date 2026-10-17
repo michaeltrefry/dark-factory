@@ -7,7 +7,10 @@ using DarkFactory.Orchestrator.WorkSources;
 namespace DarkFactory.Orchestrator.Git;
 
 /// <param name="GitDir">The worktree's git admin dir in the owner's clone, recorded before the worker runs.</param>
-public sealed record Workspace(string Path, string Branch, string BaseBranch, string GitDir);
+public sealed record Workspace(string Path, string Branch, string BaseBranch, string GitDir)
+{
+    public IReadOnlyList<string> RecoveryConflicts { get; init; } = [];
+}
 
 /// <summary>A throwaway directory (<paramref name="Path"/>) holding a checkout of each of several repositories, each in its own directory under it.</summary>
 public sealed record SeatWorkspace(string Path, IReadOnlyList<(RepoRef Repo, Workspace Workspace)> Checkouts);
@@ -42,6 +45,10 @@ public interface IRepoWorkspace
     /// The base is the worktree's <see cref="Workspace.BaseBranch"/>, which its pull request targets.
     /// </summary>
     Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null);
+
+    /// <summary>Fresh coding from the current base, containing the assessed delivered correction, never the old PR branch.</summary>
+    Task<Workspace> PrepareCorrectedAsync(RepoRef repo, string branch, string correctedCommit, CancellationToken ct, string? baseBranch = null) =>
+        throw new NotSupportedException("This workspace cannot prove a corrected base.");
 
     /// <summary>
     /// Re-creates a story's worktree from its already-pushed branch (<c>origin/&lt;branch&gt;</c>)
@@ -165,6 +172,28 @@ public sealed class GitWorkspace(
 
     public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
         CreateWorktreeAsync(repo, branch, baseBranch, @base => $"origin/{@base}", ct);
+
+    public async Task<Workspace> PrepareCorrectedAsync(RepoRef repo, string branch, string correctedCommit, CancellationToken ct, string? baseBranch = null)
+    {
+        if (!FullSha.IsMatch(correctedCommit)) throw new ArgumentException("Correction delivery must be a full commit id.", nameof(correctedCommit));
+        var workspace = await PrepareAsync(repo, branch, ct, baseBranch);
+        // A plan child keeps its own changeset base and blockers. Bring the delivered correction into this fresh branch,
+        // not into the plan's shared branch, under the ordinary owner-git and clone-lock rules.
+        using var cloneLock = await LockAsync(ClonePath(repo), ct);
+        try
+        {
+            await Git(workspace.Path, null, ct, [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}",
+                "-c", $"user.name={CommitterName}", "-c", $"user.email={CommitterEmail}", "merge", "--no-ff", "--no-edit", correctedCommit]);
+        }
+        catch (InvalidOperationException)
+        {
+            var conflicts = (await Git(workspace.Path, null, ct, [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}",
+                "diff", "--name-only", "-z", "--diff-filter=U"])).Split('\0', StringSplitOptions.RemoveEmptyEntries);
+            if (conflicts.Length == 0) throw;
+            return workspace with { RecoveryConflicts = conflicts };
+        }
+        return workspace;
+    }
 
     public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) =>
         CreateWorktreeAsync(repo, branch, baseBranch, _ => $"origin/{branch}", ct);

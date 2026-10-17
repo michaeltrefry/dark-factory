@@ -55,9 +55,9 @@ public sealed class RecoverySnapshotTests
     }
 
     private const string Repo = "owner/alpha";
-    private sealed class Fixture
+    internal sealed class Fixture(DbContextOptions<LedgerDbContext>? options = null)
     {
-        public readonly LedgerDbContextFactory Contexts = new(new DbContextOptionsBuilder<LedgerDbContext>()
+        public readonly LedgerDbContextFactory Contexts = new(options ?? new DbContextOptionsBuilder<LedgerDbContext>()
             .UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
         public readonly GatePipelineTests.FakeGateGitHub GitHub = new() { Merged = true, MergeCommitSha = new string('9', 40) };
         public FakeWorkSource Source = new(new WorkStory(1, "requirements", "original spec", "chore", "board/story", ItemNaming.Shortcut))
@@ -89,6 +89,53 @@ public sealed class RecoverySnapshotTests
         }
         private static WorkItem Item(string id, WorkState state) => new() { Source = "shortcut", ExternalId = id,
             Repo = Repo, Title = id, State = state, EpicId = 9, Version = 1 };
+    }
+
+    [Fact]
+    public async Task Reassessment_captures_delivery_and_dispositions_without_self_revoking_the_next_grant()
+    {
+        var f = new Fixture(); await f.Seed();
+        RecoveryCorrection first;
+        var before = await f.Evidence.CaptureAsync(f.Trigger, default);
+        HotFileAssessment Answer(string material, string issue)
+        {
+            var snapshot = RecoverySnapshot.FromDetail(material)!;
+            var citation = snapshot.Evidence.First(e => e.Category == "merged").Id;
+            var finding = new RecoveryFinding("merged", true, issue, "Count once", ["Counts once"],
+                ["src/a.cs", "tests/CountTests.cs"], [citation], []);
+            return new(f.Trigger.Id, 1, Repo, "high", "unsafe", f.Trigger.EvidenceHash)
+            { Material = material, MaterialSnapshot = snapshot.Id, MaterialHash = RecoverySnapshot.Hash(material), Session = "fresh",
+                Citations = [citation], Findings = [finding], CorrectionFindings = [finding] };
+        }
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var answer = Answer(before, "First defect");
+            var incident = new HotFileIncident { Repo = Repo, Generation = 1, State = "Unsafe", Snapshot = JsonSerializer.Serialize(f.Trigger),
+                EvidenceHash = f.Trigger.EvidenceHash, Answer = JsonSerializer.Serialize(answer), Session = answer.Session };
+            db.Add(incident); await db.SaveChangesAsync();
+            first = await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(TestPolicies.Standard()), DateTimeOffset.UtcNow, default);
+            await db.SaveChangesAsync();
+            first.State = "Merged";
+            var item = new WorkItem { Source = ItemNaming.Recovery.Source, ExternalId = $"rc-{first.Id}", Title = "repair", Repo = Repo, State = WorkState.Watch };
+            db.Add(item); await db.SaveChangesAsync();
+            db.Add(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Merge, Detail = new string('9', 40),
+                Outcome = StepOutcome.Passed, RecordedAt = DateTimeOffset.UtcNow });
+            incident.State = "Assessing";
+            await db.SaveChangesAsync();
+        }
+        var corrected = await f.Evidence.CaptureAsync(f.Trigger, default);
+        var materialized = RecoverySnapshot.FromDetail(corrected)!;
+        Assert.Contains(materialized.Evidence, e => e.Category == "recovery" && e.Commit == new string('9', 40));
+        Assert.Contains(materialized.Evidence, e => e.Category == "disposition");
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var incident = await db.HotFileIncidents.SingleAsync();
+            var answer = Answer(corrected, "Another defect discovered after delivery");
+            incident.State = "Unsafe"; incident.Answer = JsonSerializer.Serialize(answer);
+            await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(TestPolicies.Standard()), DateTimeOffset.UtcNow, default, 2);
+            await db.SaveChangesAsync();
+        }
+        Assert.Equal(corrected, await f.Evidence.CaptureAsync(f.Trigger, default));
     }
 
     [Theory]
@@ -307,7 +354,7 @@ public sealed class RecoverySnapshotTests
     [InlineData(false, true)]
     [InlineData(true, true)]
     [InlineData(true, false)]
-    public async Task Retained_coding_is_incomplete_even_paused_or_with_an_old_published_attempt(bool oldPublication, bool started)
+    public async Task Retained_coding_is_explicitly_unreviewed_and_requires_discard_even_with_an_old_publication(bool oldPublication, bool started)
     {
         var f = new Fixture(); await f.Seed();
         await using (var db = f.Contexts.CreateDbContext())
@@ -331,8 +378,13 @@ public sealed class RecoverySnapshotTests
         var snapshot = await f.Evidence.SnapshotAsync(f.Trigger, CancellationToken.None);
         if (started)
         {
-            Assert.False(snapshot.Complete);
-            Assert.Contains(snapshot.Missing, m => m.Category == "pending" && m.Reason.Contains("Unpublished coding work"));
+            Assert.True(snapshot.Complete);
+            var pending = Assert.Single(snapshot.Evidence, e => e.Category == "pending" && e.Content.Contains("sc-2"));
+            using var json = JsonDocument.Parse(pending.Content);
+            Assert.Null(pending.Commit);
+            Assert.Equal("unpublished-unreviewed", json.RootElement.GetProperty("headState").GetString());
+            Assert.True(json.RootElement.GetProperty("requiredDiscardRestart").GetBoolean());
+            Assert.NotEmpty(await f.Evidence.CaptureAsync(f.Trigger, default));
         }
         else
         {

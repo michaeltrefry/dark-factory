@@ -15,7 +15,7 @@ namespace DarkFactory.Orchestrator.Tests;
 
 public class RecoveryCorrectionPipelineTests
 {
-    private sealed class Fixture
+    internal sealed class Fixture
     {
         internal readonly RecoveryWorkSourceTests.Fixture Recovery = new();
         internal readonly FakeWorkspaces Workspaces = new();
@@ -26,6 +26,7 @@ public class RecoveryCorrectionPipelineTests
         internal readonly FakeTestRunner Tests = new();
         internal RecoveryCorrection Correction = null!;
         internal Func<Task>? AfterWorker;
+        internal Func<RecoverySnapshot, Task<RecoverySnapshot>>? BeforeMaterialize;
         internal bool Tainted;
         internal string Material = "";
         internal string[] Paths = ["src/a.cs", FakeTestRunner.NewTestFile];
@@ -34,6 +35,7 @@ public class RecoveryCorrectionPipelineTests
             await Recovery.Initialize();
             var material = RecoverySnapshot.FromDetail(Recovery.Answer.Material)! with
             { BaseTips = new Dictionary<string, string> { ["main"] = GatePipelineTests.FakeGateGitHub.BaseSha } };
+            if (BeforeMaterialize is not null) material = await BeforeMaterialize(material);
             var finding = Recovery.Answer.CorrectionFindings.Single() with { Paths = Paths };
             Material = JsonSerializer.Serialize(material);
             Recovery.Answer = Recovery.Answer with { Material = Material, MaterialHash = RecoverySnapshot.Hash(Material),

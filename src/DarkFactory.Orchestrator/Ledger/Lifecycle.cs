@@ -28,7 +28,7 @@ public enum WorkState
 }
 
 /// <summary>Facts from an item's ledger history that some transitions depend on.</summary>
-public sealed record TransitionContext(WorkState? PausedFrom = null, int FixRounds = 0)
+public sealed record TransitionContext(WorkState? PausedFrom = null, int FixRounds = 0, bool RecoveryRestart = false)
 {
     /// <summary>Derives the context from an item's transition rows, oldest first.</summary>
     public static TransitionContext From(IReadOnlyList<WorkState> transitions)
@@ -120,6 +120,11 @@ public static class Lifecycle
         {
             return to == context.PausedFrom ? null : $"a paused item returns only to the state it paused from ({context.PausedFrom?.ToString() ?? "unknown"})";
         }
+        // Issued only by WorkLedger.RestartCodingAsync after checking the persisted safe disposition. A Stop/terminal
+        // state, a waiting plan or a delivered item is never restartable by this path.
+        if (context.RecoveryRestart && to == WorkState.Implement
+            && from is WorkState.Intake or WorkState.Implement or WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate)
+            return null;
         if (to == WorkState.Escalated)
         {
             return from == WorkState.Escalated ? "already escalated" : null;
