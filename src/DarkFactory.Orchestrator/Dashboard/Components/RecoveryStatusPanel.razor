@@ -38,12 +38,18 @@
                 <p>@row.Remedy</p>
             </article>
         }
-        @if (report.Repositories.Count == 0) { <p class="muted">No repository recovery incidents recorded.</p> }
+        <nav aria-label="Recovery pages">
+            @if (report.Page > 0) { <button type="button" class="recovery-previous" @onclick="() => PageChanged.InvokeAsync(report.Page - 1)">Previous</button> }
+            <span>Recovery page @(report.Page + 1); unresolved incidents first</span>
+            @if (report.HasMore) { <button type="button" class="recovery-next" @onclick="() => PageChanged.InvokeAsync(report.Page + 1)">Next</button> }
+        </nav>
+        @if (report.Repositories.Count == 0) { <p class="muted">No repository recovery incidents recorded on this page.</p> }
     </section>
 }
 
 @code {
     [Parameter] public RecoveryStatusReport? Report { get; set; }
+    [Parameter] public EventCallback<int> PageChanged { get; set; }
     [Parameter] public IReadOnlyDictionary<string, Control> Controls { get; set; } = new Dictionary<string, Control>();
     private bool Paused(string scope) => Controls.GetValueOrDefault(scope)?.State == ControlState.Paused;
 }

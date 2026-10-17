@@ -70,7 +70,7 @@ else if (Intake.Deferrals is { Count: > 0 } deferrals)
     <ControlButton Action="@(Paused(ControlScope.Factory) ? "continue" : "pause")" Scope="@ControlScope.Factory" />
     <ControlButton Action="stop" Scope="@ControlScope.Factory" />
 </div>
-<RecoveryStatusPanel Report="@_recovery" Controls="@_controls" />
+<RecoveryStatusPanel Report="@_recovery" Controls="@_controls" PageChanged="ChangeRecoveryPageAsync" />
 @foreach (var repo in RepositoriesWithoutIncident)
 {
     var scope = ControlScope.Repository(repo);
@@ -340,15 +340,14 @@ else
 
     private void OnChanged(long? workItemId) => _ = InvokeAsync(ReloadAsync);
 
-    private Task OnTickAsync()
+    // Recovery writes need not notify work_items. Retry even after an initial failure or an empty idle read.
+    private Task OnTickAsync() => ReloadAsync();
+
+    private int _recoveryPage;
+    private Task ChangeRecoveryPageAsync(int page)
     {
-        // A run shown alive is asked about again too (sc-25991): one that died wrote no row, so no change announces it.
-        if (_recovery is not null || _rows?.Any(r => r.Sessions.Any(s => s.Running) || r.Run?.Live == true) == true)
-        {
-            return ReloadAsync();
-        }
-        StateHasChanged();
-        return Task.CompletedTask;
+        _recoveryPage = page;
+        return ReloadAsync();
     }
 
     private void OnIntakeChanged() => _ = InvokeAsync(StateHasChanged);
@@ -368,7 +367,7 @@ else
             {
                 _again = false;
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
-                _recovery = await Data.RecoveryAsync(_cts.Token);
+                _recovery = await Data.RecoveryPageAsync(_recoveryPage, _cts.Token);
                 _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
                 _stale = false;
                 await ReloadMetricsAsync();

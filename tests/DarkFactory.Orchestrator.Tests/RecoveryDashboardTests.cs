@@ -14,7 +14,7 @@ using Microsoft.Extensions.Time.Testing;
 
 namespace DarkFactory.Orchestrator.Tests;
 
-public sealed class RecoveryDashboardTests : BunitContext
+public sealed partial class RecoveryDashboardTests : BunitContext
 {
     private readonly FakeTimeProvider _time = new(DateTimeOffset.Parse("2026-10-17T12:00:00Z"));
     private readonly string _database = Guid.NewGuid().ToString();

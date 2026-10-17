@@ -7,9 +7,9 @@ using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync, RecoveryStatusAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync, recoveryPageStatus: RecoveryStatusAsync).Parse(args).InvokeAsync();
 
-static async Task<int> RecoveryStatusAsync(CancellationToken ct)
+static async Task<int> RecoveryStatusAsync(int page, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     try
@@ -17,7 +17,7 @@ static async Task<int> RecoveryStatusAsync(CancellationToken ct)
         // No worker, board, router or recovery service: migrate before reading, as every ledger reader does.
         await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
         var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
-        var report = await new DarkFactory.Orchestrator.Recovery.RecoveryStatusReader(contexts, TimeProvider.System).ReadAsync(ct);
+        var report = await new DarkFactory.Orchestrator.Recovery.RecoveryStatusReader(contexts, TimeProvider.System).ReadPageAsync(page, ct);
         Console.Write(LedgerReport.RecoveryStatus(report));
         await using var db = contexts.CreateDbContext();
         var freeze = await db.Controls.FindAsync([DarkFactory.Orchestrator.Controls.ControlScope.Freeze], ct);
