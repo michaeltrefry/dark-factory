@@ -30,6 +30,7 @@ internal sealed class E2e : IAsyncDisposable
     private readonly NpgsqlConnectionStringBuilder _admin;
     private readonly string _database;
     private readonly IDisposable? _realRootLock;
+    internal EvaluationWorkRoot? EvaluationRoot { get; private set; }
 
     private E2e(NpgsqlConnectionStringBuilder admin, string database, IDisposable? realRootLock, string workRoot)
     {
@@ -92,7 +93,13 @@ internal sealed class E2e : IAsyncDisposable
         ct.ThrowIfCancellationRequested();
         Harness.RequireOptIn();
         Harness.RequireSecret(o => o.RouterKey);
-        await Harness.RequireRouterAsync(); // Existing bounded (3 s) prerequisite; no inference.
+        using (var http = OutboundHttp.RouterApi(Harness.Options.RouterBaseUrl, TimeSpan.FromSeconds(3)))
+        {
+            await EvaluationSetup.RequireRouterAsync(async token =>
+            {
+                using var response = await http.GetAsync(Harness.Options.RouterBaseUrl, token);
+            }, ct); // Evaluation failure, not shared harness Skip; bounded prerequisite, no inference.
+        }
         ct.ThrowIfCancellationRequested();
         return await EvaluationSetup.StartAsync(Harness.Options, AcquireRealLocks, async isolated =>
         {
@@ -100,12 +107,15 @@ internal sealed class E2e : IAsyncDisposable
             // Probe through the isolated root's sandbox locks, not the already exclusively held real-root files.
             // The real-root locks stay held too, excluding every real worker for the entire arm.
             var options = isolated.Options();
-            foreach (var slot in options.WorkerSlots!.All)
+            await isolated.EvaluationRoot!.RunAsync(async () =>
             {
-                ct.ThrowIfCancellationRequested();
-                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, ct);
-            }
-        }, held => CreateIsolatedAsync(prefix, held, ct), ct);
+                foreach (var slot in options.WorkerSlots!.All)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, ct);
+                }
+            });
+        }, held => CreateIsolatedAsync(prefix, held, ct, evaluation: true), ct);
     }
 
     private static IDisposable AcquireRealLocks()
@@ -130,7 +140,7 @@ internal sealed class E2e : IAsyncDisposable
         return realLock ?? (IDisposable)new RealLocks();
     }
 
-    private static async Task<E2e> CreateIsolatedAsync(string prefix, IDisposable realLock, CancellationToken ct = default)
+    private static async Task<E2e> CreateIsolatedAsync(string prefix, IDisposable realLock, CancellationToken ct = default, bool evaluation = false)
     {
         var realRoot = Harness.Options.WorkRoot;
         var admin = new NpgsqlConnectionStringBuilder(Harness.Options.LedgerConnectionString);
@@ -145,6 +155,8 @@ internal sealed class E2e : IAsyncDisposable
         catch (Exception ex) when (ex is NpgsqlException or System.Net.Sockets.SocketException)
         {
             realLock?.Dispose();
+            if (evaluation)
+            { throw new InvalidOperationException($"Evaluation ledger prerequisite unavailable ({ex.GetType().Name}); campaign incomplete (no automatic retry)."); }
             Assert.Skip($"Ledger Postgres not reachable ({ex.Message}); run `docker compose up -d`.");
         }
         var workRoot = Path.Combine(realRoot, "e2e", database);
@@ -153,6 +165,7 @@ internal sealed class E2e : IAsyncDisposable
         {
             // CREATE DATABASE above is uncancelled until ownership is established, so a cancelled command cannot
             // leave an ambiguously-created database. Everything after ownership cancels through the usual cleanup.
+            if (evaluation) { e2e.EvaluationRoot = EvaluationWorkRoot.Create(Path.Combine(realRoot, "e2e"), database); }
             ct.ThrowIfCancellationRequested();
             await LedgerMigrations.MigrateAsync(e2e.Ledger, ct);
             await using (var ledger = new NpgsqlConnection(e2e.Ledger))
@@ -325,17 +338,22 @@ internal sealed class E2e : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        NpgsqlConnection.ClearAllPools();
-        try
+        async Task DropLedgerAsync()
         {
+            NpgsqlConnection.ClearAllPools();
             await using var conn = new NpgsqlConnection(_admin.ConnectionString);
             await conn.OpenAsync();
             await using var drop = new NpgsqlCommand($"DROP DATABASE IF EXISTS {_database} WITH (FORCE)", conn);
             await drop.ExecuteNonQueryAsync();
         }
-        finally
+        if (EvaluationRoot is { } owned)
         {
-            _realRootLock?.Dispose();
+            await owned.DisposeAsync(DropLedgerAsync, _realRootLock);
+        }
+        else
+        {
+            try { await DropLedgerAsync(); }
+            finally { _realRootLock?.Dispose(); }
         }
     }
 

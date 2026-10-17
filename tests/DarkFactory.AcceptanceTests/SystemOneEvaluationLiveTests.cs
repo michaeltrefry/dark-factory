@@ -66,7 +66,7 @@ internal sealed class LiveEvaluationArm(EvaluationCorpus corpus, string model) :
         if (http is not null) { http.DefaultRequestHeaders.Add(RouterReviewer.SessionHeader, classifierSession); }
         var observation = await EvaluationIntake.RunAsync(input, mode, sha,
             await File.ReadAllTextAsync(Path.Combine(snapshot, "factory", "gate.yaml"), ct), contexts,
-            new PostgresRunLocks(e2e.Ledger), new LedgerControls(contexts, TimeProvider.System), triage,
+            new PostgresRunLocks(e2e.Ledger), new LedgerControls(contexts, TimeProvider.System), e2e.EvaluationRoot!.Guard(triage),
             () => mode == "disabled" ? null : IssueClassifier.Create(options, http!, () => options.RouterKey), ct,
             classifierSession, http is null ? null : new RouterClient(http, options.RouterKey));
         await completed(observation); // Durable sanitized checkpoint before e2e.DisposeAsync drops this arm's ledger.
