@@ -504,14 +504,14 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         WorkSources.WorkSourceRegistry.EnsureKanbanTokensApart(this);
     }
 
-    /// <summary>Optional report classification. Advisory is not supported until its separately reviewed story lands.</summary>
+    /// <summary>Optional report classification: disabled by default, shadow metadata only, or a non-authoritative advisory triage hint.</summary>
     public string IssueClassificationMode
     {
         get
         {
             var mode = config["Issues:Classification:Mode"] ?? "disabled";
-            return mode is "disabled" or "shadow" ? mode
-                : throw new InvalidOperationException("Issues:Classification:Mode must be disabled or shadow; advisory is not yet supported.");
+            return mode is "disabled" or "shadow" or "advisory" ? mode
+                : throw new InvalidOperationException("Issues:Classification:Mode must be disabled, shadow or advisory.");
         }
     }
 
@@ -523,7 +523,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
             var model = config["Issues:Classification:Model"];
             if (IssueClassificationMode == "disabled") { return model; }
             return !string.IsNullOrWhiteSpace(model) && model.Length <= 128 && !model.Any(char.IsWhiteSpace) ? model
-                : throw new InvalidOperationException("Issues:Classification:Model must name an explicit SystemOne catalog model in shadow mode.");
+                : throw new InvalidOperationException("Issues:Classification:Model must name an explicit SystemOne catalog model in shadow or advisory mode.");
         }
     }
 
