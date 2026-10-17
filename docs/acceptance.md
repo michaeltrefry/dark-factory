@@ -1498,6 +1498,12 @@ it is passed on to the test application and breaks the `dotnet test` run. The re
 Both runs passed against `michaeltrefry/dark-factory-sandbox`. Each used a throwaway ledger that was dropped afterwards, so
 what survives as evidence is the two xunit result files (`--report-xunit-xml`) and the sandbox pull requests listed here.
 
+The result files are in `/Users/michael/Repos/dark-factory/.claude/worktrees/agent-a30f8072b3e6299bb/TestResults/`. The safe
+run is `michael_Michaels-MacBook-Pro_2026-10-17_17_31_17.297013.xunit.xml` and the defect run is
+`michael_Michaels-MacBook-Pro_2026-10-17_17_42_08.454570.xunit.xml`. A third file there,
+`michael_Michaels-MacBook-Pro_2026-10-17_17_28_55.950776.xunit.xml`, is a first attempt that skipped because of the router
+default.
+
 | Case | Duration | Evidence |
 | --- | --- | --- |
 | Safe | 5 min 51 s | sandbox PRs #91 (merged as `e7118027`) and #92 (merged as `a052f5da`) changed the same file; one incident opened and was Resolved after one fresh high-class assessment answered safe; no correction; no global freeze row |
