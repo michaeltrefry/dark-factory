@@ -88,7 +88,8 @@ public sealed class IssueIntake(
     IntakeStatus status,
     int maxFailures,
     TimeProvider time,
-    TextWriter log)
+    TextWriter log,
+    IssueClassifier? classifier = null)
 {
     public static readonly ItemNaming Naming = ItemNaming.GitHubIssue;
 
@@ -247,7 +248,29 @@ public sealed class IssueIntake(
         var record = Latest(history);
         if (record is null || record.Version != version)
         {
-            var (triaged, usagePaused) = await TriageAsync(ledger, item, repo, issue, version, ct);
+            string? classificationHint = null;
+            if (classifier is not null)
+            {
+                // A completed attempt for this version is durable and reused across polls and process restarts (E9): the
+                // attempt may have been persisted just before a crash, before the authoritative triage recorded anything.
+                // A pre-release edit is a new version hash, so it starts a fresh attempt; a released issue never reaches here.
+                // Completed unavailable/skipped outcomes are observable attempts too — they are not silently retried each poll.
+                await using var classificationDb = await contexts.CreateDbContextAsync(ct);
+                var classification = await classificationDb.IssueClassifications.AsNoTracking()
+                    .SingleOrDefaultAsync(a => a.WorkItemId == item.Id && a.IssueVersion == version, ct);
+                if (classification is null)
+                {
+                    classification = await ClassifyAsync(item, version, issue, ct);
+                    classificationDb.IssueClassifications.Add(classification);
+                    await classificationDb.SaveChangesAsync(ct);
+                }
+                // Active mode controls visibility; a reused attempt keeps its historical mode. Unavailable/skipped is no hint.
+                if (classifier.Mode == "advisory" && classification.Status == "completed")
+                {
+                    classificationHint = classification.Label;
+                }
+            }
+            var (triaged, usagePaused) = await TriageAsync(ledger, item, repo, issue, version, classificationHint, ct);
             if (triaged is null)
             {
                 return usagePaused ? Outcome.UsagePaused : Outcome.Again;
@@ -298,19 +321,52 @@ public sealed class IssueIntake(
         return Outcome.Done;
     }
 
+    /// <summary>The optional HTTP call still obeys live controls, including Stop. A control is a deferral, not unavailability.</summary>
+    private async Task<IssueClassification> ClassifyAsync(WorkItem item, string version, IssueFacts issue, CancellationToken ct)
+    {
+        using var call = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var pending = classifier!.ClassifyAsync(item.Id, version, issue.Title, issue.Body, call.Token);
+        try
+        {
+            while (!pending.IsCompleted)
+            {
+                await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(1), call.Token));
+                ct.ThrowIfCancellationRequested();
+                if (await controls.EffectiveAsync(item.ExternalId, null, ct) != ControlState.Running)
+                {
+                    throw new TriageDeferredException("a control holds classification; retried once running");
+                }
+            }
+            var result = await pending;
+            ct.ThrowIfCancellationRequested();
+            if (await controls.EffectiveAsync(item.ExternalId, null, ct) != ControlState.Running)
+            {
+                throw new TriageDeferredException("a control holds classification; retried once running");
+            }
+            return result;
+        }
+        finally
+        {
+            // Drain before disposing the request's lifetime or releasing the intake lock. Never leave a call running behind triage.
+            await call.CancelAsync();
+            try { await pending; }
+            catch (OperationCanceledException) when (call.IsCancellationRequested) { }
+        }
+    }
+
     /// <summary>
     /// Runs the triage worker on this version and routes it; returns the record to write, or none when the worker was refused for
     /// usage (<c>UsagePaused</c>: the factory is now paused) or failed and will be tried again. After <c>maxFailures</c> failures in
     /// a row the failure itself is the triage (routed to a human), so a broken issue is neither retried forever nor left silent (E10).
     /// </summary>
     private async Task<(TriageRecord? Record, bool UsagePaused)> TriageAsync(WorkLedger ledger, WorkItem item, RepoRef repo, IssueFacts issue,
-        string version, CancellationToken ct)
+        string version, string? classificationHint, CancellationToken ct)
     {
         Triage? parsed = null;
         string? error = null;
         try
         {
-            var result = await triage.RunAsync(item, repo, TriagePrompt.Build(repo, issue, watched),
+            var result = await triage.RunAsync(item, repo, TriagePrompt.Build(repo, issue, watched, classificationHint),
                 async (session, c) =>
                 {
                     await ledger.CheckpointAsync(item, IssueSteps.TriageSession, session, version, c);

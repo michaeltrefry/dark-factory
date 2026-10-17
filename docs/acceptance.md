@@ -3,6 +3,74 @@
 How to run each epic acceptance test, what is automated and what the owner does by hand. Everything live is
 opt-in: the tests skip, naming the missing prerequisite, unless their gate variable is set.
 
+## SystemOne S6 evaluation-only graceful cancellation (sc-26354)
+
+For a **new, explicitly authorized** held-out campaign only (not an instruction to start or stop an existing run):
+choose a unique artifact directory inside the **owner's session folder**, outside the frozen scoring corpus and the
+configured `Factory:WorkRoot` (which contains every isolated arm's synthetic snapshot, clone and triage ReadRule
+worktree). An ignored artifact directory inside the owner's checkout is allowed: that checkout is not given to the
+worker. Git metadata paths and symlinked artifact ancestors remain forbidden. Use the session's physical path
+(`pwd -P`). Preserve the existing prerequisites (router, Postgres, sandbox setup, catalog model and exclusive sandbox locks).
+
+```sh
+# Example only: this starts paid live inference. Do not run alongside an existing campaign.
+# Run from the owner's isolated session checkout, not a worker worktree.
+session="$(pwd -P)"
+mkdir -p "$session/artifacts"
+artifacts="$(mktemp -d "$session/artifacts/systemone-evaluation.XXXXXXXX")"
+export FACTORY_E2E=1 FACTORY_E2E_SYSTEMONE_EVALUATION=1
+export FACTORY_E2E_SYSTEMONE_REPORT="$artifacts/evidence.json"
+export FACTORY_E2E_SYSTEMONE_CANCEL_FILE="$FACTORY_E2E_SYSTEMONE_REPORT.cancel"
+printf 'This run cancellation file: %s\n' "$FACTORY_E2E_SYSTEMONE_CANCEL_FILE"
+# Issues__Classification__Model must already name the approved SystemOne catalog model.
+dotnet test --project tests/DarkFactory.AcceptanceTests \
+  --filter-method '*Frozen_corpus_paired_disabled_vs_advisory_live_campaign'
+```
+
+From another shell, create **that run's exact flag** (substitute the printed/recorded artifact path):
+
+```sh
+# Existence only; the harness never reads the file body. No process signals.
+touch /absolute/owner/session/artifacts/systemone-evaluation.XXXXXXXX/evidence.json.cancel
+```
+
+The dedicated variable is read only after both live opt-ins. It has **no default**, and must equal the absolute
+report path plus `.cancel`; the report itself is reserved with create-new semantics, preventing shared campaign
+ownership. With the variable absent, no file watcher runs. Flags in the actual scoring corpus or configured worker
+work root, git metadata, another campaign's flag, relative paths and symlinked artifact ancestors are refused before
+client construction. A `.git` entry in an owner-checkout ancestor alone is not a reason to reject session artifacts. A pre-existing flag writes initial
+`incomplete` evidence and stops before client construction/inference; do not delete a flag to resume a campaign.
+
+The linked token preserves the caller's cancellation and 100-minute deadline, checks synchronously between arms
+and polls existence every 100 ms during the current arm. It cancels the normal await, **not** the process directly;
+the existing production runner unwinds its sandbox cleanup before the arm disposes its ledger/locks. This mechanism
+adds no signals and does not bypass production controls or change existing sandbox cleanup. Await termination
+before touching artifacts or starting any other sandbox work. Completed observations remain durably checkpointed;
+an interrupted arm has no fabricated observation, no summary is published, and evidence stays `incomplete`.
+The watcher is stopped, drained and disposed on every exit. An incomplete/cancelled test exits non-successfully;
+that is not a completed performance/quality result and does not authorize rerunning or relabeling the frozen corpus.
+An already-running older harness cannot acquire this feature retroactively.
+
+Evaluation gating is separate from campaign completion: absent live opt-ins or missing model/report configuration
+may intentionally skip **before** the campaign starts. Once the campaign loop is entered, any arm prerequisite skip
+is a failure, not a successful skipped run. Router reachability failures (including between arms) name the prerequisite
+and exception type only, never the raw response, URL or key. There are no automatic inference retries; completed arms
+stay in the `incomplete` file and no final summary is emitted.
+
+Each evaluation arm creates and owns its unique `<Factory:WorkRoot>/e2e/df_systemone_eval_<guid>` directory.
+After the production triage runner has fully unwound, teardown first acquires every isolated worker-slot lock
+nonblocking and holds them through ledger/root cleanup. A helper that outlives shutdown retains that actual lock
+through production `KeepUntil`, even if cancellation is unmarked or recorder cleanup replaces its exception.
+Only once all isolated locks are held does teardown drop that arm's ledger and remove only that directory
+before releasing the machine sandbox locks. Owner-side recursive deletion unlinks nested symlinks without following
+their targets; a symlink at the root or any ancestor is refused. This adds no helper, uid sweep, chmod/chown or signal.
+An inaccessible leftover is a teardown failure (not a reason to launch a privileged cleanup helper). If a probe or triage
+reports a worker still running, or any isolated lock cannot be acquired (including unsafe linked lock paths), the harness
+refuses ledger/root teardown and retains the machine locks until its process exits; inspect/stop the runner before any
+manual cleanup or new sandbox activity. Existing older campaign directories
+are not adopted or swept by this code: collect only individually verified owned roots after the terminal runner is stopped,
+with evidence stored outside them. Do not use a wildcard or a sandbox helper to clean up historical roots.
+
 ## Safety first (read before any live run)
 
 - **The `_factory` user is single-tenant** — and so is each further sandbox user of a machine set up with worker slots

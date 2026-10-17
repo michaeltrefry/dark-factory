@@ -281,9 +281,11 @@ public static class FactoryRunner
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
+        using var classifierHttp = ClassifierHttp(options);
+        var classifier = Issues.IssueClassifier.Create(options, classifierHttp, () => options.RouterKey);
         var intake = new Issues.IssueIntake(WorkSourceRegistry.Issues(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
-            options.MaxItemFailures, TimeProvider.System, log);
+            options.MaxItemFailures, TimeProvider.System, log, classifier);
         await intake.PollAsync(ct);
     }
 
@@ -448,6 +450,14 @@ public static class FactoryRunner
     internal static HttpClient ReviewerHttp(FactoryOptions options) => OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
 
     /// <summary>
+    /// The issue classifier's router client: <c>Issues:Classification:TimeoutSeconds</c> is the deadline, carried by the
+    /// classifier's own linked token on every request and body read, so the client's HTTP timeout is disabled — the gateway's
+    /// 100 s default would cut a longer configured deadline short in production only (tests inject their own clients).
+    /// </summary>
+    internal static HttpClient ClassifierHttp(FactoryOptions options) =>
+        OutboundHttp.RouterApi(options.RouterBaseUrl, Timeout.InfiniteTimeSpan);
+
+    /// <summary>
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
     /// the new tests run sandboxed for up to <c>Gate:TestTimeoutMinutes</c> each, and each review waits up to
     /// <c>CodeGraph:OverlayTimeoutMinutes</c> for CodeGraph's overlay of the head (sc-25708; without a CodeGraph token the wait ends at
@@ -586,6 +596,10 @@ public sealed class FactoryItemStops(FactoryOptions options, WorkSourceRegistry 
 /// </summary>
 public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) : Issues.ITriageRunner
 {
+    // Test/held-out evaluation seam only: a locally materialized, frozen synthetic repository instead of GitHub.
+    // No configuration/env/CLI can set it. The sandbox, locks, worker, tools, taint and session accounting stay production's.
+    internal string? EvaluationSnapshot { private get; init; }
+
     /// <summary>The work root's directory of triage worktrees, apart from the items' <c>worktrees</c> (slot 1's; slot n's: <see cref="TriageWorktreesOf"/>).</summary>
     public const string TriageWorktrees = "triage-worktrees";
 
@@ -635,11 +649,16 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         await FactoryRunner.EnsureSandboxReadyAsync(slots, options.WorkerAuth, options.ClaudePath, ct);
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
-        var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
+        if (EvaluationSnapshot is { } snapshot && (!Path.IsPathFullyQualified(snapshot) || !Directory.Exists(snapshot)))
+        {
+            throw new InvalidOperationException("The evaluation snapshot must be a local absolute repository directory.");
+        }
+        var app = EvaluationSnapshot is null
+            ? new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System) : null;
         // The seat is the held slot's (sc-25990): its own root of triage worktrees, its own directory of session files.
         var seat = SlotSeat.Of(options.WorkRoot, TriageWorktrees, slots, slot);
-        GitWorkspace SeatsIn(string worktrees) => new(options.WorkRoot, GitWorkspace.GitHubRemote,
-            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
+        GitWorkspace SeatsIn(string worktrees) => new(options.WorkRoot, r => EvaluationSnapshot ?? GitWorkspace.GitHubRemote(r),
+            async (r, c) => app is null ? null : (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
             worktreesDirectory: worktrees, shareWithWorker: false);
         var workspaces = SeatsIn(seat.Worktrees);
         // Whatever a crashed or unstoppable triage left in this slot's root is swept (nothing resumes a triage), this issue's own
@@ -664,11 +683,14 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         // text is untrusted and the triage's answer is posted on the issue). The upstream token stays here; the session gets a
         // credential revoked when it ends, in a file (never argv).
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
-        var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
+        // A held-out synthetic snapshot must not acquire private indexed context (or change context between arms).
+        var upstreams = EvaluationSnapshot is null ? FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log)
+            : new Mcp.McpUpstreams(null, null);
         await using var proxy = await StartMcpProxyAsync(upstreams, seat.Sessions, live, ct);
         var tools = TriageTools(upstreams, proxy is not null);
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerAuth, options.WorkerTimeout, slots,
-            pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
+            pauseFlagDirectory: options.PauseFlagDirectory, tools: tools,
+            maxTurns: EvaluationSnapshot is null ? null : 12);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
         return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log,
