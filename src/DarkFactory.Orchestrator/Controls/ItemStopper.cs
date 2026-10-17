@@ -58,8 +58,11 @@ public sealed class ItemStopper(IWorkSource source, WorkLedger ledger, IRunLocks
         var id = source.Naming.Format(storyId);
         if (await ledger.FindAsync(source.Naming.Source, id, ct) is not { } item)
         {
+            // Internal sources can own runnable identities before WorkLedger creates their intake row.
+            var settled = await source.StopBeforeIntakeAsync(storyId, ct);
             await controls.ClearAsync(ControlScope.Item(id), ct);
-            return new ControlResult(true, $"{id} is not in the factory ledger; nothing to stop.");
+            return new ControlResult(true, settled ? $"{id} stopped before intake; it cannot be dispatched."
+                : $"{id} is not in the factory ledger; nothing to stop.");
         }
         await using var runLock = await locks.TryAcquireAsync(item.Id, ct);
         if (runLock is null)

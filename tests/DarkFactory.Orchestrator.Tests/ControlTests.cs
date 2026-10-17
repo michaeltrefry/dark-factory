@@ -732,7 +732,7 @@ public class ControlTests
         // Refused before the ledger is opened, so no database is needed.
         var controls = new LedgerControls(null!, TimeProvider.System);
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => controls.SetAsync("everything", ControlState.Paused, "tester", CancellationToken.None));
-        Assert.Contains("(factory, usage, freeze, repo:<owner/name>, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key> or item:kb-<n>)", ex.Message);
+        Assert.Contains("(factory, usage, freeze, repo:<owner/name>, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key>, item:kb-<n> or item:rc-<n>)", ex.Message);
         // Every source whose epics carry its prefix (sc-25985) has its epic scope named too.
         Assert.All(ItemNaming.All.Where(n => n.Epics == EpicNaming.Key), naming => Assert.Contains($"epic:{naming.Prefix}-<", ex.Message));
         // Every source's items have a scope (sc-25982): a new source's must be named here too.

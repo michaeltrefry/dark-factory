@@ -242,10 +242,15 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
         var repositories = db.WorkItems.Where(i => i.Source == source && i.ExternalId == externalId && i.State != WorkState.Planned)
             .Select(i => i.Repo.ToLower());
         var repositoryScopes = repositories.Select(r => "repo:" + r);
-        var manual = db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope) || planScopes.Contains(c.Scope)
+        var corrections = Recovery.RecoveryCorrections.Grants(db, externalId, repoKey);
+        int? correctionKey = ItemNaming.Recovery.TryParse(externalId, out var recoveryKey) ? recoveryKey : null;
+        // Ancestral human controls survive grant revocation and Stop; an incident exception never removes this context.
+        var ancestry = db.RecoveryAncestors.Where(a => correctionKey != null && a.CorrectionId == correctionKey).Select(a => a.Scope);
+        var manual = db.Controls.AsNoTracking().Where(c => scopes.Contains(c.Scope) || planScopes.Contains(c.Scope) || ancestry.Contains(c.Scope)
                 || (resolveRepository && repositoryScopes.Contains(c.Scope)))
             .Select(c => new { c.Scope, Stopping = c.State == ControlState.Stopping, Paused = c.State == ControlState.Paused, c.ResumeAt });
         var automatic = db.HotFileIncidents.AsNoTracking().Where(i => i.State != "Resolved"
+                && !corrections.Any(c => c.IncidentId == i.Id)
                 && (resolveRepository ? repositories.Contains(i.Repo) : repoKey != null && i.Repo == repoKey))
             .Select(i => new { Scope = "recovery", Stopping = false, Paused = true, ResumeAt = (DateTimeOffset?)null });
         // These are read-only effective reasons, never persisted control rows and never a synthetic Running authorization.
@@ -377,7 +382,7 @@ public sealed class LedgerControls(IDbContextFactory<LedgerDbContext> contexts, 
     {
         if (!ControlScope.IsValid(scope))
         {
-            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, repo:<owner/name>, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key> or item:kb-<n>).", nameof(scope));
+            throw new ArgumentException($"'{scope}' is not a control scope (factory, usage, freeze, repo:<owner/name>, epic:<id>, epic:kb-<n>, item:sc-<id>, item:gh-<key>, item:kb-<n> or item:rc-<n>).", nameof(scope));
         }
         if (state == ControlState.Stopping && ControlScope.ItemOf(scope) is null)
         {

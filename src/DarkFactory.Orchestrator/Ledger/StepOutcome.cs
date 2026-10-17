@@ -110,6 +110,8 @@ public static class StepOutcomes
 
     private static StepOutcome OfCheckpoint(string step, string? detail) => step switch
     {
+        Recovery.RecoveryCorrections.RefusalStep => StepOutcome.GateRejected,
+        Recovery.RecoveryCorrections.StateStep when detail?.StartsWith("Stopped", StringComparison.Ordinal) == true => StepOutcome.Escalated,
         Recovery.HotFileAssessment.Step => Recovery.HotFileAssessment.FromDetail(detail)?.Decision switch
         {
             "safe" => StepOutcome.Passed,

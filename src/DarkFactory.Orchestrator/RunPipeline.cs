@@ -759,6 +759,7 @@ public sealed partial class RunPipeline(
         /// (sc-25872), or null for the repository's default branch (an item of no plan, and a plan item's own changeset).
         /// </summary>
         public string? BaseBranch { get; init; }
+        public string? RequiredBase { get; init; }
 
         /// <summary>A plan item's changeset (the item's branch is then the changeset branch); null for every other item.</summary>
         public Plans.Changeset? Changeset { get; init; }
@@ -998,6 +999,10 @@ public sealed partial class RunPipeline(
         }
         // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
+        if (await source.AuthorizeDispatchAsync(storyId, primary, ct) is { Claimed: false } refusal)
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, refusal.Refusal);
+        if (Naming == ItemNaming.Recovery && (recovery is null || !await recovery.AuthorizeCorrectionAsync(Naming.Format(storyId), primary.FullName, ct)))
+            return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, "Correction requires fresh incident-bound authorization.");
         if (known is null && await RepositoryControlAsync(Naming.Format(storyId), spec.Epic?.Id, primary.FullName, ct) != ControlState.Running)
         {
             // A repository hold is not a factory-wide Deferred: the next item in this lane may target another repository.
@@ -1045,6 +1050,7 @@ public sealed partial class RunPipeline(
             Primary = primary,
             Branch = changeset?.Branch ?? story.Kind.BranchName(story.Id),
             BaseBranch = ofPlan.Changeset?.Branch,
+            RequiredBase = await source.DeliveryBaseAsync(storyId, ct),
             Changeset = changeset,
         };
         // Fail closed: a plan with a changeset has none on origin for this repository (the story's `Repo:` line names another one),
@@ -1570,9 +1576,13 @@ public sealed partial class RunPipeline(
     /// On success it checkpoints <see cref="Steps.WorkerDone"/> and returns the session id.
     /// </summary>
     private async Task<string?> RunWorkerSessionAsync(Run run, Workspace workspace, string? session, Func<string?, string> prompt,
-        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct) =>
-        (await RunSessionAsync(run, worker, workspace.Path, null, implementing: true, session, prompt, models,
+        HashSet<string> models, IReadOnlyCollection<WorkerInput> inputs, string label, string modelClass, CancellationToken ct)
+    {
+        if (run.RequiredBase is { } required && workspace.BaseBranch != required)
+            throw new InvalidOperationException($"Correction worktree base {workspace.BaseBranch} is not its granted delivery base {required}.");
+        return (await RunSessionAsync(run, worker, workspace.Path, null, implementing: true, session, prompt, models,
             inputs.Select(Taint.Of).OfType<string>().ToList(), label, modelClass, ct)).Session;
+    }
 
     /// <summary>
     /// <see cref="RunWorkerSessionAsync"/> for any session of the item: <paramref name="runner"/> in <paramref name="path"/>, tainted from
@@ -1861,7 +1871,7 @@ public sealed partial class RunPipeline(
             if (!backgroundRecovery) await recovery.AdvanceAsync(repository, ct);
             if (await recovery.HeldAsync(repository, ct) is { } incident)
             {
-                held = true;
+                held = !await recovery.AuthorizeCorrectionAsync(externalId, repository, ct);
                 if (backgroundRecovery) recovery.Schedule(repository, log, ct);
                 log.WriteLine($"[recovery] repository {incident.Repo} held by hot-file recovery generation {incident.Generation} ({incident.State}): {incident.Error}");
             }
@@ -1876,6 +1886,14 @@ public sealed partial class RunPipeline(
         if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var state)
         {
             throw new ControlRequestedException(state);
+        }
+        if (Naming == ItemNaming.Recovery)
+        {
+            var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(item.ExternalId, item.Repo, ct);
+            // Evidence/policy acquisition awaits external reads. A human Stop during them wins even over a refused grant.
+            var current = await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct);
+            if (current != ControlState.Running) throw new ControlRequestedException(current);
+            if (!authorized) throw new ControlRequestedException(ControlState.Paused);
         }
     }
 

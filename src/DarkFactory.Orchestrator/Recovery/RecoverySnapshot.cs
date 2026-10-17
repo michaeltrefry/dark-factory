@@ -130,7 +130,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                 });
             }
             var known = await db.WorkItems.AsNoTracking().OrderBy(i => i.Id).ToListAsync(token);
-            var items = known.Where(i => Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
+            var items = known.Where(i => i.Source != ItemNaming.Recovery.Source && Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
             // Backlog/released children have no item row until intake sees them. A parent may currently be in another repo.
             var plans = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RunPipeline.Steps.PlanStories)
                 .OrderBy(e => e.Id).ToListAsync(token);
@@ -293,7 +293,8 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
             });
         }
         async Task<List<LedgerEntry>> Rows(long item, long? through = null) => await db.LedgerEntries.AsNoTracking()
-            .Where(e => e.WorkItemId == item && e.Step != RecoverySnapshot.Step && e.Step != HotFileAssessment.Step && (through == null || e.Id <= through))
+            // Acquisition/authorization bookkeeping is not a change to requirements or executed delivery evidence.
+            .Where(e => e.WorkItemId == item && (e.Step == null || !e.Step.StartsWith("recovery-")) && (through == null || e.Id <= through))
             .OrderBy(e => e.Id).ToListAsync(token);
     }
 

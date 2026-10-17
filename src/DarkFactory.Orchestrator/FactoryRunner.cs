@@ -282,7 +282,8 @@ public static class FactoryRunner
             async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c, GitHubGate.ReadPermissions)).Token, protectCloneLocks: true);
         return new Recovery.HotFileRecovery(Contexts(options), new PostgresRunLocks(options.LedgerConnectionString), options.Freeze,
             TimeProvider.System, new Recovery.RouterHotFileAssessor(new RouterReviewer(router, options.RouterKey), evidence.CaptureAsync,
-                new RouterClient(router, options.RouterKey), files, costSettleDelay: options.CostSettleDelay), [http, router, sources]);
+                new RouterClient(router, options.RouterKey), files, costSettleDelay: options.CostSettleDelay), [http, router, sources],
+            evidence.CaptureAsync, new GitHubGate(http, app).GetPolicyAsync);
     }
 
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>

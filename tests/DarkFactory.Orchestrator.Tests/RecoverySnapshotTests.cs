@@ -91,6 +91,60 @@ public sealed class RecoverySnapshotTests
             Repo = Repo, Title = id, State = state, EpicId = 9, Version = 1 };
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Materialized_plan_coordinator_keeps_production_evidence_authority(bool completed)
+    {
+        var f = new Fixture(); await f.Seed();
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var coordinator = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-1");
+            coordinator.PlanItemId = null;
+            coordinator.State = completed ? WorkState.Done : WorkState.Watch;
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-10")).State = WorkState.Done;
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-2")).PlanItemId = coordinator.Id;
+            db.Add(new LedgerEntry { WorkItemId = coordinator.Id, State = coordinator.State, Step = "plan",
+                Detail = "coordinator requirements", Outcome = StepOutcome.Passed, RecordedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        var material = await f.Evidence.CaptureAsync(f.Trigger, default);
+        var snapshot = RecoverySnapshot.FromDetail(material)!;
+        Assert.True(snapshot.Complete);
+        Assert.Contains(snapshot.Evidence, e => e.Category == "plan" && e.Content.Contains("coordinator requirements"));
+        var citation = snapshot.Evidence.First(e => e.Category == "merged").Id;
+        var finding = new RecoveryFinding("merged", true, "Fix defect", "Count once", ["Counts once"],
+            ["src/a.cs", "tests/CountTests.cs"], [citation], []);
+        var answer = new HotFileAssessment(f.Trigger.Id, 1, Repo, "high", "unsafe", f.Trigger.EvidenceHash)
+        {
+            Material = material, MaterialSnapshot = snapshot.Id, MaterialHash = RecoverySnapshot.Hash(material), Session = "fresh-assessment",
+            Citations = [citation], Findings = [finding], CorrectionFindings = [finding]
+        };
+        RecoveryCorrection correction;
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var incident = new HotFileIncident { Repo = Repo, Generation = 1, State = "Unsafe", Snapshot = JsonSerializer.Serialize(f.Trigger),
+                EvidenceHash = f.Trigger.EvidenceHash, Answer = JsonSerializer.Serialize(answer), Session = answer.Session };
+            db.Add(incident); await db.SaveChangesAsync();
+            correction = await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(TestPolicies.Standard()), DateTimeOffset.UtcNow, default);
+            await db.SaveChangesAsync();
+        }
+        Assert.Equal(material, await f.Evidence.CaptureAsync(f.Trigger, default));
+        await using var recovery = new HotFileRecovery(f.Contexts, new InProcessRunLocks(), new(), TimeProvider.System,
+            new HotFileRecoveryTests.Assessor(), capture: f.Evidence.CaptureAsync,
+            policy: (_, _, _) => Task.FromResult<string?>(TestPolicies.Standard()));
+        Assert.True(await recovery.AuthorizeCorrectionAsync($"rc-{correction.Id}", Repo, default));
+        // A genuine requirement change remains semantic evidence and revokes the same grant.
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            (await db.LedgerEntries.SingleAsync(e => e.WorkItemId == f.Trigger.Merges[0].Item && e.Step == "plan")).Detail = "changed requirements";
+            await db.SaveChangesAsync();
+        }
+        Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{correction.Id}", Repo, default));
+        await using var read = f.Contexts.CreateDbContext();
+        Assert.Equal("Revoked", Assert.Single(read.RecoveryCorrections).State);
+    }
+
     [Fact]
     public async Task Snapshot_pins_requirements_plan_diffs_executed_results_heads_and_hashes_and_is_durable_before_review()
     {
