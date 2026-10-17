@@ -12,7 +12,8 @@ namespace DarkFactory.Orchestrator.Recovery;
 /// can be read whole. The assessor's own limits (<see cref="MaxSessionChars"/>, <see cref="MaxToolCalls"/>, <see cref="MaxTurns"/>)
 /// are explicit and apart from the reviewer panel's, which are unchanged.
 /// </summary>
-internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReviewFiles? files, int promptChars)
+internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReviewFiles? files, int promptChars, int promptTokens,
+    EvidencePages? pages = null)
 {
     /// <summary>
     /// The UTF-8 bytes of an entry's content one page carries: with its header (a few hundred bytes) a page stays well under the
@@ -22,33 +23,89 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
 
     /// <summary>
     /// The characters of tool results one assessment session may receive, its request (the index) included. Every turn resends
-    /// the whole conversation, so this is what the model must hold in its context at the end: 400,000 characters is about
-    /// 100,000–130,000 tokens of diff and code, which with the prompt and an 8,192-token answer fits the high class's smallest
-    /// context (200,000 tokens) with room to spare. Twice the panel's 200,000 (<see cref="ReviewTools.MaxSessionChars"/>): a
-    /// reviewer reads one diff, the assessor every merged diff of an incident. It does NOT reach the snapshot's 2 MiB bound: no
-    /// one conversation can hold 2 MiB (about 500,000+ tokens) — an incident whose required reads do not fit is refused up
+    /// the whole conversation, so this is what the model must hold in its context at the end: 400,000 characters of code and
+    /// diff (about 3–4 characters a token) is about 100,000–130,000 tokens, which with the prompt and an 8,192-token answer fits
+    /// the high class's smallest context (200,000 tokens). Characters are not tokens, so the session is also bounded by
+    /// <see cref="MaxSessionTokens"/> (dense or non-Latin text). Twice the panel's 200,000 (<see cref="ReviewTools.MaxSessionChars"/>):
+    /// a reviewer reads one diff, the assessor every merged diff of an incident. It does NOT reach the snapshot's 2 MiB bound:
+    /// no one conversation can hold 2 MiB (about 500,000+ tokens) — an incident whose required reads do not fit is refused up
     /// front (<see cref="RouterHotFileAssessor.Unreadable"/>) rather than spending a session it could never finish.
     /// </summary>
     public const int MaxSessionChars = 400_000;
 
     /// <summary>
-    /// Tool calls in one assessment session (the panel's is 24): one call per page, so the whole session budget in full pages
-    /// (8) plus one first page of each of the snapshot's up to 50 contributing merges' diffs, and some pending reads and
-    /// <c>read_file</c>s besides. Calls past it answer an error and run nothing.
+    /// The estimated tokens (<see cref="EstimatedTokens"/>) of tool results one assessment session may receive, its request and
+    /// prompt deducted: the high class's smallest context (200,000 tokens) less the 8,192-token answer and room for the model's
+    /// own turns. For ASCII code it binds about where <see cref="MaxSessionChars"/> does; for non-Latin text (about one token a
+    /// character) it binds first, so a session is not sent past the router's context and refused (400/413) in a late turn.
     /// </summary>
-    public const int MaxToolCalls = 64;
+    public const int MaxSessionTokens = 140_000;
 
     /// <summary>
-    /// Model turns with tools in one assessment session (the panel's is 8); then one final-answer turn. A model may ask for
-    /// several pages in one turn, so 12 turns reach <see cref="MaxToolCalls"/> at about 6 calls a turn. The turns stay bounded
-    /// in time by the router client's timeout (<c>Review:TimeoutMinutes</c>) and the incident's stage timeout.
+    /// Tool calls in one assessment session (the panel's is 24): one call per page. The merged diffs alone may take all but
+    /// <see cref="ReservedCalls"/> of them (60: a first page of each of the snapshot's up to 50 contributing merges' diffs, or
+    /// the diff budget in full pages, with room); the reserve is for the other reads a safe answer needs (requirements, executed
+    /// results, pending work, <c>read_file</c>). Calls past it answer an error and run nothing.
+    /// </summary>
+    public const int MaxToolCalls = 80;
+
+    /// <summary>
+    /// Model turns in one assessment session that may call tools; the last of them answers its calls "not run" (the turn cap),
+    /// so tools run in <see cref="ToolTurns"/> turns; then one final-answer turn. A model may ask for several pages in one turn,
+    /// so 11 turns reach <see cref="MaxToolCalls"/> at about 7 calls a turn.
     /// </summary>
     public const int MaxTurns = 12;
+
+    /// <summary>The turns in which tool calls actually run (<see cref="MaxTurns"/> less the turn cap's), as the request states.</summary>
+    public const int ToolTurns = MaxTurns - 1;
+
+    /// <summary>
+    /// What the up-front check (<see cref="RouterHotFileAssessor.Unreadable"/>) keeps free of the merged diffs for the other reads a
+    /// safe answer needs (requirements, executed results, pending work, <c>read_file</c> of code): a quarter of the character and
+    /// token budgets and of the calls. Merged diffs that leave less are refused before any session, since a session that reads
+    /// them all could still not read what it must cite.
+    /// </summary>
+    public const int ReservedChars = MaxSessionChars / 4;
+
+    /// <inheritdoc cref="ReservedChars"/>
+    public const int ReservedTokens = MaxSessionTokens / 4;
+
+    /// <inheritdoc cref="ReservedChars"/>
+    public const int ReservedCalls = MaxToolCalls / 4;
+
+    /// <summary>
+    /// How long one assessment conversation may take in all (sc-26444), apart from the panel's <c>Review:TimeoutMinutes</c>
+    /// (10 min), which bounds each of its turns instead (with the stream's idle bound, 2 min): a live conversation goes on turn
+    /// after turn while any one stalled turn fails. 13 turns (12 with tools and the final answer), each resending up to about
+    /// 140,000 tokens, at about 2.3 minutes a turn. <see cref="HotFileRecovery.StageTimeout"/> is sized from it.
+    /// </summary>
+    public static readonly TimeSpan ConversationTimeout = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// A rough, deliberately high token estimate of <paramref name="text"/>: an ASCII character a third of a token (code and
+    /// English run 3–4 characters a token), any other character (a surrogate pair once) a whole token (CJK and other dense
+    /// scripts run about one a character).
+    /// </summary>
+    public static int EstimatedTokens(string text)
+    {
+        var (ascii, other) = (0, 0);
+        foreach (var c in text)
+        {
+            if (c < 0x80) ascii++;
+            else if (!char.IsLowSurrogate(c)) other++;
+        }
+        return (ascii + 2) / 3 + other;
+    }
 
     /// <summary>The session's tool-result budget given the request's size, at least the panel's floor.</summary>
     public static int Budget(int promptChars) => Math.Max(ReviewTools.MinSessionBudget, MaxSessionChars - promptChars);
 
+    /// <summary>The session's tool-result token budget given the request's estimated tokens, at least the panel's floor's.</summary>
+    public static int TokenBudget(int promptTokens) => Math.Max(ReviewTools.MinSessionBudget / 3, MaxSessionTokens - promptTokens);
+
+    private readonly EvidencePages _pages = pages ?? new EvidencePages();
     private int _remaining = Budget(promptChars);
+    private int _remainingTokens = TokenBudget(promptTokens);
     private readonly HashSet<string> _commits = snapshot.BaseTips.Values.Concat(snapshot.Evidence.SelectMany(e => new[] { e.Commit, e.BaseCommit }).OfType<string>())
         .Where(c => c.Length == 40 && c.All(Uri.IsHexDigit)).ToHashSet(StringComparer.Ordinal);
 
@@ -62,7 +119,7 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
     internal IReadOnlySet<string> FullyRead => _fullyRead;
 
     internal AssessmentToolBindings Bindings => new(snapshot.Repo, files is null ? [EvidenceDefinition] : [ReadDefinition, EvidenceDefinition], RunAsync,
-        MaxTurns, MaxToolCalls);
+        MaxTurns, MaxToolCalls, ConversationTimeout);
 
     /// <summary>
     /// The pages of one entry, exactly as <c>read_evidence</c> serves them: its content cut into runs of at most
@@ -140,11 +197,11 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
                         throw new InvalidOperationException("page must be a whole number from 1.");
                     var evidence = snapshot.Evidence.SingleOrDefault(e => e.Id == id)
                         ?? throw new InvalidOperationException("Evidence is not in this snapshot.");
-                    var pages = Pages(evidence);
-                    if (page > pages.Count) throw new InvalidOperationException($"Evidence {evidence.Id} has {pages.Count} page(s); there is no page {page}.");
+                    var entryPages = _pages.Of(evidence);
+                    if (page > entryPages.Count) throw new InvalidOperationException($"Evidence {evidence.Id} has {entryPages.Count} page(s); there is no page {page}.");
                     commit = evidence.Commit;
-                    raw = pages[page - 1];
-                    read = (evidence.Id, page, pages.Count);
+                    raw = entryPages[page - 1];
+                    read = (evidence.Id, page, entryPages.Count);
                     break;
                 default: throw new InvalidOperationException("Tool is not on the recovery read-only allowlist.");
             }
@@ -155,7 +212,14 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
             error = true;
         }
         var shown = ReviewTools.Bounded(raw, Math.Max(0, _remaining));
+        if (EstimatedTokens(shown) > _remainingTokens)
+        {
+            // Characters are not tokens: dense text that would carry the conversation past the context is not sent at all.
+            (shown, error) = ($"Assessment token budget exhausted: this result is about {EstimatedTokens(shown)} tokens, "
+                + $"{Math.Max(0, _remainingTokens)} left.", true);
+        }
         _remaining -= shown.Length;
+        _remainingTokens -= EstimatedTokens(shown);
         if (!error && use.Name == "read_evidence" && shown == raw && read is { } served)
         {
             var seen = _pagesRead.TryGetValue(served.Id, out var known) ? known : _pagesRead[served.Id] = [];
@@ -164,5 +228,23 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
         }
         return new(shown, error, new(use.Name ?? "", (use.InputJson ?? "")[..Math.Min(use.InputJson?.Length ?? 0, 2000)],
             RecoverySnapshot.Hash(raw), error, commit, Bytes: Encoding.UTF8.GetByteCount(raw)));
+    }
+}
+
+/// <summary>
+/// Each evidence entry's pages (<see cref="RecoveryAssessmentTools.Pages"/>), cut once per assessment and shared by the index, the
+/// up-front check and every <c>read_evidence</c> of the session, rather than re-paging an entry of up to 2 MiB on every call.
+/// </summary>
+internal sealed class EvidencePages
+{
+    private readonly Dictionary<RecoveryEvidence, IReadOnlyList<string>> _pages = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>How many entries were paged (tests).</summary>
+    internal int Paged => _pages.Count;
+
+    public IReadOnlyList<string> Of(RecoveryEvidence evidence)
+    {
+        if (!_pages.TryGetValue(evidence, out var pages)) _pages[evidence] = pages = RecoveryAssessmentTools.Pages(evidence);
+        return pages;
     }
 }
