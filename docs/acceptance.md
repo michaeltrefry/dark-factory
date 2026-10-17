@@ -1412,7 +1412,7 @@ in `RecoveryAcceptanceTests`; the per-story tests prove each stage on its own.
 | AT5 authorisation negatives | `RecoveryAssessmentTests` (wrong class, malformed, bounds, tool surface), `HotFileRecoveryTests.Assessment_parser_refuses_…`, `RecoveryWorkSourceTests` (wrong binding, sealed/protected/escaping envelope, unbounded repair, stale evidence or policy, ordinary work and another incident), `RecoveryCorrectionPipelineTests` (wrong base/tip/diff, outside the envelope, another incident, moved head, high-class review and CI, vacuous test, taint) | a negative fixture per predicate, proven by mutation | `AT5_each_grant_predicate_alone_refuses_the_correction`, `AT5_each_assessment_binding_alone_refuses_a_correction`, `AT5_the_correction_envelope_is_at_most_twenty_explicit_paths`; mutation table below |
 | AT6 durability | `RecoveryPostgresTests` (racing drivers and a lost PR-creation answer, uncertain PR reconciliation, budgets across restarts, 30/120 s retries then escalation, the refresh cap across drivers, stale CAS, usage/shutdown spend nothing, a real child-process crash at a checkpoint, reserved attempts, the legacy freeze on upgrade), `RecoveryCorrectionCrashTests`, `HotFileRecoveryTests.Postgres_restart_…`, `RecoveryWorkSourceTests.Postgres_retains_grant_…` | none found | — |
 | AT7 evidence and reports | `RecoverySnapshotTests` (pinning, hashes, missing inputs explicit, a changed spec/tip/head invalidates), `RecoveryAssessmentTests` (pinned tools, the final freshness read after cost, lagging/zero/unknown cost, session and tool provenance), `HotFileRecoveryTests.Production_router_assessor_uses_fresh_high_sessions_…`, `RecoveryReassessmentTests.Post_delivery_uses_…` | dashboard and CLI status equal to the ledger over a real recovery | S9's `RecoveryDashboardTests` (PR #136: repo A separate from B, a safe-but-paused incident keeps its Pause, an exhausted correction names its blocker and remedy, a correction link outside its repository is never clickable, legacy freeze named, reports inert, a stage race reported as an observation, Postgres schema, idle refresh); and every integrated test here checks S9's projection (`RecoveryStatusReader`, rendered by `LedgerReport.RecoveryStatus` for the dashboard and `factory recovery status`) against the ledger at each stage — state, generation, `assessment n/3, correction n/2, refresh n/3`, each correction's id, attempt, state and repo-scoped PR, held items, the fresh assessment session, no raw model fence (`AssertStatusEqualsLedgerAsync`) |
-| AT8 terminal | build, unit tests, Postgres tests and gateway lint in CI | the two controlled sandbox runs; the feature-end review; integration with main; tracker readback | `tests/DarkFactory.AcceptanceTests/HotFileRecoveryAcceptanceTests.cs` (live, below) and `HotFileLiveTests` (not live: its pass/fail rules). Open: the live runs (not run yet), the review, integration and readback |
+| AT8 terminal | build, unit tests, Postgres tests and gateway lint in CI | the two controlled sandbox runs; the feature-end review; integration with main; tracker readback | `tests/DarkFactory.AcceptanceTests/HotFileRecoveryAcceptanceTests.cs` (live, below) and `HotFileLiveTests` (not live: its pass/fail rules). Both live runs PASSED on 2026-10-17 ("AT8 live evidence" below); integration with main is the feature→main pull request |
 
 ### Authorisation mutations (AT5)
 
@@ -1488,6 +1488,20 @@ FACTORY_E2E=1 FACTORY_E2E_WATCH_EPIC=<defect epic> FACTORY_E2E_HOTFILE_REPO=<own
   FACTORY_E2E_HOTFILE_DEFECT_STORIES=sc-<d1>,sc-<d2> \
   dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*AT8_merged_defect*" --report-xunit-xml
 ```
+
+Pitfall: put `--results-directory` (and every other test-platform option) BEFORE `--`, or leave it out; given after `--`
+it is passed on to the test application and breaks the `dotnet test` run. The report then goes to the test project's default
+`TestResults/` directory.
+
+### AT8 live evidence (2026-10-17)
+
+Both runs passed against `michaeltrefry/dark-factory-sandbox`. Each used a throwaway ledger that was dropped afterwards, so
+what survives as evidence is the two xunit result files (`--report-xunit-xml`) and the sandbox pull requests listed here.
+
+| Case | Duration | Evidence |
+| --- | --- | --- |
+| Safe | 5 min 51 s | sandbox PRs #91 (merged as `e7118027`) and #92 (merged as `a052f5da`) changed the same file; one incident opened and was Resolved after one fresh high-class assessment answered safe; no correction; no global freeze row |
+| Merged defect | 13 min 54 s | d1 merged as PR #93 (`f380e8e7`); d2 merged as PR #94 (`43a8617a`) and opened incident generation 1; the first assessment was unsafe; correction `rc-1` merged through the gate as PR #95 (`d41790c9`) with 3 new tests that fail on the base; a fresh high-class reassessment answered safe and the incident was Resolved; no global freeze row |
 
 Bounds: the safe case waits up to 2 h and the defect case 4 h for the incident to end (Resolved or Escalated). Cost: four
 real implementer sessions (five with the correction), their panels, and two to four high-class assessments. They leave merged
