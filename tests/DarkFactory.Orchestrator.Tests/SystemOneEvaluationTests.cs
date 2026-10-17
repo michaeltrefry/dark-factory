@@ -396,6 +396,149 @@ public class SystemOneEvaluationTests
             (observation.ClassifierStatus, observation.ClassifierRequestedModelSha, observation.ClassifierModelSha));
     }
 
+    private static string NewCancellationArtifactDirectory()
+    {
+        // macOS /var is a symlink: exercise the same canonical external-artifact rule as live callers.
+        var root = OperatingSystem.IsMacOS() ? "/private/tmp" : Path.GetTempPath();
+        return Directory.CreateDirectory(Path.Combine(root, "df-evaluation-cancel-" + Guid.NewGuid().ToString("N"))).FullName;
+    }
+
+    [Theory]
+    [InlineData("file")]
+    [InlineData("caller")]
+    public async Task Evaluation_cancel_interrupts_running_arm_and_drains_cleanup(string trigger)
+    {
+        var directory = NewCancellationArtifactDirectory();
+        var output = Path.Combine(directory, "evidence.json");
+        using var caller = new CancellationTokenSource();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowCleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleaned = false;
+        var tornDown = false;
+        var calls = 0;
+        var campaign = SystemOneEvaluation.RunToFileAsync(CorpusPath, output, _ => new DelegateEvaluationArm(async (input, mode, ct) =>
+        {
+            if (++calls == 1) { return Sample(input, mode); }
+            try
+            {
+                try { started.SetResult(); await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+                finally
+                {
+                    cleanupEntered.SetResult();
+                    await allowCleanup.Task;
+                    cleaned = true; // Fake sandbox finally: no helper, probe or process signal.
+                }
+            }
+            finally { tornDown = cleaned; } // Fake ledger/lock teardown follows runner cleanup.
+            return Sample(input, mode);
+        }), caller.Token, output + ".cancel");
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            if (trigger == "file") { File.WriteAllText(output + ".cancel", "body is never read"); }
+            else { caller.Cancel(); }
+            await cleanupEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.False(campaign.IsCompleted);
+            Assert.False(tornDown);
+            allowCleanup.SetResult();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => campaign.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.True(cleaned);
+            Assert.True(tornDown);
+            Assert.Equal(2, calls);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(File.ReadAllText(output))!;
+            Assert.Equal(("incomplete", 1, (EvaluationReport?)null), (evidence.Status, evidence.Observations.Count, evidence.Summary));
+        }
+        finally
+        {
+            caller.Cancel(); allowCleanup.TrySetResult();
+            try { await campaign; } catch (OperationCanceledException) { }
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Evaluation_preexisting_cancel_preserves_initial_evidence_before_client_construction(bool file)
+    {
+        var directory = NewCancellationArtifactDirectory();
+        var output = Path.Combine(directory, "evidence.json");
+        using var caller = new CancellationTokenSource();
+        var constructed = false;
+        try
+        {
+            if (file) { File.WriteAllText(output + ".cancel", ""); } else { caller.Cancel(); }
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); }, caller.Token, output + ".cancel"));
+            Assert.False(constructed);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(File.ReadAllText(output))!;
+            Assert.Equal(("incomplete", 0, 30, (EvaluationReport?)null),
+                (evidence.Status, evidence.Observations.Count, evidence.ExpectedArms, evidence.Summary));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(30)]
+    public async Task Evaluation_cancel_at_arm_boundary_never_starts_another_arm_or_completes_campaign(int stopAfter)
+    {
+        var directory = NewCancellationArtifactDirectory();
+        var output = Path.Combine(directory, "evidence.json");
+        var calls = 0;
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => new DelegateEvaluationArm((input, mode, _) =>
+                {
+                    if (++calls == stopAfter) { File.WriteAllText(output + ".cancel", ""); }
+                    return Task.FromResult(Sample(input, mode));
+                }), CancellationToken.None, output + ".cancel"));
+            Assert.Equal(stopAfter, calls);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(File.ReadAllText(output))!;
+            Assert.Equal(("incomplete", stopAfter, (EvaluationReport?)null), (evidence.Status, evidence.Observations.Count, evidence.Summary));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_cancel_watch_finishes_normally_before_artifact_teardown()
+    {
+        var directory = NewCancellationArtifactDirectory();
+        var output = Path.Combine(directory, "evidence.json");
+        try
+        {
+            await SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => new DelegateEvaluationArm((input, mode, _) => Task.FromResult(Sample(input, mode))), CancellationToken.None, output + ".cancel");
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(File.ReadAllText(output))!;
+            Assert.Equal(("complete", 30, 15), (evidence.Status, evidence.Observations.Count, evidence.Summary?.Pairs.Count));
+            File.WriteAllText(output + ".cancel", "");
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_cancel_file_is_scoped_to_its_own_external_artifact()
+    {
+        var directory = NewCancellationArtifactDirectory();
+        try
+        {
+            var output = Path.Combine(directory, "evidence.json");
+            foreach (var flag in new[] { Path.Combine(directory, "shared.cancel"), Path.Combine(CorpusPath, "stop") })
+            {
+                await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                    _ => throw new Exception("must not construct clients"), CancellationToken.None, flag));
+                Assert.False(File.Exists(output));
+            }
+            Directory.CreateDirectory(Path.Combine(directory, ".git"));
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => throw new Exception("must not construct clients"), CancellationToken.None, output + ".cancel"));
+            Assert.False(File.Exists(output));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
     private sealed class RouterOnlySecrets : ISecretStore
     {
         public string? Get(string account) => account == SecretAccounts.RouterKey ? "synthetic-key" : throw new InvalidOperationException("Unrelated credential read: " + account);
@@ -411,6 +554,18 @@ public class SystemOneEvaluationTests
     }
     private static FactoryOptions EvaluationOptions(string runAs = "_factory") =>
         new(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Worker:RunAs"] = runAs }).Build(), new RouterOnlySecrets(), _ => null);
+
+    [Fact]
+    public async Task Evaluation_setup_cancellation_unwinds_fake_probe_and_releases_lock()
+    {
+        using var cancel = new CancellationTokenSource();
+        var trace = new List<string>();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EvaluationSetup.StartAsync(EvaluationOptions(),
+            () => { trace.Add("locked"); return new FakeHeldLock(trace); },
+            async _ => { trace.Add("fake-probe"); cancel.Cancel(); await Task.Delay(Timeout.InfiniteTimeSpan, cancel.Token); },
+            held => Task.FromResult(new FakeIsolated(held)), cancel.Token));
+        Assert.Equal(new[] { "locked", "fake-probe", "released" }, trace);
+    }
 
     [Fact]
     public async Task Evaluation_setup_needs_no_App_credentials_and_holds_locks_for_isolated_ledger_and_sandbox_probe()

@@ -144,18 +144,20 @@ public sealed record EvaluationCampaign(string Status, string CorpusIdentity, st
 public static class SystemOneEvaluation
 {
     public static async Task<EvaluationReport> RunAsync(string root, Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct,
-        Func<IReadOnlyList<EvaluationObservation>, EvaluationReport?, Task>? checkpoint = null)
+        Func<IReadOnlyList<EvaluationObservation>, EvaluationReport?, Task>? checkpoint = null, Action? checkCancellation = null)
     {
         var corpus = EvaluationCorpus.Load(root); // MUST precede client construction or any classifier/worker output.
         var observations = new List<EvaluationObservation>();
         // Even a setup failure or skip leaves a nonempty, explicitly incomplete evidence file.
         if (checkpoint is not null) { await checkpoint(observations, null); }
+        CheckCancellation();
         var runner = createRunner(corpus);
+        void CheckCancellation() { checkCancellation?.Invoke(); ct.ThrowIfCancellationRequested(); }
         for (var i = 0; i < corpus.Reports.Count; i++)
         {
             foreach (var mode in i % 2 == 0 ? new[] { "disabled", "advisory" } : new[] { "advisory", "disabled" })
             {
-                ct.ThrowIfCancellationRequested();
+                CheckCancellation();
                 await runner.RunAsync(corpus.Reports[i], mode, async observation =>
                 {
                     observations.Add(observation);
@@ -164,21 +166,24 @@ public static class SystemOneEvaluation
                 }, ct);
             }
         }
+        CheckCancellation();
         var report = EvaluationReport.Create(corpus, observations);
         if (checkpoint is not null) { await checkpoint(observations, report); }
         return report;
     }
 
     public static async Task<EvaluationReport> RunToFileAsync(string root, string output,
-        Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct)
+        Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct, string? cancelFile = null)
     {
         var corpus = EvaluationCorpus.Load(root);
         output = Path.GetFullPath(output);
         if (output == Path.GetFullPath(root) || output.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
         { throw new InvalidDataException("Evidence must be outside the frozen corpus."); }
+        EvaluationCancellation.Validate(output, cancelFile);
+        await using var cancellation = new EvaluationCancellation(cancelFile, ct);
         // Reserve once, never overwrite an earlier campaign. Checkpoints replace it atomically in the same directory.
         using (new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
-        return await RunAsync(root, createRunner, ct, (observations, summary) =>
+        return await RunAsync(root, createRunner, cancellation.Token, (observations, summary) =>
         {
             var evidence = new EvaluationCampaign(summary is null ? "incomplete" : "complete", corpus.Identity,
                 EvaluationCorpus.AuthorCommit, corpus.Reports.Count * 2, observations, summary);
@@ -194,7 +199,66 @@ public static class SystemOneEvaluation
             }
             finally { if (File.Exists(temporary)) { File.Delete(temporary); } }
             return Task.CompletedTask;
-        });
+        }, cancellation.ThrowIfCancellationRequested);
+    }
+}
+
+// Evaluation-only, one explicitly named flag per evidence file; never reads its contents or signals a process.
+internal sealed class EvaluationCancellation : IAsyncDisposable
+{
+    private readonly string? file;
+    private readonly CancellationTokenSource linked;
+    private readonly CancellationTokenSource stop = new();
+    private readonly Task watcher;
+    public CancellationToken Token => linked.Token;
+
+    public EvaluationCancellation(string? file, CancellationToken caller)
+    {
+        this.file = file is null ? null : Path.GetFullPath(file);
+        linked = CancellationTokenSource.CreateLinkedTokenSource(caller);
+        watcher = file is null ? Task.CompletedTask : WatchAsync();
+    }
+
+    public static void Validate(string output, string? file)
+    {
+        if (file is null) { return; } // No global/default flag; existing campaigns are unaffected.
+        if (!Path.IsPathFullyQualified(file) || Path.GetFullPath(file) != output + ".cancel")
+        { throw new InvalidDataException("Cancellation file must be the absolute evidence path plus .cancel."); }
+        // Neither artifacts nor the flag may be in a repository/worker context, or reached through a symlink.
+        for (var directory = new DirectoryInfo(Path.GetDirectoryName(output)!); directory is not null; directory = directory.Parent)
+        {
+            if (directory.LinkTarget is not null || File.Exists(Path.Combine(directory.FullName, ".git"))
+                || Directory.Exists(Path.Combine(directory.FullName, ".git")))
+            { throw new InvalidDataException("Cancellation artifacts must be outside repositories and symlinked directories."); }
+        }
+    }
+
+    private void Refresh()
+    {
+        // Existence only: a directory or dangling symlink at the flag also stops safely.
+        if (file is not null && (Path.Exists(file) || new FileInfo(file).LinkTarget is not null)) { linked.Cancel(); }
+    }
+
+    public void ThrowIfCancellationRequested() { Refresh(); Token.ThrowIfCancellationRequested(); }
+
+    private async Task WatchAsync()
+    {
+        try
+        {
+            while (!Token.IsCancellationRequested)
+            {
+                Refresh();
+                await Task.Delay(TimeSpan.FromMilliseconds(100), stop.Token);
+            }
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        stop.Cancel();
+        try { await watcher; }
+        finally { stop.Dispose(); linked.Dispose(); }
     }
 }
 
@@ -203,8 +267,9 @@ public static class SystemOneEvaluation
 public static class EvaluationSetup
 {
     public static async Task<T> StartAsync<T>(FactoryOptions options, Func<IDisposable> acquireLocks,
-        Func<T, Task> sandboxProbe, Func<IDisposable, Task<T>> createIsolatedLedger) where T : IAsyncDisposable
+        Func<T, Task> sandboxProbe, Func<IDisposable, Task<T>> createIsolatedLedger, CancellationToken ct = default) where T : IAsyncDisposable
     {
+        ct.ThrowIfCancellationRequested();
         if (options.WorkerSandbox is null)
         { throw new InvalidOperationException("The evaluation requires the actual worker sandbox."); }
         _ = options.RouterKey;
@@ -214,7 +279,9 @@ public static class EvaluationSetup
         catch { held.Dispose(); throw; }
         try
         {
+            ct.ThrowIfCancellationRequested();
             await sandboxProbe(ledger);
+            ct.ThrowIfCancellationRequested();
             return ledger;
         }
         catch { await ledger.DisposeAsync(); throw; }
