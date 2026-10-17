@@ -304,7 +304,7 @@ public class SystemOneEvaluationTests
     [Fact]
     public async Task Completed_arm_is_durable_even_when_its_ledger_teardown_fails()
     {
-        var directory = Directory.CreateTempSubdirectory("df-evaluation-teardown-").FullName;
+        var directory = NewCancellationArtifactDirectory(); // Not CreateTempSubdirectory: macOS /var is a symlinked ancestor, which the artifact guard refuses.
         var output = Path.Combine(directory, "evidence.json");
         try
         {
@@ -327,7 +327,7 @@ public class SystemOneEvaluationTests
     [InlineData(4, "database")]
     public async Task Every_completed_arm_survives_campaign_interruption_with_an_explicit_incomplete_report(int completed, string failure)
     {
-        var directory = Directory.CreateTempSubdirectory("df-evaluation-interrupt-").FullName;
+        var directory = NewCancellationArtifactDirectory(); // Not CreateTempSubdirectory: macOS /var is a symlinked ancestor, which the artifact guard refuses.
         var output = Path.Combine(directory, "evidence.json");
         using var cancel = new CancellationTokenSource();
         var count = 0;
@@ -357,7 +357,7 @@ public class SystemOneEvaluationTests
     [Fact]
     public async Task Final_checkpoint_contains_complete_paired_summary_and_cannot_overwrite_earlier_evidence()
     {
-        var directory = Directory.CreateTempSubdirectory("df-evaluation-complete-").FullName;
+        var directory = NewCancellationArtifactDirectory(); // Not CreateTempSubdirectory: macOS /var is a symlinked ancestor, which the artifact guard refuses.
         var output = Path.Combine(directory, "evidence.json");
         try
         {
@@ -625,6 +625,138 @@ public class SystemOneEvaluationTests
                 CancellationToken.None, output + ".cancel", Path.Combine(owner, "worker-root")));
             Assert.False(constructed);
             Assert.False(File.Exists(Path.Combine(artifacts, "evidence.json")));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    // No cancellation flag: the artifact-location rules still run (they are not flag configuration).
+    [Theory]
+    [InlineData("worker-root")]
+    [InlineData("worker-root/e2e/isolated/synthetic-snapshot")]
+    [InlineData("scoring")]
+    [InlineData(".git")]
+    [InlineData(".git/worktrees/session")]
+    public async Task Evaluation_null_cancellation_flag_still_refuses_protected_artifact_locations_before_clients(string location)
+    {
+        var owner = NewCancellationArtifactDirectory();
+        var constructed = false;
+        try
+        {
+            var corpus = Path.Combine(owner, "scoring");
+            foreach (var file in Directory.GetFiles(CorpusPath, "*", SearchOption.AllDirectories))
+            {
+                var copy = Path.Combine(corpus, Path.GetRelativePath(CorpusPath, file));
+                Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
+                File.Copy(file, copy);
+            }
+            var artifacts = Directory.CreateDirectory(Path.Combine(owner, location)).FullName;
+            var output = Path.Combine(artifacts, "evidence.json");
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(corpus, output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); },
+                CancellationToken.None, cancelFile: null, Path.Combine(owner, "worker-root")));
+            Assert.False(constructed);
+            Assert.False(File.Exists(output));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_without_cancellation_flag_never_watches_the_cancel_path()
+    {
+        var directory = NewCancellationArtifactDirectory();
+        var output = Path.Combine(directory, "evidence.json");
+        using var caller = new CancellationTokenSource();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var campaign = SystemOneEvaluation.RunToFileAsync(CorpusPath, output, _ => new DelegateEvaluationArm(async (input, mode, ct) =>
+        {
+            if (++calls == 1) { return Sample(input, mode); }
+            started.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return Sample(input, mode);
+        }), caller.Token, cancelFile: null, Path.Combine(directory, "worker-root"));
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            File.WriteAllText(output + ".cancel", "would cancel a watched campaign");
+            await Task.Delay(TimeSpan.FromMilliseconds(500)); // A wrong watcher polls every 100ms.
+            Assert.False(campaign.IsCompleted);
+            caller.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => campaign.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Equal(2, calls);
+        }
+        finally
+        {
+            caller.Cancel();
+            try { await campaign; } catch (OperationCanceledException) { }
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task Evaluation_null_cancellation_flag_still_refuses_corpus_alias_output_before_clients()
+    {
+        var owner = NewCancellationArtifactDirectory();
+        var constructed = false;
+        try
+        {
+            var corpus = Path.Combine(owner, "scoring");
+            foreach (var file in Directory.GetFiles(CorpusPath, "*", SearchOption.AllDirectories))
+            {
+                var copy = Path.Combine(corpus, Path.GetRelativePath(CorpusPath, file));
+                Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
+                File.Copy(file, copy);
+            }
+            // The corpus reached through a symlinked ancestor: RunToFileAsync's lexical root check
+            // compares the alias spelling against the physical output path and cannot see it.
+            var alias = Path.Combine(owner, "scoring-link");
+            Directory.CreateSymbolicLink(alias, owner);
+            var output = Path.Combine(corpus, "evidence.json");
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(Path.Combine(alias, "scoring"), output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); },
+                CancellationToken.None, cancelFile: null, Path.Combine(owner, "worker-root")));
+            Assert.False(constructed);
+            Assert.False(File.Exists(output));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_null_cancellation_flag_still_refuses_symlinked_artifact_ancestor_before_clients()
+    {
+        var owner = NewCancellationArtifactDirectory();
+        var constructed = false;
+        try
+        {
+            var artifacts = Directory.CreateDirectory(Path.Combine(owner, "artifacts")).FullName;
+            var link = Path.Combine(owner, "linked-artifacts");
+            Directory.CreateSymbolicLink(link, artifacts);
+            var output = Path.Combine(link, "evidence.json");
+            await Assert.ThrowsAsync<InvalidDataException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => { constructed = true; throw new Exception("must not construct clients"); },
+                CancellationToken.None, cancelFile: null, Path.Combine(owner, "worker-root")));
+            Assert.False(constructed);
+            Assert.False(File.Exists(Path.Combine(artifacts, "evidence.json")));
+        }
+        finally { Directory.Delete(owner, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_null_cancellation_flag_still_completes_owner_session_artifact_campaign()
+    {
+        var owner = NewCancellationArtifactDirectory();
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(owner, ".git"));
+            var artifacts = Directory.CreateDirectory(Path.Combine(owner, ".claude", "session", "artifacts")).FullName;
+            var output = Path.Combine(artifacts, "evidence.json");
+            var workers = Path.Combine(owner, "worker-root");
+            await SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => new DelegateEvaluationArm((input, mode, _) => Task.FromResult(Sample(input, mode))),
+                CancellationToken.None, cancelFile: null, workers);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(await File.ReadAllTextAsync(output))!;
+            Assert.Equal(("complete", 30, 15), (evidence.Status, evidence.Observations.Count, evidence.Summary?.Pairs.Count));
+            Assert.False(File.Exists(output + ".cancel")); // No flag, no watcher, no flag file created.
         }
         finally { Directory.Delete(owner, true); }
     }

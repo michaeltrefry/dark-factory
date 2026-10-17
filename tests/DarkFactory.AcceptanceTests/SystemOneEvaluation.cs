@@ -179,7 +179,10 @@ public static class SystemOneEvaluation
         output = Path.GetFullPath(output);
         if (output == Path.GetFullPath(root) || output.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
         { throw new InvalidDataException("Evidence must be outside the frozen corpus."); }
-        EvaluationCancellation.Validate(output, cancelFile, root, workerWorkRoot);
+        // Artifact-location rules hold for every campaign, cancellation flag or not; only the flag's
+        // identity is conditional on a flag existing. Checked before any reservation or client work.
+        EvaluationCancellation.Validate(output, root, workerWorkRoot);
+        EvaluationCancellation.ValidateFlag(cancelFile, output);
         await using var cancellation = new EvaluationCancellation(cancelFile, ct);
         // Reserve once, never overwrite an earlier campaign. Checkpoints replace it atomically in the same directory.
         using (new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
@@ -219,11 +222,10 @@ internal sealed class EvaluationCancellation : IAsyncDisposable
         watcher = file is null ? Task.CompletedTask : WatchAsync();
     }
 
-    public static void Validate(string output, string? file, string corpusRoot, string? workerWorkRoot)
+    // Runs for every campaign, whatever the cancellation flag: an evidence file under the scoring corpus,
+    // the worker work root, git metadata or a symlinked directory is refused before anything is reserved.
+    public static void Validate(string output, string corpusRoot, string? workerWorkRoot)
     {
-        if (file is null) { return; } // No global/default flag; existing campaigns are unaffected.
-        if (!Path.IsPathFullyQualified(file) || Path.GetFullPath(file) != output + ".cancel")
-        { throw new InvalidDataException("Cancellation file must be the absolute evidence path plus .cancel."); }
         // The live composition supplies its configured work root: all isolated ledgers' synthetic snapshots,
         // clones and triage ReadRule worktrees live below it. The owner's checkout is NOT a worker context.
         if (Within(output, PhysicalRoot(new DirectoryInfo(corpusRoot)))
@@ -234,6 +236,14 @@ internal sealed class EvaluationCancellation : IAsyncDisposable
             if (directory.LinkTarget is not null || directory.Name.Equals(".git", StringComparison.OrdinalIgnoreCase))
             { throw new InvalidDataException("Cancellation artifacts must be outside git metadata and symlinked directories."); }
         }
+    }
+
+    // Only the flag's identity depends on a flag existing; no flag means no watcher, never a skipped location check.
+    public static void ValidateFlag(string? file, string output)
+    {
+        if (file is null) { return; } // No global/default flag; existing campaigns are unaffected.
+        if (!Path.IsPathFullyQualified(file) || Path.GetFullPath(file) != output + ".cancel")
+        { throw new InvalidDataException("Cancellation file must be the absolute evidence path plus .cancel."); }
     }
 
     private static bool Within(string path, string root) => path.Equals(root, StringComparison.OrdinalIgnoreCase)
