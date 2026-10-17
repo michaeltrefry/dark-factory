@@ -40,11 +40,16 @@ public sealed class RecoveryAcceptanceTests
         }
         await using (var held = f.Recovery.Recovery(() => f.Material))
             Assert.Contains("held", (await f.Recovery.Seed.Run(Alpha, 90, held)).Error);
+        var correcting = await AssertStatusEqualsLedgerAsync(f.Recovery.Seed);
+        Assert.Contains(correcting.Single().HeldItems, h => h.StartsWith("sc-77"));
+        Assert.StartsWith("automatic repository hold", correcting.Single().Hold);
 
         var delivery = await f.Run();
         Assert.True(delivery.State == WorkState.Watch, delivery.Error);
         Assert.Single(f.Prs.Opened);
         Assert.Contains(await f.Rows(), r => r.Step == "recovery-delivered");
+        var delivered = Assert.Single(Assert.Single(await AssertStatusEqualsLedgerAsync(f.Recovery.Seed)).Corrections);
+        Assert.Equal("https://github.com/owner/alpha/pull/1", delivered.PullRequest);
 
         var assessor = new RecoveryReassessmentTests.Assessor(f);
         await using var recovery = assessor.Recovery();
@@ -75,6 +80,9 @@ public sealed class RecoveryAcceptanceTests
         await using var read = f.Recovery.Seed.Contexts.CreateDbContext();
         Assert.Single(await read.RecoveryCorrections.ToListAsync());
         Assert.Equal("Resolved", (await read.HotFileIncidents.SingleAsync()).State);
+        var resolved = Assert.Single(await AssertStatusEqualsLedgerAsync(f.Recovery.Seed));
+        Assert.Empty(resolved.HeldItems);
+        Assert.Contains($"session {call.Session}", resolved.Assessment);
         // AT4: the global freeze row (its acknowledgements), the usage row and unrelated manual scopes survive byte for byte.
         Assert.Equal(before, await OtherControls(f.Recovery.Seed));
     }
@@ -147,6 +155,8 @@ public sealed class RecoveryAcceptanceTests
         await using var read = f.Recovery.Seed.Contexts.CreateDbContext();
         Assert.Equal("Resolved", (await read.HotFileIncidents.SingleAsync()).State);
         Assert.Equal(2, await read.RecoveryCorrections.CountAsync());
+        var both = Assert.Single(await AssertStatusEqualsLedgerAsync(f.Recovery.Seed)).Corrections;
+        Assert.Equal(new[] { 1, 2 }, both.Select(c => c.Attempt));
     }
 
     private sealed class PerRepositoryAssessor : IHotFileAssessor
@@ -209,6 +219,7 @@ public sealed class RecoveryAcceptanceTests
         Assert.All(incidents, i => Assert.Equal(1, i.Generation));
         Assert.All(incidents, i => Assert.Equal("Resolved", i.State));
         Assert.Equal(new[] { 1, 2 }, incidents.Select(i => i.Attempts));
+        Assert.Equal(2, (await AssertStatusEqualsLedgerAsync(f)).Count);
     }
 
     // AT5: each conjunct of the structural grant (dispatch, worker entry, push, merge and the control exemption all use it) refuses
@@ -317,6 +328,41 @@ public sealed class RecoveryAcceptanceTests
         Assert.Equal(held, await f.Recovery.HeldAsync(Alpha, default) is not null);
         Assert.Equal(8, new FreezeOptions().HotFileMerges);
         Assert.Equal(TimeSpan.FromHours(24), new FreezeOptions().HotFileWindow);
+    }
+
+    /// <summary>
+    /// AT7: the operator projection the dashboard and `factory recovery status` render (S9's <see cref="RecoveryStatusReader"/>,
+    /// <see cref="LedgerReport.RecoveryStatus"/>) states exactly what the ledger holds — per repository its latest incident's state,
+    /// generation, attempt counts and corrections — and the CLI text carries the same facts with no raw model fence.
+    /// </summary>
+    private static async Task<IReadOnlyList<RepositoryRecoveryStatus>> AssertStatusEqualsLedgerAsync(HotFileRecoveryTests.Fixture seed)
+    {
+        var report = await new RecoveryStatusReader(seed.Contexts, seed.Time).ReadAsync(default);
+        var text = LedgerReport.RecoveryStatus(report);
+        await using var db = seed.Contexts.CreateDbContext();
+        var latest = (await db.HotFileIncidents.AsNoTracking().ToListAsync())
+            .GroupBy(i => i.Repo.ToLowerInvariant()).Select(g => g.MaxBy(i => i.Id)!).ToList();
+        Assert.Equal(latest.Select(i => i.Id).Order(), report.Repositories.Select(r => r.Incident).Order());
+        foreach (var incident in latest)
+        {
+            var row = report.Repositories.Single(r => r.Incident == incident.Id);
+            var corrections = await db.RecoveryCorrections.AsNoTracking().Where(c => c.IncidentId == incident.Id).OrderBy(c => c.Attempt).ToListAsync();
+            Assert.Equal(incident.Repo, row.Repo);
+            Assert.Equal(incident.Generation, row.Generation);
+            Assert.Equal(incident.State, row.Stage);
+            var attempts = $"assessment {incident.Attempts}/3, correction {corrections.Select(c => c.Attempt).DefaultIfEmpty().Max()}/2, refresh {incident.Refreshes}/3";
+            Assert.Equal(attempts, row.Attempts);
+            Assert.Equal(corrections.Select(c => (ItemNaming.Recovery.Format(c.Id), c.Attempt)), row.Corrections.Select(c => (c.Item, c.Attempt)));
+            Assert.All(corrections.Zip(row.Corrections), pair => Assert.StartsWith(pair.First.State, pair.Second.State));
+            Assert.All(row.Corrections, c => Assert.True(c.PullRequest is null || c.PullRequest.StartsWith($"https://github.com/{incident.Repo}/pull/")));
+            Assert.Equal(incident.State == "Resolved", row.Hold.StartsWith("automatic hold resolved"));
+            Assert.Contains(incident.Repo, text);
+            Assert.Contains(attempts, text);
+            Assert.All(row.Corrections, c => Assert.Contains(c.Item, text));
+        }
+        Assert.DoesNotContain("<recovery-findings>", text);
+        Assert.DoesNotContain("<prior-recovery>", text);
+        return report.Repositories;
     }
 
     private static async Task PollUntil(Func<bool> done)
