@@ -98,6 +98,7 @@ public sealed class RecoverySnapshotTests
         var material = await f.Evidence.CaptureAsync(f.Trigger, CancellationToken.None);
         var snapshot = JsonSerializer.Deserialize<RecoverySnapshot>(material)!;
         Assert.True(snapshot.Complete);
+        Assert.Equal(GatePipelineTests.FakeGateGitHub.BaseSha, Assert.Single(snapshot.Evidence, e => e.Category == "merged").BaseCommit);
         Assert.Equal(GatePipelineTests.FakeGateGitHub.BaseSha, snapshot.BaseTips["main"]);
         foreach (var category in new[] { "spec", "plan", "merged-diff", "executed-results", "ci", "pending" })
             Assert.Contains(snapshot.Evidence, e => e.Category == category);

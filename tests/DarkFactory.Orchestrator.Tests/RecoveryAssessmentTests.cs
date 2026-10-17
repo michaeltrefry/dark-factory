@@ -8,6 +8,174 @@ namespace DarkFactory.Orchestrator.Tests;
 
 public sealed class RecoveryAssessmentTests
 {
+    [Theory]
+    [InlineData("historical", false)]
+    [InlineData("forged", true)]
+    [InlineData("main", true)]
+    public async Task Historical_base_is_typed_authority_but_content_and_live_refs_are_not(string kind, bool refused)
+    {
+        var historical = new string('c', 40);
+        var forged = new string('d', 40);
+        var captured = Snapshot with { Evidence = [.. Snapshot.Evidence,
+            new RecoveryEvidence("merge:1", "merged", "API PR:1", Tip, "hash", $"BaseSha={forged}") { BaseCommit = historical }] };
+        var files = new Files();
+        var turns = 0;
+        var commit = kind == "historical" ? historical : kind == "forged" ? forged : "main";
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
+            ? SseAnswers.ToolTurn(("read", "read_file", JsonSerializer.Serialize(new { commit, path = "src/a.cs" })))
+            : SseAnswers.Answer(Answer("inconclusive"))));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(captured)), files: files).AssessAsync(Trigger, "historical", CancellationToken.None);
+        Assert.Equal(refused, Assert.Single(result.Tools).Error);
+        Assert.Equal(refused ? 0 : 1, files.Reads.Count);
+    }
+
+    [Theory]
+    [InlineData("transport")]
+    [InlineData("http-timeout")]
+    [InlineData("deadline")]
+    public async Task Failed_later_turn_persists_partial_provenance_cost_and_semantic_attempt(string failure)
+    {
+        var fixture = new HotFileRecoveryTests.Fixture();
+        for (var n = 0; n < 8; n++) await fixture.Merge();
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ =>
+        {
+            if (++turns == 1) return SseAnswers.Response(SseAnswers.ToolTurn(("read", "read_file", $$"""{"commit":"{{Tip}}","path":"src/a.cs"}""")));
+            if (failure == "deadline") time.Advance(TimeSpan.FromMinutes(21));
+            if (failure == "transport") throw new HttpRequestException("fixture transport failure");
+            throw new TaskCanceledException("fixture timeout");
+        });
+        using var http = api.Client("http://router.test/");
+        http.Timeout = TimeSpan.FromMinutes(20);
+        var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test", time: time), (trigger, _) =>
+            Task.FromResult(JsonSerializer.Serialize(Snapshot with { IncidentSnapshot = trigger.Id, Generation = trigger.Generation })),
+            new Costs(), new Files(), costSettleDelay: TimeSpan.Zero);
+        await using var recovery = new HotFileRecovery(fixture.Contexts, fixture.Locks, fixture.Options, fixture.Time, assessor);
+        await recovery.AdvanceAsync(Repo, CancellationToken.None);
+        await using var db = fixture.Contexts.CreateDbContext();
+        var incident = Assert.Single(db.HotFileIncidents);
+        Assert.NotNull(incident.Answer);
+        var stored = JsonSerializer.Deserialize<HotFileAssessment>(incident.Answer)!;
+        Assert.Equal("inconclusive", stored.Decision);
+        Assert.NotNull(stored.Problem);
+        Assert.Single(stored.Tools);
+        Assert.Single(stored.Turns);
+        Assert.Equal(0.125m, stored.CostUsd);
+        Assert.Equal(1, incident.Attempts);
+        Assert.Single(db.LedgerEntries.Where(e => e.Step == HotFileAssessment.Step));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Configured_twenty_minute_session_survives_eleven_minutes_but_shutdown_propagates(bool shutdown)
+    {
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        using var stop = new CancellationTokenSource();
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ =>
+        {
+            if (++turns == 1) return SseAnswers.Response(SseAnswers.ToolTurn(("evidence", "read_evidence", "{\"id\":\"diff:1\"}")));
+            time.Advance(TimeSpan.FromMinutes(11));
+            if (shutdown) { stop.Cancel(); throw new OperationCanceledException(stop.Token); }
+            return SseAnswers.Response(SseAnswers.Answer(Answer()));
+        });
+        using var http = api.Client("http://router.test/");
+        http.Timeout = TimeSpan.FromMinutes(20);
+        var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test", time: time),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot)));
+        if (shutdown) await Assert.ThrowsAnyAsync<OperationCanceledException>(() => assessor.AssessAsync(Trigger, "bound", stop.Token));
+        else Assert.Equal("safe", (await assessor.AssessAsync(Trigger, "bound", stop.Token)).Decision);
+    }
+
+    private sealed class SequencedCosts(params DarkFactory.Orchestrator.Router.SessionCost?[] values) : DarkFactory.Orchestrator.Router.ISessionCostSource
+    {
+        public int Reads;
+        public Task<DarkFactory.Orchestrator.Router.SessionCost?> GetSessionCostAsync(string id, CancellationToken ct) =>
+            Task.FromResult(values[Math.Min(Reads++, values.Length - 1)]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Lagging_cost_retries_then_settles_and_unknown_is_bounded(bool unknown)
+    {
+        var costs = new SequencedCosts(null, new("cost", 0, 0), unknown ? null : new("cost", 1, 0), unknown ? null : new("cost", 2, 250000));
+        var delays = new List<TimeSpan>();
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot)), costs,
+            costRetryDelays: [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)], costSettleDelay: TimeSpan.FromSeconds(7),
+            costDelay: (d, _) => { delays.Add(d); return Task.CompletedTask; }).AssessAsync(Trigger, "cost", CancellationToken.None);
+        Assert.Equal(unknown ? null : 0.25m, result.CostUsd);
+        Assert.Equal(unknown ? 3 : 4, costs.Reads);
+        Assert.Equal(unknown ? new[] { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2) }
+            : new[] { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(7) }, delays);
+    }
+
+    [Fact]
+    public async Task Measured_zero_is_known_spend_and_does_not_keep_retrying()
+    {
+        var costs = new SequencedCosts(new DarkFactory.Orchestrator.Router.SessionCost("zero", 1, 0));
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot)), costs, costSettleDelay: TimeSpan.Zero, costRetryDelays: [])
+            .AssessAsync(Trigger, "zero", CancellationToken.None);
+        Assert.Equal(0m, result.CostUsd);
+        Assert.Equal(2, costs.Reads);
+    }
+
+    private sealed class HangingCosts(Microsoft.Extensions.Time.Testing.FakeTimeProvider time, Action? shutdown) : DarkFactory.Orchestrator.Router.ISessionCostSource
+    {
+        public bool Cancelled;
+        public Task<DarkFactory.Orchestrator.Router.SessionCost?> GetSessionCostAsync(string id, CancellationToken ct)
+        {
+            shutdown?.Invoke();
+            time.Advance(TimeSpan.FromMinutes(3));
+            Cancelled = ct.IsCancellationRequested;
+            ct.ThrowIfCancellationRequested();
+            throw new InvalidOperationException("Accounting was not bounded.");
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Accounting_has_its_own_bound_and_never_swallows_shutdown(bool shutdown)
+    {
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        using var stop = new CancellationTokenSource();
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        using var http = api.Client("http://router.test/");
+        var costs = new HangingCosts(time, shutdown ? stop.Cancel : null);
+        var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot)), costs, time: time, costRetryDelays: []);
+        if (shutdown) await Assert.ThrowsAnyAsync<OperationCanceledException>(() => assessor.AssessAsync(Trigger, "bound-cost", stop.Token));
+        else
+        {
+            Assert.Null((await assessor.AssessAsync(Trigger, "bound-cost", stop.Token)).CostUsd);
+            Assert.True(costs.Cancelled);
+        }
+    }
+
+    [Fact]
+    public void Production_recovery_reader_protects_shared_locks_and_uses_configured_settle_delay()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "DarkFactory.slnx"))) root = root.Parent;
+        Assert.NotNull(root);
+        var production = File.ReadAllText(Path.Combine(root.FullName, "src/DarkFactory.Orchestrator/FactoryRunner.cs"));
+        var recovery = production[production.IndexOf("private static Recovery.HotFileRecovery CreateRecovery", StringComparison.Ordinal)..];
+        recovery = recovery[..recovery.IndexOf("private static LedgerDbContextFactory Contexts", StringComparison.Ordinal)];
+        Assert.Contains("protectCloneLocks: true", recovery);
+        Assert.Contains("costSettleDelay: options.CostSettleDelay", recovery);
+    }
+
     internal const string Repo = "owner/alpha";
     internal static readonly string Tip = new('a', 40);
     internal static readonly HotFileSnapshot Trigger = new("incident", Repo, 1, [], "trigger-hash");
@@ -86,7 +254,7 @@ public sealed class RecoveryAssessmentTests
             node["evidenceHash"] = trigger.EvidenceHash;
             response = node.ToJsonString();
             return Task.FromResult(JsonSerializer.Serialize(captured));
-        }, new Costs(), files);
+        }, new Costs(), files, costSettleDelay: TimeSpan.Zero);
         await using var recovery = new HotFileRecovery(fixture.Contexts, fixture.Locks, fixture.Options, fixture.Time, assessor);
         await recovery.AdvanceAsync(Repo, CancellationToken.None);
         await using var db = fixture.Contexts.CreateDbContext();
@@ -139,7 +307,7 @@ public sealed class RecoveryAssessmentTests
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot) + (changed ? " " : "")),
-            new Costs(() => changed = true)).AssessAsync(Trigger, "fresh", CancellationToken.None);
+            new Costs(() => changed = true), costSettleDelay: TimeSpan.Zero).AssessAsync(Trigger, "fresh", CancellationToken.None);
         Assert.Equal("inconclusive", result.Decision);
         Assert.Empty(result.CorrectionFindings);
         Assert.Equal(0.125m, result.CostUsd);

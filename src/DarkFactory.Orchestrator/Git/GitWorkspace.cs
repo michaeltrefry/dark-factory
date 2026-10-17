@@ -138,7 +138,8 @@ public sealed class GitWorkspace(
     IWorkerSandbox? sandbox = null,
     string worktreesDirectory = GitWorkspace.ItemWorktrees,
     bool shareWithWorker = true,
-    GitStreamCommand? gitStream = null)
+    GitStreamCommand? gitStream = null,
+    bool protectCloneLocks = false)
     : IRepoWorkspace, ISeatWorkspace, Gate.IReviewFiles
 {
     private readonly GitCommand _git = git ?? RunGitAsync;
@@ -298,12 +299,13 @@ public sealed class GitWorkspace(
     private async Task<CloneLock> LockAsync(string clone, CancellationToken ct)
     {
         var locks = Path.Combine(workRoot, CloneLock.DirectoryName);
-        if (sandbox is not null && !_locksClosed)
+        if ((sandbox is not null || protectCloneLocks) && !_locksClosed)
         {
             try
             {
                 Directory.CreateDirectory(locks);
-                await sandbox.CloseToWorkerAsync(locks, ct);
+                if (sandbox is not null) await sandbox.CloseToWorkerAsync(locks, ct);
+                else await WorkerSandbox.CloseDirectoryToOwnerAsync(locks, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {

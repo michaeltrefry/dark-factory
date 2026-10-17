@@ -152,16 +152,11 @@ public sealed class SessionRecorder(
             var session = await db.WorkerSessions.SingleAsync(s => s.Id == WorkerSessionId, ct);
             (session.EndedAt, session.ExitCode, session.ExitStatus) = (_recorder._time.GetUtcNow(), exitCode, exitStatus);
             await db.SaveChangesAsync(ct);
-            if (fetchCost && session.ClaudeSessionId is { } sid && await FetchCostAsync(sid, ct) is { } cost)
+            if (fetchCost && session.ClaudeSessionId is { } sid)
             {
-                // Stored before the settle wait, so a caller that gives up during it still keeps the recorded cost.
-                await StoreCostAsync(db, session, cost, ct);
-                // The session's last requests may be committed after its first ones: read once more, keep a recorded answer.
-                await Task.Delay(_recorder._costSettleDelay, _recorder._time, ct);
-                if (await TryGetRecordedAsync(sid, ct) is { } settled)
-                {
-                    await StoreCostAsync(db, session, settled, ct);
-                }
+                await SessionCostAccounting.CollectAsync(_recorder._costs, sid, _recorder._costRetryDelays,
+                    _recorder._costSettleDelay, (delay, token) => Task.Delay(delay, _recorder._time, token), _recorder._log,
+                    cost => StoreCostAsync(db, session, cost, ct), ct);
             }
         }
 
@@ -184,44 +179,6 @@ public sealed class SessionRecorder(
                 {
                     _recorder._log.WriteLine($"[session] storing events of session {ClaudeSessionId ?? WorkerSessionId.ToString()} failed: {ex.Message}");
                 }
-            }
-        }
-
-        /// <summary>
-        /// The router's cost for the session. It counts as recorded once the router reports at least one request
-        /// (<c>request_count &gt; 0</c>); a 404 or zero requests is retried, up to the recorder's retry delays. A
-        /// recorded actual cost of 0 is valid (turns served on a local model are priced at $0) and stops the retries.
-        /// Null if nothing is ever recorded.
-        /// </summary>
-        private async Task<SessionCost?> FetchCostAsync(string sessionId, CancellationToken ct)
-        {
-            var delays = _recorder._costRetryDelays;
-            for (var attempt = 0; ; attempt++)
-            {
-                if (await TryGetRecordedAsync(sessionId, ct) is { } recorded)
-                {
-                    return recorded;
-                }
-                if (attempt >= delays.Count)
-                {
-                    _recorder._log.WriteLine($"[session] router has recorded no request for session {sessionId}; cost left unset");
-                    return null;
-                }
-                await Task.Delay(delays[attempt], _recorder._time, ct);
-            }
-        }
-
-        /// <summary>The router's answer if it has recorded a request for the session; null on 404, zero requests or an error.</summary>
-        private async Task<SessionCost?> TryGetRecordedAsync(string sessionId, CancellationToken ct)
-        {
-            try
-            {
-                return await _recorder._costs.GetSessionCostAsync(sessionId, ct) is { RequestCount: > 0 } cost ? cost : null;
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-            {
-                _recorder._log.WriteLine($"[session] router cost for session {sessionId}: {ex.Message}");
-                return null;
             }
         }
 

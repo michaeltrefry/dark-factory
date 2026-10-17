@@ -11,7 +11,11 @@ using Microsoft.EntityFrameworkCore;
 namespace DarkFactory.Orchestrator.Recovery;
 
 /// <summary>Content, not a live URL: its hash and origin survive subsequent board edits and branch movement.</summary>
-public sealed record RecoveryEvidence(string Id, string Category, string Provenance, string? Commit, string Hash, string Content);
+public sealed record RecoveryEvidence(string Id, string Category, string Provenance, string? Commit, string Hash, string Content)
+{
+    /// <summary>Typed immutable PR base, captured from the API, never discovered by parsing evidence text.</summary>
+    public string? BaseCommit { get; init; }
+}
 public sealed record MissingRecoveryEvidence(string Category, string Reason);
 
 /// <summary>
@@ -98,7 +102,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                     if (!pull.Merged || pull.Number != number || pull.BaseRef != merge.Base || pull.MergeCommitSha != merge.Commit
                         || string.IsNullOrWhiteSpace(pull.HeadSha) || string.IsNullOrWhiteSpace(pull.BaseSha))
                         throw new InvalidOperationException("Merged PR does not match its ledger merge.");
-                    Add("merged", $"merge:{merge.Row}", $"ledger:{merge.Row}; PR:{number}", merge.Commit, new { merge, pull });
+                    Add("merged", $"merge:{merge.Row}", $"ledger:{merge.Row}; PR:{number}", merge.Commit, new { merge, pull }, pull.BaseSha);
                     await Spec(item);
                     await Plan(item);
                     if (!rows.Any(r => r.Step == RunPipeline.Steps.GatePassed && r.Detail == pull.HeadSha)
@@ -212,7 +216,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                     Add("pending", $"pending:{EvidenceKey(item)}", $"ledger:{item.Id}@{item.Version}; {item.ExternalId}", head,
                         new { item.Id, item.ExternalId, item.State, item.Version, item.PlanItemId, item.EpicId, pull, blockers,
                             head, headState = head is null ? "not-pushed" : "published",
-                            rows = Results(rows) });
+                            rows = Results(rows) }, pull?.BaseSha);
                 });
             }
         }
@@ -228,11 +232,11 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         return result;
 
         void Missing(string category, string reason) => missing.Add(new(category, reason));
-        void Add(string category, string id, string provenance, string? commit, object value)
+        void Add(string category, string id, string provenance, string? commit, object value, string? baseCommit = null)
         {
             if (evidence.Any(e => e.Id == id)) return;
             var content = value is string text ? text : JsonSerializer.Serialize(value);
-            var entry = new RecoveryEvidence(id, category, provenance, commit, RecoverySnapshot.Hash(content), content);
+            var entry = new RecoveryEvidence(id, category, provenance, commit, RecoverySnapshot.Hash(content), content) { BaseCommit = baseCommit };
             budget += Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(entry));
             if (budget > RecoverySnapshot.MaxBytes)
             {

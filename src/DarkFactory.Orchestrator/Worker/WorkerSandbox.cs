@@ -503,6 +503,25 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         }
     }
 
+    /// <summary>Owner-only readers protect shared lock files without creating a sandbox or running its helper.</summary>
+    internal static async Task CloseDirectoryToOwnerAsync(string path, CancellationToken ct)
+    {
+        if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Owner-only clone locks require Unix permissions.");
+        if (OperatingSystem.IsMacOS())
+        {
+            await CloseAsync(path, ct);
+            if (!IsClosed(await ListAclAsync(path, ct)))
+                throw new InvalidOperationException($"{path} is still open to others than its owner after closing it.");
+        }
+        else
+        {
+            const UnixFileMode ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+            File.SetUnixFileMode(path, ownerOnly);
+            if (File.GetUnixFileMode(path) != ownerOnly)
+                throw new InvalidOperationException($"{path} is still open to others than its owner after mode 0700.");
+        }
+    }
+
     /// <summary>
     /// The one way the owner closes a directory of its own to every sandbox user (sc-25992: the clone locks', the slot locks' and
     /// a slot's MCP session directory all start here): <c>chmod -N</c> removes every ACL entry — the work root's inherited read

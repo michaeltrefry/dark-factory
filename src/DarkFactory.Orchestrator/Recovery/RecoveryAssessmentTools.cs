@@ -8,7 +8,7 @@ namespace DarkFactory.Orchestrator.Recovery;
 internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReviewFiles? files, int promptChars)
 {
     private int _remaining = ReviewTools.Budget(promptChars);
-    private readonly HashSet<string> _commits = snapshot.BaseTips.Values.Concat(snapshot.Evidence.Select(e => e.Commit).OfType<string>())
+    private readonly HashSet<string> _commits = snapshot.BaseTips.Values.Concat(snapshot.Evidence.SelectMany(e => new[] { e.Commit, e.BaseCommit }).OfType<string>())
         .Where(c => c.Length == 40 && c.All(Uri.IsHexDigit)).ToHashSet(StringComparer.Ordinal);
 
     internal AssessmentToolBindings Bindings => new(snapshot.Repo, files is null ? [EvidenceDefinition] : [ReadDefinition, EvidenceDefinition], RunAsync);

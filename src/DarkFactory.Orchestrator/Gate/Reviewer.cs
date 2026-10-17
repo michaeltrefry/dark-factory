@@ -88,7 +88,7 @@ public interface IReviewer
 /// calls included, and a stream silent for the idle gap fails.
 /// </summary>
 public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? idleTimeout = null, ReviewTools? tools = null,
-    TimeSpan? transientRetryDelay = null) : IReviewer
+    TimeSpan? transientRetryDelay = null, TimeProvider? time = null) : IReviewer
 {
     /// <summary>
     /// A turn whose stream fails with a transient upstream error (<see cref="RouterTransientStreamException"/>) is sent again — the
@@ -212,11 +212,8 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     private async Task<SessionEnd> ConverseAsync(string session, string system, string user, string repo, PullFacts pull, CodeGraphOverlay? overlay,
         bool confirm, CancellationToken ct, AssessmentToolBindings? assessment = null)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        if (http.Timeout != Timeout.InfiniteTimeSpan)
-        {
-            deadline.CancelAfter(http.Timeout);
-        }
+        using var timer = new CancellationTokenSource(http.Timeout, time ?? TimeProvider.System);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timer.Token);
         var calls = new List<ToolCall>();
         var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length, overlay);
         var definitions = assessment?.Definitions ?? await _tools.DefinitionsAsync(toolSession, deadline.Token);
@@ -294,9 +291,15 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         {
             return new SessionEnd(null, null, null, "", ex.Message, Calls(), Turns: Turns());
         }
+        catch (HttpRequestException ex) when (assessment is not null && !ct.IsCancellationRequested)
+        {
+            return new SessionEnd(null, null, null, "", $"Assessment transport failed: {ex.Message}", Calls(), Turns: Turns());
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            throw new InvalidOperationException($"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.");
+            var problem = $"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.";
+            if (assessment is not null) return new SessionEnd(null, null, null, "", problem, Calls(), Turns: Turns());
+            throw new InvalidOperationException(problem);
         }
     }
 

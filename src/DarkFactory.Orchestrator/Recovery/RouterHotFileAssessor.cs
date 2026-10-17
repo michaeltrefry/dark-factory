@@ -2,12 +2,15 @@ using System.Text;
 using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Router;
+using DarkFactory.Orchestrator.Sessions;
 
 namespace DarkFactory.Orchestrator.Recovery;
 
 /// <summary>A fresh high-class assessment over immutable evidence, using the panel's bounded streaming tool loop.</summary>
 public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileSnapshot, CancellationToken, Task<string>> evidence,
-    ISessionCostSource? costs = null, IReviewFiles? files = null) : IHotFileAssessor
+    ISessionCostSource? costs = null, IReviewFiles? files = null,
+    TimeSpan? costSettleDelay = null, IReadOnlyList<TimeSpan>? costRetryDelays = null,
+    Func<TimeSpan, CancellationToken, Task>? costDelay = null, TimeProvider? time = null) : IHotFileAssessor
 {
     public async Task<HotFileAssessment> AssessAsync(HotFileSnapshot snapshot, string session, CancellationToken ct)
     {
@@ -16,8 +19,6 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
             ?? throw new InvalidOperationException("Required recovery snapshot is not readable.");
         if (!captured.Complete || captured.IncidentSnapshot != snapshot.Id || captured.Repo != snapshot.Repo || captured.Generation != snapshot.Generation)
             throw new InvalidOperationException("Required recovery snapshot is incomplete or names another incident.");
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(TimeSpan.FromMinutes(10));
         var prompt = ReviewPrompts.For("hot-file-assessment");
         var request = JsonSerializer.Serialize(new { version = 1, snapshot.Id, snapshot.Generation, snapshot.Repo, snapshot.EvidenceHash,
             materialHash = RecoverySnapshot.Hash(material), material = captured });
@@ -28,7 +29,7 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         HotFileAssessment parsed;
         try
         {
-            conversation = await reviewer.AssessAsync(session, prompt.Text, request, bindings, deadline.Token);
+            conversation = await reviewer.AssessAsync(session, prompt.Text, request, bindings, ct);
             if (conversation.Class != "high" || conversation.Stop != "end_turn" || conversation.Problem is not null)
                 throw new InvalidOperationException(conversation.Problem ?? "Unusable high-class assessment stream.");
             parsed = RecoveryDecision.Parse(conversation.Text, snapshot, captured);
@@ -40,7 +41,18 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         SessionCost? cost = null;
         if (costs is not null)
         {
-            try { cost = await costs.GetSessionCostAsync(session, deadline.Token); }
+            var retries = costRetryDelays ?? SessionRecorder.DefaultCostRetryDelays;
+            var settle = costSettleDelay ?? SessionRecorder.DefaultCostSettleDelay;
+            // Accounting is bounded separately from the conversation; its deadline may already have expired.
+            using var accounting = new CancellationTokenSource(TimeSpan.FromSeconds(30) + settle
+                + TimeSpan.FromTicks(retries.Sum(d => d.Ticks)), time ?? TimeProvider.System);
+            using var bound = CancellationTokenSource.CreateLinkedTokenSource(ct, accounting.Token);
+            try
+            {
+                await SessionCostAccounting.CollectAsync(costs, session, retries, settle,
+                    costDelay ?? ((d, token) => Task.Delay(d, time ?? TimeProvider.System, token)), TextWriter.Null,
+                    measured => { cost = measured; return Task.CompletedTask; }, bound.Token);
+            }
             catch (Exception) when (!ct.IsCancellationRequested) { /* Unknown spend is never zero spend. */ }
         }
         // Freshness gates dispositions as well as safe resolution. Revalidate after accounting, just before returning.
