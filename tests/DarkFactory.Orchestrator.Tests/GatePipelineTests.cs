@@ -127,8 +127,9 @@ public class GatePipelineTests
         /// <summary>Runs as the merge call starts, e.g. to press Ctrl-C while it is in flight.</summary>
         public Action? OnMergeCall { get; set; }
 
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+        public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
         {
+            if (authorize is not null) await authorize(ct);
             Calls.Add($"merge {number} {headSha}");
             OnMergeCall?.Invoke();
             if (HeadMovesBeforeMerge is { } moved)
@@ -138,7 +139,7 @@ public class GatePipelineTests
             }
             if (headSha != Head)
             {
-                return Task.FromResult(new MergeResult(false, null, true, "Head branch was modified."));
+                return new MergeResult(false, null, true, "Head branch was modified.");
             }
             if (MergeThrows is { } failure && !MergesBeforeThrowing)
             {
@@ -151,7 +152,7 @@ public class GatePipelineTests
             {
                 throw late;
             }
-            return Task.FromResult(new MergeResult(true, MergeCommit, false, "Pull Request successfully merged"));
+            return new MergeResult(true, MergeCommit, false, "Pull Request successfully merged");
         }
 
         public static CiFacts Green(string sha) => new(sha, [new CheckFact("build-test", true, "success")]);

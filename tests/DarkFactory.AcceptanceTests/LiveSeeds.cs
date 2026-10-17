@@ -244,5 +244,5 @@ internal sealed class PolicyFromRef(IGateGitHub inner, string policyRef, Func<bo
 
     public Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct) => inner.CompareAsync(repo, baseRef, headSha, ct);
 
-    public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct) => inner.MergeAsync(repo, number, headSha, ct);
+    public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null) => inner.MergeAsync(repo, number, headSha, ct, authorize);
 }

@@ -303,8 +303,9 @@ public partial class ChangesetPipelineTests
             }
         }
 
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+        public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
         {
+            if (authorize is not null) await authorize(ct);
             OnMerge?.Invoke(number, headSha);
             lock (_gate)
             {
@@ -312,13 +313,13 @@ public partial class ChangesetPipelineTests
                 Calls.Add($"merge {number} {headSha} into {pull.Base}");
                 if (Branches[pull.Head] != headSha)
                 {
-                    return Task.FromResult(new MergeResult(false, null, true, "Head branch was modified."));
+                    return new MergeResult(false, null, true, "Head branch was modified.");
                 }
                 var commit = Commit($"merge-{number}", [.. Changes[Branches[pull.Base]], .. Changes[headSha]]);
                 Branches[pull.Base] = commit;
                 (pull.MergedHead, pull.MergeCommit) = (headSha, commit);
                 Merges.Add((pull.Head, pull.Base, headSha, commit));
-                return Task.FromResult(new MergeResult(true, commit, false, "merged"));
+                return new MergeResult(true, commit, false, "merged");
             }
         }
 

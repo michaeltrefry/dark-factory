@@ -37,6 +37,8 @@ public sealed partial class RunPipeline
     private async Task ValidateCorrectionMergeAsync(Run run, PullFacts pull, IReadOnlyList<string> paths, CancellationToken ct)
     {
         if (Naming != ItemNaming.Recovery) return;
+        // Called by the merge transport AFTER its write token is minted. These reads use their own read-only token.
+        // GitHub binds only the head: a base/control/grant change after these last reads and before the PUT remains a race.
         var current = await Gate.GitHub.GetPullAsync(run.Repo, pull.Number, ct);
         if (!current.Open || current.HeadSha != pull.HeadSha)
             throw new GateBlockedException("Correction pull request changed before its authorized merge.");

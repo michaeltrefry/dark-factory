@@ -1,4 +1,7 @@
+using System.Net;
+using System.Security.Cryptography;
 using System.Text.Json;
+using DarkFactory.Orchestrator.GitHub;
 using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Ledger;
@@ -18,6 +21,7 @@ public class RecoveryCorrectionPipelineTests
         internal readonly FakeWorkspaces Workspaces = new();
         internal readonly FakePullRequests Prs = new();
         internal readonly GatePipelineTests.FakeGateGitHub GitHub = new();
+        internal IGateGitHub? GateClient;
         internal GatePipelineTests.FakeReviewer Reviewer = new();
         internal readonly FakeTestRunner Tests = new();
         internal RecoveryCorrection Correction = null!;
@@ -54,7 +58,7 @@ public class RecoveryCorrectionPipelineTests
             return await new RunPipeline(Recovery.Source, new WorkLedger(db, Recovery.Seed.Time), Recovery.Seed.Locks,
                 Workspaces, worker, Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: Controls,
                 recovery: Recovery.Recovery(() => Material),
-                gate: new GateStage(GitHub, Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(2), Tests: Tests,
+                gate: new GateStage(GateClient ?? GitHub, Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(2), Tests: Tests,
                     Risk: FakeCodeGraphRisk.Reader(new FakeCodeGraphRisk())))
                 .RunAsync(Correction.Id, ct);
         }
@@ -63,6 +67,122 @@ public class RecoveryCorrectionPipelineTests
             await using var db = Recovery.Seed.Contexts.CreateDbContext();
             return await db.LedgerEntries.Where(e => db.WorkItems.Any(i => i.Id == e.WorkItemId && i.ExternalId == $"rc-{Correction.Id}"))
                 .OrderBy(e => e.Id).ToListAsync();
+        }
+    }
+
+    // Real GitHubGate transport for every PR read and merge; unrelated policy/CI fixtures stay deterministic.
+    private sealed class TokenBoundaryGate : HttpMessageHandler, IGateGitHub
+    {
+        private readonly GatePipelineTests.FakeGateGitHub inner;
+        private readonly HttpClient client;
+        private readonly GitHubGate transport;
+        internal readonly TaskCompletionSource TokenRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource ReleaseToken = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly List<string> Requests = [];
+        internal TokenBoundaryGate(GatePipelineTests.FakeGateGitHub inner)
+        {
+            this.inner = inner;
+            client = new HttpClient(this, disposeHandler: false) { BaseAddress = new Uri("https://api.github.com/") };
+            using var key = RSA.Create(2048);
+            transport = new GitHubGate(client, new GitHubApp(client, "4242", key.ExportRSAPrivateKeyPem(), TimeProvider.System));
+        }
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct);
+            if (path.EndsWith("/installation")) return FakeApi.Json(HttpStatusCode.OK, "{\"id\":555}");
+            if (path.EndsWith("/access_tokens"))
+            {
+                var write = JsonDocument.Parse(body).RootElement.GetProperty("permissions").GetProperty("contents").GetString() == "write";
+                Requests.Add(write ? "write-token requested" : "read-token");
+                if (write)
+                {
+                    TokenRequested.TrySetResult();
+                    await ReleaseToken.Task.WaitAsync(ct);
+                    Requests.Add("write-token returned");
+                }
+                return FakeApi.Json(HttpStatusCode.Created, JsonSerializer.Serialize(new
+                    { token = write ? "write-token" : "read-token", expires_at = DateTimeOffset.UtcNow.AddMinutes(59) }));
+            }
+            if (request.Method == HttpMethod.Get && path == "/repos/owner/alpha/pulls/1")
+            {
+                Assert.Equal("read-token", request.Headers.Authorization!.Parameter);
+                Requests.Add("GET pull");
+                return FakeApi.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+                {
+                    number = 1, html_url = "https://github.com/owner/alpha/pull/1", state = inner.Merged ? "closed" : "open",
+                    merged = inner.Merged, draft = false, changed_files = 2,
+                    head = new { sha = inner.Head }, @base = new { @ref = inner.PullBaseRef, sha = inner.PullBaseSha }
+                }));
+            }
+            if (request.Method == HttpMethod.Put && path == "/repos/owner/alpha/pulls/1/merge")
+            {
+                Requests.Add("PUT merge");
+                Assert.Equal("write-token", request.Headers.Authorization!.Parameter);
+                inner.Merged = true;
+                return FakeApi.Json(HttpStatusCode.OK, "{\"merged\":true,\"sha\":\"merged\",\"message\":\"merged\"}");
+            }
+            throw new InvalidOperationException($"Unexpected transport request: {request.Method} {path}");
+        }
+        protected override void Dispose(bool disposing) { if (disposing) client.Dispose(); base.Dispose(disposing); }
+        public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct) => transport.GetPullAsync(repo, number, ct);
+        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null) => transport.MergeAsync(repo, number, headSha, ct, authorize);
+        public Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct) => inner.GetDiffAsync(repo, baseSha, headSha, ct);
+        public Task<RepoFiles> GetFilesAsync(RepoRef repo, string sha, CancellationToken ct) => inner.GetFilesAsync(repo, sha, ct);
+        public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => inner.GetPolicyAsync(repo, baseRef, ct);
+        public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct) => inner.GetCiAsync(repo, sha, ct);
+        public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => inner.GetWorkflowsAsync(repo, ct);
+        public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct) => inner.GetCheckLogAsync(repo, check, ct);
+        public Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct) => inner.CompareAsync(repo, baseRef, headSha, ct);
+    }
+
+    [Theory]
+    [InlineData("unchanged")]
+    [InlineData("grant")]
+    [InlineData("repo-pause")]
+    [InlineData("item-pause")]
+    [InlineData("item-stop")]
+    [InlineData("pull-base-sha")]
+    [InlineData("pull-head")]
+    [InlineData("pull-retarget")]
+    public async Task Correction_reauthorizes_after_the_merge_token_returns_before_any_PUT(string change)
+    {
+        var f = new Fixture(); await f.Initialize();
+        using var transport = new TokenBoundaryGate(f.GitHub);
+        f.GateClient = transport;
+        var run = f.Run();
+        try
+        {
+            await transport.TokenRequested.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.False(run.IsCompleted);
+            Assert.DoesNotContain("PUT merge", transport.Requests);
+            if (change == "grant")
+            {
+                await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+                (await db.RecoveryCorrections.SingleAsync()).State = "Revoked";
+                await db.SaveChangesAsync();
+            }
+            if (change is "repo-pause" or "item-pause" or "item-stop")
+                await f.Controls.SetAsync(change == "repo-pause" ? "repo:owner/alpha" : $"item:rc-{f.Correction.Id}",
+                    change == "item-stop" ? ControlState.Stopping : ControlState.Paused, "human", default);
+            if (change == "pull-base-sha") f.GitHub.PullBaseSha = "moved";
+            if (change == "pull-head") f.GitHub.Head = GatePipelineTests.ShaA;
+            if (change == "pull-retarget") f.GitHub.PullBaseRef = "other";
+        }
+        finally { transport.ReleaseToken.TrySetResult(); }
+        var result = await run;
+        if (change == "unchanged")
+        {
+            Assert.Equal(WorkState.Watch, result.State);
+            Assert.Single(transport.Requests, r => r == "PUT merge");
+            Assert.Contains("GET pull", transport.Requests.Skip(transport.Requests.IndexOf("write-token returned") + 1)
+                .TakeWhile(r => r != "PUT merge"));
+        }
+        else
+        {
+            Assert.DoesNotContain("PUT merge", transport.Requests);
+            Assert.False(f.GitHub.Merged);
+            Assert.DoesNotContain(await f.Rows(), r => r.Step == "recovery-delivered");
         }
     }
 

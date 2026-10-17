@@ -59,8 +59,12 @@ public interface IGateGitHub
     /// </summary>
     Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct);
 
-    /// <summary>Merges PR <paramref name="number"/> only if its head is still <paramref name="headSha"/> (GitHub enforces it).</summary>
-    Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct);
+    /// <summary>
+    /// Merges PR <paramref name="number"/> only if its head is still <paramref name="headSha"/> (GitHub enforces it).
+    /// When supplied, <paramref name="authorize"/> must succeed after minting the write token, immediately before sending
+    /// the merge PUT. A refused callback sends nothing; ordinary merges supply none.
+    /// </summary>
+    Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null);
 }
 
 /// <summary>
@@ -402,11 +406,12 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         return new BaseComparison(compare.BaseCommit.Sha, compare.BehindBy);
     }
 
-    public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+    public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
     {
         var token = (await gateApp.CreateInstallationTokenAsync(repo, ct, MergePermissions)).Token;
         using var request = GitHubApp.Request(HttpMethod.Put, $"repos/{repo.Owner}/{repo.Name}/pulls/{number}/merge", "Bearer", token);
         request.Content = JsonContent.Create(new { sha = headSha, merge_method = "merge" });
+        if (authorize is not null) await authorize(ct);
         using var response = await http.SendAsync(request, ct);
         if (response.StatusCode == HttpStatusCode.Conflict)
         {

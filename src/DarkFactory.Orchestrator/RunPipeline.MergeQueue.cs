@@ -523,11 +523,11 @@ public sealed partial class RunPipeline
         await ledger.CheckpointAsync(run.Item, Steps.MergeFiles, null,
             new MergeFiles(pull.BaseRef, files, run.Changeset is not null ? run.Repo.FullName : null).ToDetail(), ct);
         await ledger.CheckpointAsync(run.Item, Steps.GatePassed, null, pull.HeadSha, ct);
-        await ValidateCorrectionMergeAsync(run, pull, files, ct);
         MergeResult merged;
         try
         {
-            merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct);
+            merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct,
+                Naming == ItemNaming.Recovery ? token => ValidateCorrectionMergeAsync(run, pull, files, token) : null);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {

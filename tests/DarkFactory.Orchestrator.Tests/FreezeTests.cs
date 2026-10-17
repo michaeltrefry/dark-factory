@@ -50,7 +50,7 @@ public class FreezeTests
         public Task<RepoWorkflows> GetWorkflowsAsync(RepoRef repo, CancellationToken ct) => throw new NotSupportedException();
         public Task<string?> GetPolicyAsync(RepoRef repo, string baseRef, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct) => throw new NotSupportedException();
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct) => throw new NotSupportedException();
+        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null) => throw new NotSupportedException();
     }
 
     /// <summary>Controls whose freeze record cannot be read (every other scope reads normally).</summary>
