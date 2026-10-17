@@ -60,8 +60,11 @@ public static class RecoveryCorrections
         // Replays never revive a stopped/failed item or mint a second authority for the same attempt.
         if (existing is not null) return existing;
         if (attempt is < 1 or > 2 || attempt == 2 && !await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id
-                && c.Attempt == 1 && (c.State == "Failed" || c.State == "Merged"), ct))
+                && c.Attempt == 1 && (c.State == "Failed" || c.State == "Merged" || c.State == "Revoked"), ct))
             throw new InvalidOperationException("Correction attempt is not authorized by a failed prior repair or exceeds two attempts.");
+        if (await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id && (c.State == "Stopped"
+            || db.WorkItems.Any(w => w.ExternalId == "rc-" + c.Id && w.State == WorkState.Cancelled)), ct))
+            throw new InvalidOperationException("A correction was stopped; no replacement repair is authorized.");
         var trigger = HotFileSnapshot.Parse(incident.Snapshot);
         var material = ValidateAssessment(incident, answer, trigger);
         await HotFileRecovery.RecordRedirectsAsync(db, incident, answer, now, ct);

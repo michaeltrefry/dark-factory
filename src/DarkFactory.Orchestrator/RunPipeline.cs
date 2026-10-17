@@ -1517,8 +1517,23 @@ public sealed partial class RunPipeline(
         // A Stop or Pause that arrived during the push: no ready PR is opened for a stopped item.
         await ThrowIfControlledAsync(item, ct);
         // Returns the branch's already-open PR instead of opening a second one.
-        var prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
-            $"{story.Ref}: {story.PublicName}", await PullRequestBodyAsync(run, ct), ct);
+        string prUrl;
+        try
+        {
+            prUrl = await pullRequests.OpenAsync(repo, workspace.Branch, workspace.BaseBranch,
+                $"{story.Ref}: {story.PublicName}", await PullRequestBodyAsync(run, ct), ct);
+        }
+        catch (Exception ex) when (source.Naming == ItemNaming.Recovery && !ct.IsCancellationRequested
+            && ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
+        {
+            // The POST may have succeeded. Keep the pushed checkpoint and exact correction identity: OpenAsync's
+            // branch lookup recovers its PR on restart. Never spend a new correction just because its answer was lost.
+            const string uncertain = "recovery-pr-uncertain";
+            var failures = (await ledger.HistoryAsync(item, ct)).Count(e => e.Step == uncertain);
+            await ledger.CheckpointAsync(item, uncertain, session, $"attempt {failures + 1}: {ex.GetType().Name}", ct);
+            if (failures >= 2) throw;
+            throw new Recovery.RecoveryContinuationDeferredException("Correction PR creation answer uncertain; the next run recovers the same branch's PR.");
+        }
         var branchUrl = BranchUrl(repo, workspace.Branch);
         if (!attempt.Any(e => e.Step == Steps.Linked && e.Detail == $"{prUrl} {branchUrl}"))
         {

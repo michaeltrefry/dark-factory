@@ -60,7 +60,7 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         {
             try
             {
-                if (await CaptureAsync(snapshot, ct) != material) parsed = Inconclusive("Snapshot evidence changed during assessment.");
+                if (await CaptureAsync(snapshot, ct) != material) parsed = Inconclusive("Snapshot evidence changed during assessment.") with { EvidenceChanged = true };
             }
             catch (Exception) when (!ct.IsCancellationRequested)
             {

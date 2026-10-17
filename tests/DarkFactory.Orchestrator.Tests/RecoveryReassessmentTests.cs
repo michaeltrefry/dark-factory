@@ -97,7 +97,7 @@ public sealed class RecoveryReassessmentTests
         await recovery.AdvanceAsync("owner/alpha", default);
         await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
         var corrections = await db.RecoveryCorrections.OrderBy(c => c.Attempt).ToListAsync();
-        Assert.Equal(2, corrections.Count);
+        Assert.True(corrections.Count == 2, JsonSerializer.Serialize(await db.HotFileIncidents.SingleAsync()));
         Assert.Equal("Merged", corrections[0].State);
         Assert.Equal(2, corrections[1].Attempt);
         Assert.Contains(new string('9', 40), corrections[1].Spec);

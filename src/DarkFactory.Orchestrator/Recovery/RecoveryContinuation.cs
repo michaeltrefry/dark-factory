@@ -50,7 +50,13 @@ public sealed partial class HotFileRecovery
         var merge = rows.LastOrDefault(e => e.Step == null && e.State == WorkState.Merge);
         if (correction.State == "Merged" && (merge is null || !rows.Any(e => e.Step == "recovery-delivered"))) return;
         if (merge is not null && old.Merges.Any(m => m.Row == merge.Id)) return;
-        if (correction.State == "Failed" && (incident.State != "Escalated" || rows.Any(e => e.Step == "recovery-reassessment"))) return;
+        if (correction.State == "Failed" && (incident.State is not ("Escalated" or "CorrectionFailed") || rows.Any(e => e.Step == "recovery-reassessment"))) return;
+        if (correction.State == "Failed" && correction.Attempt >= 2)
+        {
+            Escalate(incident, "Correction budget exhausted");
+            await db.SaveChangesAsync(ct);
+            return;
+        }
         var merges = old.Merges.ToList();
         if (merge is not null)
         {
@@ -59,14 +65,8 @@ public sealed partial class HotFileRecovery
                 throw new InvalidOperationException("Delivered correction has no exact base/merge provenance.");
             merges.Add(new(merge.Id, item.Id, merge.Detail, files.Base, files.Files));
         }
-        var snapshot = new HotFileSnapshot(Guid.NewGuid().ToString("N"), incident.Repo, incident.Generation, merges, Hash(merges));
-        incident.Snapshot = JsonSerializer.Serialize(snapshot);
-        incident.EvidenceHash = snapshot.EvidenceHash;
-        incident.State = "Reassessing";
-        incident.Attempts = 0;
-        incident.NextAttemptAt = null;
-        incident.Answer = null;
-        incident.Version++;
+        if (!await RefreshAsync(db, incident, merges, $"Correction attempt {correction.Attempt} observed", ct)) return;
+        var snapshot = HotFileSnapshot.Parse(incident.Snapshot);
         db.LedgerEntries.Add(new() { WorkItemId = item.Id, State = item.State, Step = "recovery-reassessment",
             Detail = $"incident {incident.Id}: correction attempt {correction.Attempt} observed for snapshot {snapshot.Id}",
             RecordedAt = time.GetUtcNow(), Outcome = StepOutcome.Passed });
@@ -148,7 +148,7 @@ public sealed partial class HotFileRecovery
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            incident.State = "Held";
+            incident.State = "Refreshing";
             incident.Error = "Required redirect is not currently authorized: " + ex.Message;
             incident.Version++;
             await db.SaveChangesAsync(ct);

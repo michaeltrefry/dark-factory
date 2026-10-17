@@ -249,9 +249,18 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
 
     public DbSet<Recovery.RecoveryCorrection> RecoveryCorrections => Set<Recovery.RecoveryCorrection>();
     public DbSet<Recovery.RecoveryAncestor> RecoveryAncestors => Set<Recovery.RecoveryAncestor>();
+    public DbSet<Recovery.RecoveryAssessmentAttempt> RecoveryAssessmentAttempts => Set<Recovery.RecoveryAssessmentAttempt>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<Recovery.RecoveryAssessmentAttempt>(e =>
+        {
+            e.ToTable("recovery_assessment_attempts");
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => x.Session).IsUnique();
+            e.HasIndex(x => new { x.IncidentId, x.Snapshot, x.Number });
+            e.HasOne<Recovery.HotFileIncident>().WithMany().HasForeignKey(x => x.IncidentId).OnDelete(DeleteBehavior.Restrict);
+        });
         modelBuilder.Entity<Recovery.RecoveryCorrection>(e =>
         {
             e.ToTable("recovery_corrections");
