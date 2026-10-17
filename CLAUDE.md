@@ -936,11 +936,23 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `read_evidence`, so the tool budget is not spent on inline material), its answer bound to incident, generation, snapshot, repo and evidence
   hash and parsed strictly (`RecoveryDecision`). A safe or unsafe answer counts only over evidence it read whole
   (`RouterHotFileAssessor.Unread`, sc-26335): every id it cites, top level and per finding, and for a safe answer every
-  `merged-diff` entry of the incident, must have been served by a successful `read_evidence` whose result reached the model
-  uncut (`RecoveryAssessmentTools.FullyRead`); otherwise the answer is inconclusive, naming the unread ids, and the prompt says
-  so. Consequence, accepted: a diff over one tool result's cap (60,000 bytes serialized), diffs together past the session's
-  tool budget (about 200,000 characters) or more required reads than `RouterReviewer.MaxToolCalls` (24) cannot be judged safe —
-  the incident is reassessed until its budgets escalate it to a human. Only the exact current safe answer resolves, acknowledging exactly its
+  `merged-diff` entry of the incident, must have been read in full — every one of its pages served by a successful
+  `read_evidence` whose result reached the model uncut (`RecoveryAssessmentTools.FullyRead`); otherwise the answer is
+  inconclusive, naming the unread ids, and the prompt says so. Paged evidence (sc-26444): `read_evidence(id, page)` serves one
+  page — at most `RecoveryAssessmentTools.PageBytes` (50,000) UTF-8 bytes of the entry's content, never splitting a character,
+  behind a one-line JSON header (id, category, provenance, commits, hash, page, pages, byte offset, bytes, total bytes), so no
+  page reaches the 60,000-byte per-result cap; the index gives each entry's `Pages`, and an entry counts as read once its pages
+  together cover the whole content (a page skipped, cut or failed leaves it unread). The assessor has
+  its own explicit limits, stated in the request (`limits`) and apart from the reviewer panel's (8 turns, 24 calls, 200,000
+  characters: unchanged): `MaxSessionChars` 400,000 characters of tool results less the request (every turn resends the
+  conversation, so this is what the model holds at the end — about 100,000–130,000 tokens, inside the high class's smallest
+  200,000-token context with the prompt and answer), `MaxToolCalls` 64 (a page per call: the budget in full pages plus a first
+  page of each of up to 50 merged diffs and some pending reads), `MaxTurns` 12. They do not reach the snapshot's 2 MiB bound —
+  no single conversation can hold 2 MiB (500,000+ tokens) — so before any router call `RouterHotFileAssessor.Unreadable` sums
+  the pages every merged diff takes: past the calls or the character budget, the answer is inconclusive with that reason and
+  `HotFileAssessment.Oversized`, no session is opened, and the recovery escalates the incident at once ("Assessment cannot read
+  the required evidence: …") rather than spend its remaining attempts on the same evidence: a change too large to read in one
+  session is one a human must review. Only the exact current safe answer resolves, acknowledging exactly its
   (merge row, base, file) tuples beyond the window and restarts (a later merge of a reviewed file opens a new generation).
   Correction (E7/E8): an accepted unsafe merged finding materializes ONE `rc-<n>` work item per attempt in exactly the
   incident's repository and recorded base (`RecoveryWorkSource`, internal, no board credential; its spec is planner-like data),

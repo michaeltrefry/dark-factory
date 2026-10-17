@@ -55,6 +55,12 @@ public sealed record HotFileAssessment(string Snapshot, int Generation, string R
     public string? MaterialSnapshot { get; init; }
     public string? Problem { get; init; }
     public bool EvidenceChanged { get; init; }
+
+    /// <summary>
+    /// The material's required reads cannot fit one assessment session (<see cref="RouterHotFileAssessor.Unreadable"/>, sc-26444):
+    /// decided before any router call, and the same for every attempt on this evidence, so the incident escalates at once.
+    /// </summary>
+    public bool Oversized { get; init; }
     public IReadOnlyList<string> Citations { get; init; } = [];
     public IReadOnlyList<RecoveryFinding> Findings { get; init; } = [];
     public IReadOnlyList<RecoveryFinding> CorrectionFindings { get; init; } = [];
@@ -285,6 +291,11 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                     await RecordRedirectsAsync(db, incident, answer, time.GetUtcNow(), ct);
                     incident.State = "Refreshing";
                     incident.Error = "Pending work redirected; awaiting fresh assessment.";
+                }
+                else if (!changed && answer.Oversized)
+                {
+                    // Every attempt on this evidence would answer the same: escalate now, naming why, rather than spend the rest.
+                    Escalate(incident, "Assessment cannot read the required evidence: " + answer.Problem?.TrimEnd('.'));
                 }
                 else
                 {

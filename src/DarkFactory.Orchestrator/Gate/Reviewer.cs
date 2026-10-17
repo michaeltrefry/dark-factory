@@ -215,6 +215,9 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         using var timer = new CancellationTokenSource(http.Timeout, time ?? TimeProvider.System);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timer.Token);
         var calls = new List<ToolCall>();
+        // The recovery assessor brings its own explicit limits (sc-26444); every review and second opinion keeps the panel's.
+        var maxTurns = assessment?.MaxTurns ?? MaxTurns;
+        var maxToolCalls = assessment?.MaxToolCalls ?? MaxToolCalls;
         var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length, overlay);
         var definitions = assessment?.Definitions ?? await _tools.DefinitionsAsync(toolSession, deadline.Token);
         if (toolSession.KanbanTools.Count > 0)
@@ -231,7 +234,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         {
             for (var turn = 1; ; turn++)
             {
-                var final = turn > MaxTurns;
+                var final = turn > maxTurns;
                 StreamedAnswer answer;
                 string? servedClass;
                 IReadOnlyList<string>? retried;
@@ -260,7 +263,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 SessionEnd Unusable(string why) => new(answer.Served, servedClass, answer.StopReason, answer.Text, why, Calls(), final, Turns());
                 if (final)
                 {
-                    return Unusable($"the reviewer asked for tools again in its final-answer turn, after {MaxTurns} turns with tools.");
+                    return Unusable($"the reviewer asked for tools again in its final-answer turn, after {maxTurns} turns with tools.");
                 }
                 var uses = answer.ToolUses.ToList();
                 if (uses.Count == 0 || uses.Any(u => string.IsNullOrEmpty(u.Id)))
@@ -271,15 +274,15 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 var results = new List<object>();
                 foreach (var use in uses)
                 {
-                    var outcome = turn == MaxTurns ? ReviewTools.AtTurnCap(use, MaxTurns)
-                        : calls.Count < MaxToolCalls ? assessment is null
+                    var outcome = turn == maxTurns ? ReviewTools.AtTurnCap(use, maxTurns)
+                        : calls.Count < maxToolCalls ? assessment is null
                             ? await _tools.RunAsync(use, toolSession, deadline.Token)
                             : await assessment.Run(use, deadline.Token)
-                        : ReviewTools.OverBudget(use, MaxToolCalls);
+                        : ReviewTools.OverBudget(use, maxToolCalls);
                     calls.Add(outcome.Record);
                     results.Add(new { type = "tool_result", tool_use_id = use.Id, content = PromptFence.Block(ToolResultTag, outcome.Content), is_error = outcome.IsError });
                 }
-                if (turn == MaxTurns)
+                if (turn == maxTurns)
                 {
                     // The turn cap: the next turn is the last, and only for the final answer.
                     results.Add(new { type = AnswerBlock.TextType, text = assessment is null ? FinalAnswerRequest(confirm) : "No more tools. Return only the assessment JSON now." });
@@ -591,7 +594,8 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     }
 }
 
+/// <summary>The recovery assessor's tools and its own session limits (turns with tools, tool calls), apart from the panel's.</summary>
 internal sealed record AssessmentToolBindings(string Repo, IReadOnlyList<object> Definitions,
-    Func<AnswerBlock, CancellationToken, Task<ToolOutcome>> Run);
+    Func<AnswerBlock, CancellationToken, Task<ToolOutcome>> Run, int MaxTurns, int MaxToolCalls);
 internal sealed record AssessmentConversation(string? Class, string? Stop, string Text, string? Problem,
     IReadOnlyList<ToolCall> Tools, IReadOnlyList<ServedTurn> Turns);
