@@ -278,13 +278,14 @@ public class HotFileRecoveryTests
         var answer = System.Text.Json.JsonSerializer.Serialize(new { version = 1, snapshot = snapshot.Id, generation = snapshot.Generation,
             repo = snapshot.Repo, decision = "safe", evidenceHash = snapshot.EvidenceHash, materialSnapshot = captured.Id,
             citations = new[] { captured.Evidence[0].Id }, findings = Array.Empty<object>() });
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(answer)));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, answer));
         using var http = api.Client("http://router.test/");
         await using var recovery = new HotFileRecovery(f.Contexts, f.Locks, f.Options, f.Time,
             new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "router-test-key"), evidence.CaptureAsync));
         await recovery.AdvanceAsync(Repo, CancellationToken.None);
         Assert.Null(await recovery.HeldAsync(Repo, CancellationToken.None));
-        Assert.Single(api.Requests);
+        // One assessment session (its read_evidence turns included).
+        Assert.Single(api.Requests.Select(r => r.Headers[DarkFactory.Orchestrator.Gate.RouterReviewer.SessionHeader]).Distinct());
         await using var db = f.Contexts.CreateDbContext();
         var resolved = await db.HotFileIncidents.SingleAsync();
         Assert.Equal("Resolved", resolved.State);
@@ -297,7 +298,7 @@ public class HotFileRecoveryTests
         var snapshot = RecoveryAssessmentTests.Trigger;
         var material = System.Text.Json.JsonSerializer.Serialize(RecoveryAssessmentTests.Snapshot);
         var response = RecoveryAssessmentTests.Answer();
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(response)));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, response));
         using var http = api.Client("http://router.test/");
         var captures = 0;
         var assessor = new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "router-test-key"),
@@ -307,7 +308,7 @@ public class HotFileRecoveryTests
         Assert.Equal("safe", (await assessor.AssessAsync(snapshot, session1, CancellationToken.None)).Decision);
         captures = 1;
         Assert.Equal("inconclusive", (await assessor.AssessAsync(snapshot, session2, CancellationToken.None)).Decision);
-        Assert.Equal(new[] { session1, session2 }, api.Requests.Select(r => r.Headers[DarkFactory.Orchestrator.Gate.RouterReviewer.SessionHeader]));
+        Assert.Equal(new[] { session1, session2 }, api.Requests.Select(r => r.Headers[DarkFactory.Orchestrator.Gate.RouterReviewer.SessionHeader]).Distinct());
         Assert.All(api.Requests, request =>
         {
             Assert.Equal("high", request.Headers["x-weave-model-class"]);
@@ -410,11 +411,11 @@ public class HotFileRecoveryTests
             new WorkStory(77, "pending", $"Repo: {Repo}", "feature", "", ItemNaming.Shortcut)));
         var snapshot = new HotFileSnapshot("snapshot", Repo, 1, [], "evidence");
         var response = "";
-        var api = new FakeApi().On("POST /v1/messages", _ =>
+        var api = new FakeApi().On("POST /v1/messages", r =>
         {
             // Only GitHub changes, not the ledger or the board specification.
             if (scenario == "moved") github.Head = new string('b', 40);
-            return SseAnswers.Response(SseAnswers.Answer(response));
+            return AssessmentReads.Respond(r, response);
         });
         using var http = api.Client("http://router.test/");
         var assessor = new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "test-key"), async (trigger, ct) =>

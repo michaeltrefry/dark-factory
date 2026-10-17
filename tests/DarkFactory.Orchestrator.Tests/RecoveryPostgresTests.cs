@@ -95,10 +95,10 @@ public sealed class RecoveryPostgresTests
             var text = body.RootElement.GetProperty("messages")[0].GetProperty("content").GetString()!;
             using var input = JsonDocument.Parse(text[text.IndexOf('{')..(text.LastIndexOf('}') + 1)]);
             var root = input.RootElement;
-            return SseAnswers.Response(SseAnswers.Answer(JsonSerializer.Serialize(new {
+            return AssessmentReads.Respond(request, JsonSerializer.Serialize(new {
                 version = 1, snapshot = root.GetProperty("Id").GetString(), generation = root.GetProperty("Generation").GetInt32(),
                 repo = root.GetProperty("Repo").GetString(), decision = "safe", evidenceHash = root.GetProperty("EvidenceHash").GetString(),
-                materialSnapshot = root.GetProperty("material").GetProperty("Id").GetString(), citations = new[] { "merge:1" }, findings = Array.Empty<object>() })));
+                materialSnapshot = root.GetProperty("material").GetProperty("Id").GetString(), citations = new[] { "merge:1" }, findings = Array.Empty<object>() }));
         });
         using var http = api.Client("http://router.test/");
         Task<string> Capture(HotFileSnapshot s, CancellationToken _) => Task.FromResult(materials.Material(s));
@@ -106,7 +106,8 @@ public sealed class RecoveryPostgresTests
             f.Recovery.Seed.Time, new RouterHotFileAssessor(new RouterReviewer(http, "fixture"), Capture), capture: Capture);
         await using var a = Driver(); await using var b = Driver();
         await Task.WhenAll(a.AdvanceAsync("owner/alpha", default), b.AdvanceAsync("OWNER/ALPHA", default));
-        Assert.Single(api.Requests);
+        // One assessment session (its read_evidence turns included).
+        Assert.Single(api.Requests.Select(r => r.Headers[DarkFactory.Orchestrator.Gate.RouterReviewer.SessionHeader]).Distinct());
         await using var read = f.Recovery.Seed.Contexts.CreateDbContext();
         var accepted = Assert.Single(await read.RecoveryAssessmentAttempts.ToListAsync());
         Assert.Equal("Accepted", accepted.State);

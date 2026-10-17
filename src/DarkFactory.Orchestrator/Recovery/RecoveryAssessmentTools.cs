@@ -11,6 +11,11 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
     private readonly HashSet<string> _commits = snapshot.BaseTips.Values.Concat(snapshot.Evidence.SelectMany(e => new[] { e.Commit, e.BaseCommit }).OfType<string>())
         .Where(c => c.Length == 40 && c.All(Uri.IsHexDigit)).ToHashSet(StringComparer.Ordinal);
 
+    private readonly HashSet<string> _fullyRead = new(StringComparer.Ordinal);
+
+    /// <summary>Evidence ids a successful <c>read_evidence</c> served whole (not cut by the result or session budget).</summary>
+    internal IReadOnlySet<string> FullyRead => _fullyRead;
+
     internal AssessmentToolBindings Bindings => new(snapshot.Repo, files is null ? [EvidenceDefinition] : [ReadDefinition, EvidenceDefinition], RunAsync);
     private static readonly object ReadDefinition = new { name = "read_file", description = "Read a regular UTF-8 repository file at an exact snapshot commit. No branch refs.",
         input_schema = new { type = "object", properties = new { commit = new { type = "string" }, path = new { type = "string" } },
@@ -23,6 +28,7 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
         var raw = "";
         string? commit = null;
         var error = false;
+        string? read = null;
         try
         {
             if (_remaining <= 0) throw new InvalidOperationException("Assessment tool-result budget exhausted.");
@@ -49,6 +55,7 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
                         ?? throw new InvalidOperationException("Evidence is not in this snapshot.");
                     commit = evidence.Commit;
                     raw = JsonSerializer.Serialize(evidence);
+                    read = evidence.Id;
                     break;
                 default: throw new InvalidOperationException("Tool is not on the recovery read-only allowlist.");
             }
@@ -60,6 +67,7 @@ internal sealed class RecoveryAssessmentTools(RecoverySnapshot snapshot, IReview
         }
         var shown = ReviewTools.Bounded(raw, Math.Max(0, _remaining));
         _remaining -= shown.Length;
+        if (!error && use.Name == "read_evidence" && shown == raw && read is not null) _fullyRead.Add(read);
         return new(shown, error, new(use.Name ?? "", (use.InputJson ?? "")[..Math.Min(use.InputJson?.Length ?? 0, 2000)],
             RecoverySnapshot.Hash(raw), error, commit, Bytes: Encoding.UTF8.GetByteCount(raw)));
     }

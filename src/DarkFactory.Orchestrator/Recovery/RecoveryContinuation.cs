@@ -137,8 +137,12 @@ public sealed partial class HotFileRecovery
     /// null. One whose incident is no longer the repository's newest, while that newest incident is resolved, is returned
     /// without capture too: the newer safe assessment saw this item pending, and a fresh restart from the current base only
     /// discards work. Only the newest incident's own unconsumed disposition is revalidated against fresh evidence, and only
-    /// then may a mismatch send that incident back to Refreshing (a fresh assessment, bounded by the refresh budget): an old
-    /// incident is never reopened, so a repository is never held by a generation nothing advances.</para>
+    /// against what authorizes THAT restart (<see cref="RedirectStillAuthorized"/>): the incident's identity and generation,
+    /// the redirect's own base and commit, and the item's own pending evidence and requirements. Another item merging or
+    /// advancing, or a delivery base tip moving, is not about this restart and never reopens the incident (a reopened
+    /// incident would race the same way again on its next safe answer until the refresh budget escalated it). A mismatch
+    /// of the item's own evidence sends that incident back to Refreshing (a fresh assessment, bounded by the refresh
+    /// budget): an old incident is never reopened, so a repository is never held by a generation nothing advances.</para>
     /// </summary>
     public async Task<RecoveryRedirect?> RedirectAsync(string externalId, CancellationToken ct)
     {
@@ -170,8 +174,8 @@ public sealed partial class HotFileRecovery
         {
             if (capture is null) throw new InvalidOperationException("Redirect requires current pinned recovery evidence.");
             var answer = HotFileAssessment.FromDetail(incident.Answer);
-            if (answer?.Material is null || !await ContinuationMatchesAsync(db, incident, answer.Material,
-                await capture(HotFileSnapshot.Parse(incident.Snapshot), ct), ct))
+            if (answer?.Material is null || !RedirectStillAuthorized(incident, redirect, answer.Material,
+                await capture(HotFileSnapshot.Parse(incident.Snapshot), ct)))
                 throw new InvalidOperationException("Safe redirect evidence changed before continuation; fresh assessment required.");
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -184,63 +188,62 @@ public sealed partial class HotFileRecovery
         }
         return redirect;
     }
-    // Durable per-item consumption admits only ledgered continuation progress. Source requirements, relationships,
-    // delivery tips and merged evidence are still compared on every authorization, including after a slot wait.
-    private static async Task<bool> ContinuationMatchesAsync(LedgerDbContext db, HotFileIncident incident,
-        string baseline, string current, CancellationToken ct)
+
+    /// <summary>
+    /// Whether the safe answer's material (<paramref name="baseline"/>) still authorizes <paramref name="redirect"/>'s restart
+    /// against a fresh capture (<paramref name="current"/>). Compared: both complete and of the incident's snapshot, repository
+    /// and generation; the redirect's repository, its one delivery base and its commit — the disposition the safe answer saw
+    /// for this item, or, for one recorded with that answer, one of the incident's own merge commits (or none); and the item's
+    /// own pending evidence (only its continuation progress may be added: a claim, or an unpause) and its own requirements
+    /// (its spec, byte for byte) — unless the capture is the safe answer's material exactly. Nothing else: other items' evidence, base tips and dispositions do not authorize this restart.
+    /// </summary>
+    internal static bool RedirectStillAuthorized(HotFileIncident incident, RecoveryRedirect redirect, string baseline, string current)
     {
-        if (baseline == current) return true;
         var before = RecoverySnapshot.FromDetail(baseline);
         var after = RecoverySnapshot.FromDetail(current);
+        var trigger = HotFileSnapshot.Parse(incident.Snapshot);
         if (before is not { Complete: true } || after is not { Complete: true }
-            || before.IncidentSnapshot != after.IncidentSnapshot || before.Repo != after.Repo
-            || before.Generation != after.Generation
-            || JsonSerializer.Serialize(before.BaseTips) != JsonSerializer.Serialize(after.BaseTips)) return false;
-        var prefix = RecoveryRedirect.Prefix(incident.Id);
-        var consumed = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RecoveryRedirect.Started
-            && e.Detail != null && e.Detail.StartsWith(prefix)).Select(e => e.Detail).Distinct().Take(RecoverySnapshot.MaxPending + 1).ToListAsync(ct);
-        if (consumed.Count > RecoverySnapshot.MaxPending) return false;
-        var redirects = await RecoveryRedirect.LatestAsync(db, incident, ct);
-        var remaining = after.Evidence.ToList();
-        foreach (var old in before.Evidence)
+            || before.IncidentSnapshot != trigger.Id || after.IncidentSnapshot != trigger.Id
+            || before.Repo != incident.Repo || after.Repo != incident.Repo || redirect.Repo != incident.Repo
+            || before.Generation != incident.Generation || after.Generation != incident.Generation) return false;
+        var bases = trigger.Merges.Select(m => m.Base).Distinct().ToArray();
+        if (bases.Length != 1 || bases[0] != redirect.Base) return false;
+        var seen = before.Evidence.SingleOrDefault(e => e.Category == "disposition" && e.Id == $"redirect:{redirect.Item}");
+        if (seen is not null ? seen.Content != JsonSerializer.Serialize(redirect)
+            : redirect.Commit is not null && !trigger.Merges.Any(m => m.Commit == redirect.Commit)) return false;
+        if (baseline == current) return true;
+        var old = Own(before);
+        var next = Own(after);
+        if (old is null || next is null) return false;
+        return PendingProgressed(old.Value.Pending, next.Value.Pending) && old.Value.Spec is { } a && next.Value.Spec is { } b && a.Content == b.Content;
+
+        (RecoveryEvidence Pending, RecoveryEvidence? Spec)? Own(RecoverySnapshot material)
         {
-            var next = remaining.FirstOrDefault(e => e.Id == old.Id);
-            if (old.Category == "pending") next ??= remaining.FirstOrDefault(e => e.Category == "pending" && RecoveryDecision.PendingItem(e) == RecoveryDecision.PendingItem(old));
-            next ??= remaining.FirstOrDefault(e => e.Category == old.Category && e.Content == old.Content);
-            if (next is null) return false;
-            remaining.Remove(next);
-            if (old == next) continue;
-            if (old.Category != "pending")
-            {
-                if (old.Category == "spec" && old.Content == next.Content) continue;
-                return false;
-            }
-            var item = RecoveryDecision.PendingItem(old);
-            if (item is null || RecoveryDecision.PendingItem(next) != item) return false;
-            var redirect = redirects.SingleOrDefault(d => d.Item == item);
-            var started = redirect is not null && consumed.Contains(JsonSerializer.Serialize(redirect));
-            var a = JsonNode.Parse(old.Content)!.AsObject();
-            var b = JsonNode.Parse(next.Content)!.AsObject();
-            if (a["rows"] is not JsonArray ar || b["rows"] is not JsonArray br) return false;
-            if (br.Count < ar.Count || ar.Where((r, n) => !JsonNode.DeepEquals(r, br[n])).Any()) return false;
-            var added = br.Skip(ar.Count).ToArray();
-            var newlyClaimed = a["Id"]?.GetValue<long>() == 0;
-            if (!started && added.Any(r => newlyClaimed
-                ? r?["Step"]?.GetValue<string>() is not (null or RunPipeline.Steps.Claimed) || r?["State"]?.GetValue<int>() is not ((int)WorkState.Intake or (int)WorkState.Implement)
-                : r?["Step"] is not null || r?["Detail"]?.GetValue<string>() != "unpaused")) return false;
-            if (!newlyClaimed && a["Version"] is { } av && b["Version"] is { } bv
-                && bv.GetValue<long>() != av.GetValue<long>() + added.Length + (started ? 1 : 0)) return false;
-            if (started)
-            {
-                var pushed = added.LastOrDefault(r => r?["Step"]?.GetValue<string>() == RunPipeline.Steps.Pushed)?["Detail"]?.GetValue<string>();
-                if (b["head"] is { } head && pushed is not null && head.GetValue<string>() != pushed) return false;
-                foreach (var key in new[] { "head", "headState", "requiredDiscardRestart", "pull" }) { a.Remove(key); b.Remove(key); }
-            }
-            if (newlyClaimed) { a.Remove("Id"); b.Remove("Id"); a.Remove("EpicId"); b.Remove("EpicId"); }
-            foreach (var key in new[] { "rows", "Version", "State" }) { a.Remove(key); b.Remove(key); }
-            if (!JsonNode.DeepEquals(a, b)) return false;
+            var pending = material.Evidence.Where(e => e.Category == "pending" && RecoveryDecision.PendingItem(e) == redirect.Item).ToArray();
+            if (pending.Length != 1) return null;
+            var node = JsonNode.Parse(pending[0].Content)!.AsObject();
+            var key = node["Id"]?.GetValue<long>() is { } id and not 0 ? id.ToString(System.Globalization.CultureInfo.InvariantCulture) : redirect.Item;
+            return (pending[0], material.Evidence.SingleOrDefault(e => e.Category == "spec" && e.Id == $"spec:{key}"));
         }
-        return remaining.All(e => e.Category == "disposition" && redirects.Any(d => e.Content == JsonSerializer.Serialize(d)));
+    }
+
+    // Unconsumed: only ledgered continuation progress may be appended — a claim of a newly claimed item, or an unpause.
+    private static bool PendingProgressed(RecoveryEvidence old, RecoveryEvidence next)
+    {
+        if (old == next) return true;
+        var a = JsonNode.Parse(old.Content)!.AsObject();
+        var b = JsonNode.Parse(next.Content)!.AsObject();
+        if (a["rows"] is not JsonArray ar || b["rows"] is not JsonArray br) return false;
+        if (br.Count < ar.Count || ar.Where((r, n) => !JsonNode.DeepEquals(r, br[n])).Any()) return false;
+        var added = br.Skip(ar.Count).ToArray();
+        var newlyClaimed = a["Id"]?.GetValue<long>() == 0;
+        if (added.Any(r => newlyClaimed
+            ? r?["Step"]?.GetValue<string>() is not (null or RunPipeline.Steps.Claimed) || r?["State"]?.GetValue<int>() is not ((int)WorkState.Intake or (int)WorkState.Implement)
+            : r?["Step"] is not null || r?["Detail"]?.GetValue<string>() != "unpaused")) return false;
+        if (!newlyClaimed && a["Version"] is { } av && b["Version"] is { } bv && bv.GetValue<long>() != av.GetValue<long>() + added.Length) return false;
+        if (newlyClaimed) { a.Remove("Id"); b.Remove("Id"); a.Remove("EpicId"); b.Remove("EpicId"); }
+        foreach (var key in new[] { "rows", "Version", "State" }) { a.Remove(key); b.Remove(key); }
+        return JsonNode.DeepEquals(a, b);
     }
 
 }

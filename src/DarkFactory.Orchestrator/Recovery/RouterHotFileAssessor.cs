@@ -24,7 +24,8 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         // context. Every entry is read by id through read_evidence, which serves exactly these hashed bodies.
         var request = JsonSerializer.Serialize(new { version = 1, snapshot.Id, snapshot.Generation, snapshot.Repo, snapshot.EvidenceHash,
             materialHash = RecoverySnapshot.Hash(material), material = Index(captured) });
-        var bindings = new RecoveryAssessmentTools(captured, files, request.Length + prompt.Text.Length).Bindings;
+        var tools = new RecoveryAssessmentTools(captured, files, request.Length + prompt.Text.Length);
+        var bindings = tools.Bindings;
         AssessmentConversation? conversation = null;
         HotFileAssessment Inconclusive(string why) => new(snapshot.Id, snapshot.Generation, snapshot.Repo, conversation?.Class,
             "inconclusive", snapshot.EvidenceHash) { Problem = why, MaterialSnapshot = captured.Id };
@@ -35,6 +36,8 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
             if (conversation.Class != "high" || conversation.Stop != "end_turn" || conversation.Problem is not null)
                 throw new InvalidOperationException(conversation.Problem ?? "Unusable high-class assessment stream.");
             parsed = RecoveryDecision.Parse(conversation.Text, snapshot, captured);
+            if (Unread(parsed, captured, tools.FullyRead) is { Count: > 0 } unread)
+                parsed = Inconclusive($"A {parsed.Decision} answer rests on evidence it did not read in full: {string.Join(", ", unread)}.");
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
@@ -72,6 +75,26 @@ public sealed class RouterHotFileAssessor(RouterReviewer reviewer, Func<HotFileS
         return parsed with { Material = material, MaterialHash = RecoverySnapshot.Hash(material), Session = session, Prompt = prompt.Id,
             Tools = conversation?.Tools ?? [], Turns = conversation?.Turns ?? [],
             CostUsd = cost is { RequestCount: > 0 } ? cost.ActualCostUsdMicros / 1_000_000m : null };
+    }
+
+    /// <summary>
+    /// The evidence a safe or unsafe answer must have read whole and did not: every id it cites (top level and per finding),
+    /// and for a safe answer also every merged diff of the incident (the material that was in view when the bodies were
+    /// inline). Read whole = a successful <c>read_evidence</c> of that id whose result reached the model uncut
+    /// (<see cref="RecoveryAssessmentTools.FullyRead"/>: kept by the tool runner that produced this conversation's tool
+    /// records, so it is exactly the conversation's successful, uncut reads; calls past the session's caps are answered
+    /// without running and count as unread). The request is an index, so a citation is no evidence the model saw the body,
+    /// and a body cut by the per-result or session budget was not seen whole. A diff too large for one tool result, or
+    /// diffs together past the session's tool budget, therefore cannot be judged safe: the answer is inconclusive, and the
+    /// incident goes on to its next assessment or, at the budget, to escalation — a change too large to read is one a
+    /// human must look at.
+    /// </summary>
+    internal static IReadOnlyList<string> Unread(HotFileAssessment answer, RecoverySnapshot material, IReadOnlySet<string> fullyRead)
+    {
+        if (answer.Decision is not ("safe" or "unsafe")) return [];
+        var required = answer.Citations.Concat(answer.Findings.SelectMany(f => f.Citations));
+        if (answer.Decision == "safe") required = required.Concat(material.Evidence.Where(e => e.Category == "merged-diff").Select(e => e.Id));
+        return required.Distinct(StringComparer.Ordinal).Where(id => !fullyRead.Contains(id)).ToArray();
     }
 
     /// <summary>The material as the model is first shown it: identity, base tips, what is missing, and per evidence entry its id,

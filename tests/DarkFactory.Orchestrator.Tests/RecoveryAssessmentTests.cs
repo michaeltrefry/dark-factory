@@ -105,7 +105,7 @@ public sealed class RecoveryAssessmentTests
     {
         var costs = new SequencedCosts(null, new("cost", 0, 0), unknown ? null : new("cost", 1, 0), unknown ? null : new("cost", 2, 250000));
         var delays = new List<TimeSpan>();
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot)), costs,
@@ -121,7 +121,7 @@ public sealed class RecoveryAssessmentTests
     public async Task Measured_zero_is_known_spend_and_does_not_keep_retrying()
     {
         var costs = new SequencedCosts(new DarkFactory.Orchestrator.Router.SessionCost("zero", 1, 0));
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot)), costs, costSettleDelay: TimeSpan.Zero, costRetryDelays: [])
@@ -150,7 +150,7 @@ public sealed class RecoveryAssessmentTests
     {
         var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
         using var stop = new CancellationTokenSource();
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
         using var http = api.Client("http://router.test/");
         var costs = new HangingCosts(time, shutdown ? stop.Cancel : null);
         var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test"),
@@ -209,7 +209,7 @@ public sealed class RecoveryAssessmentTests
         var files = new Files();
         var turns = 0;
         var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
-            ? SseAnswers.ToolTurn(("read", "read_file", $$"""{"commit":"{{Tip}}","path":"src/a.cs"}"""))
+            ? SseAnswers.ToolTurn(("read", "read_file", $$"""{"commit":"{{Tip}}","path":"src/a.cs"}"""), ("evidence", "read_evidence", """{"id":"diff:1"}"""))
             : SseAnswers.Answer(Answer(decision, finding: decision == "unsafe"))));
         using var http = api.Client("http://router.test/");
         var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test"),
@@ -223,7 +223,7 @@ public sealed class RecoveryAssessmentTests
         Assert.Equal("fresh-assessment", persisted.Session);
         Assert.Contains("hot-file-assessment.md@sha256:", persisted.Prompt);
         Assert.Equal((Repo, Tip, "src/a.cs"), Assert.Single(files.Reads));
-        var call = Assert.Single(persisted.Tools);
+        var call = Assert.Single(persisted.Tools, t => t.Tool == "read_file");
         Assert.Equal(Tip, call.Commit);
         Assert.False(call.Error);
         Assert.Equal(2, persisted.Turns.Count);
@@ -244,7 +244,9 @@ public sealed class RecoveryAssessmentTests
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "indexed", CancellationToken.None);
-        Assert.Equal("safe", result.Decision);
+        // A body past one tool result's cap reaches the model cut, so it cannot support a safe answer.
+        Assert.Equal("inconclusive", result.Decision);
+        Assert.Contains("diff:1", result.Problem);
         var first = api.Requests[0].Body!;
         Assert.True(first.Length < 64 * 1024, $"the first request inlines the evidence ({first.Length} chars)");
         Assert.DoesNotContain(new string('d', 1000), first);
@@ -255,6 +257,73 @@ public sealed class RecoveryAssessmentTests
         Assert.Contains("pending:sc-2", first);
         Assert.Contains(new string('d', 1000), api.Requests[1].Body!);
         Assert.False(Assert.Single(result.Tools).Error);
+    }
+
+    [Theory]
+    [InlineData("read", "safe")]
+    [InlineData("no-reads", "inconclusive")]
+    [InlineData("cut", "inconclusive")]
+    [InlineData("other-diff-unread", "inconclusive")]
+    [InlineData("other-diff-read", "safe")]
+    [InlineData("safe-citation-unread", "inconclusive")]
+    [InlineData("unsafe-read", "unsafe")]
+    [InlineData("unsafe-citation-unread", "inconclusive")]
+    [InlineData("unsafe-finding-citation-unread", "inconclusive")]
+    [InlineData("failed-read", "inconclusive")]
+    public async Task A_safe_or_unsafe_answer_counts_only_over_evidence_it_read_in_full(string scenario, string expected)
+    {
+        var material = Snapshot;
+        if (scenario == "cut")
+        {
+            var large = new string('d', 100_000);
+            material = material with { Evidence = [material.Evidence[0] with { Content = large, Hash = RecoverySnapshot.Hash(large) }, material.Evidence[1]] };
+        }
+        if (scenario.StartsWith("other-diff", StringComparison.Ordinal))
+            material = material with { Evidence = [.. material.Evidence, new("diff:2", "merged-diff", "PR:2", Tip, "hash", "second diff")] };
+        var answer = scenario.StartsWith("unsafe", StringComparison.Ordinal) ? Answer("unsafe", "pending", "pending:sc-2", true)
+            : scenario == "safe-citation-unread" ? Answer(citation: "pending:sc-2") : Answer();
+        if (scenario == "unsafe-finding-citation-unread")
+        {
+            var node = System.Text.Json.Nodes.JsonNode.Parse(answer)!;
+            node["citations"] = new System.Text.Json.Nodes.JsonArray("diff:1");
+            answer = node.ToJsonString();
+        }
+        string[] reads = scenario switch
+        {
+            "no-reads" => [],
+            "other-diff-unread" => ["diff:1"],
+            "other-diff-read" => ["diff:1", "diff:2"],
+            "unsafe-read" => ["pending:sc-2"],
+            "unsafe-citation-unread" => ["diff:1"],
+            "unsafe-finding-citation-unread" => ["diff:1"],
+            "failed-read" => ["diff:1 "],
+            _ => ["diff:1"],
+        };
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1 && reads.Length > 0
+            ? SseAnswers.ToolTurn(reads.Select((id, n) => ($"read{n}", "read_evidence", JsonSerializer.Serialize(new { id }))).ToArray())
+            : SseAnswers.Answer(answer)));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "reads", CancellationToken.None);
+        Assert.Equal(expected, result.Decision);
+        Assert.Equal(reads.Length, result.Tools.Count);
+        if (expected == "inconclusive")
+        {
+            Assert.Contains("did not read in full", result.Problem);
+            Assert.Empty(result.CorrectionFindings);
+            Assert.Empty(result.PendingDispositions);
+        }
+        if (expected == "unsafe") Assert.Single(result.PendingDispositions);
+    }
+
+    [Fact]
+    public void The_assessment_prompt_says_an_unread_or_cut_citation_makes_the_answer_inconclusive()
+    {
+        var text = ReviewPrompts.For("hot-file-assessment").Text;
+        Assert.Contains("did not read in full with read_evidence", text);
+        Assert.Contains("[cut:", text);
+        Assert.Contains("every merged-diff entry in full", text);
     }
 
     [Theory]
@@ -269,7 +338,7 @@ public sealed class RecoveryAssessmentTests
         var turns = 0;
         var response = "";
         var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
-            ? SseAnswers.ToolTurn(("read", "read_file", $$"""{"commit":"{{Tip}}","path":"src/a.cs"}"""))
+            ? SseAnswers.ToolTurn(("read", "read_file", $$"""{"commit":"{{Tip}}","path":"src/a.cs"}"""), ("evidence", "read_evidence", """{"id":"diff:1"}"""))
             : SseAnswers.Answer(response)));
         using var http = api.Client("http://router.test/");
         var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test"), (trigger, _) =>
@@ -292,8 +361,8 @@ public sealed class RecoveryAssessmentTests
         Assert.Equal(incident.Prompt, stored.Prompt);
         Assert.Equal(0.125m, stored.CostUsd);
         Assert.Equal(new[] { "diff:1" }, stored.Citations);
-        Assert.Equal(Tip, Assert.Single(stored.Tools).Commit);
-        Assert.Equal("read_file", stored.Tools[0].Tool);
+        Assert.Equal(Tip, Assert.Single(stored.Tools, t => t.Tool == "read_file").Commit);
+        Assert.Equal(new[] { "read_file", "read_evidence" }, stored.Tools.Select(t => t.Tool));
         Assert.Equal(2, stored.Turns.Count);
         Assert.Equal(decision == "safe" ? "Resolved" : "Held", incident.State);
         var history = Assert.Single(db.LedgerEntries.Where(e => e.Step == HotFileAssessment.Step));
@@ -330,7 +399,7 @@ public sealed class RecoveryAssessmentTests
     public async Task Final_freshness_read_follows_cost_telemetry_so_it_cannot_accept_a_tip_changed_during_accounting()
     {
         var changed = false;
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer())));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot) + (changed ? " " : "")),
@@ -345,7 +414,7 @@ public sealed class RecoveryAssessmentTests
     [InlineData(null)]
     public async Task Wrong_final_class_cannot_accept_a_safe_decision(string? modelClass)
     {
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer()), modelClass: modelClass));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer(), modelClass: modelClass));
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot))).AssessAsync(Trigger, "fresh", CancellationToken.None);
@@ -467,7 +536,7 @@ public sealed class RecoveryAssessmentTests
     public async Task Changed_material_revokes_unsafe_dispositions_as_well_as_safe_resolution()
     {
         var captures = 0;
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(Answer("unsafe", finding: true))));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer("unsafe", finding: true)));
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot) + (++captures == 1 ? "" : " ")))
@@ -541,7 +610,7 @@ public sealed class RecoveryAssessmentTests
 
     internal static async Task<HotFileAssessment> Run(string text)
     {
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(text)));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, text));
         using var http = api.Client("http://router.test/");
         return await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot))).AssessAsync(Trigger, "fresh", CancellationToken.None);

@@ -55,16 +55,17 @@ public sealed class RecoveryReassessmentTests
             Assert.Contains(new string('9', 40), request.Body);
             Assert.DoesNotContain("correction-session", request.Body);
             var s = current!;
-            return SseAnswers.Response(SseAnswers.Answer(JsonSerializer.Serialize(new { version = 1, snapshot = s.Id,
+            return AssessmentReads.Respond(request, JsonSerializer.Serialize(new { version = 1, snapshot = s.Id,
                 generation = s.Generation, repo = s.Repo, decision = "safe", evidenceHash = s.EvidenceHash,
-                materialSnapshot = "corrected-" + s.Id, citations = new[] { "merge:1" }, findings = Array.Empty<object>() })), modelClass: servedClass);
+                materialSnapshot = "corrected-" + s.Id, citations = new[] { "merge:1" }, findings = Array.Empty<object>() }), modelClass: servedClass);
         });
         using var http = api.Client("http://router.test/");
         var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "fixture"), Capture);
         await using var recovery = new HotFileRecovery(f.Recovery.Seed.Contexts, f.Recovery.Seed.Locks,
             f.Recovery.Seed.Options, f.Recovery.Seed.Time, assessor, capture: Capture);
         await recovery.AdvanceAsync("owner/alpha", default);
-        Assert.Single(api.Requests);
+        // One assessment session (its read_evidence turns included).
+        Assert.Single(api.Requests.Select(r => r.Headers[DarkFactory.Orchestrator.Gate.RouterReviewer.SessionHeader]).Distinct());
         Assert.Equal(safe, await recovery.HeldAsync("owner/alpha", default) is null);
     }
 

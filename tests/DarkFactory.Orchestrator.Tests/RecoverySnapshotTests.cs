@@ -586,7 +586,7 @@ public sealed class RecoverySnapshotTests
         var response = JsonSerializer.Serialize(new { version = 1, snapshot = f.Trigger.Id, generation = f.Trigger.Generation, repo = Repo,
             decision = "safe", evidenceHash = f.Trigger.EvidenceHash, materialSnapshot = captured.Id,
             citations = new[] { captured.Evidence[0].Id }, findings = Array.Empty<object>() });
-        using var http = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(response)))
+        using var http = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, response))
             .Client("http://router.test/");
         var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test-key"), (_, token) =>
         {
@@ -599,4 +599,65 @@ public sealed class RecoverySnapshotTests
         Assert.Equal(2, captures);
     }
 
+
+    [Fact]
+    public async Task Two_concurrent_captures_of_the_same_material_store_it_once_and_record_it_once_per_item()
+    {
+        await using var database = await TempPostgresDatabase.CreateAsync("df_recovery_capture");
+        await LedgerMigrations.MigrateAsync(database.ConnectionString, default);
+        // Both captures pass "is the material stored?" before either inserts it, and both reach "is the capture recorded?"
+        // together unless something serializes them: each barrier waits for the other capture, or 3 s at most.
+        var materials = new Barrier2();
+        var records = new Barrier2();
+        var options = new DbContextOptionsBuilder<LedgerDbContext>(LedgerDbContext.PostgresOptions(database.ConnectionString))
+            .AddInterceptors(new MaterialSaves(materials), new RecordReads(records)).Options;
+        var f = new Fixture(options); await f.Seed();
+
+        var captures = await Task.WhenAll(Task.Run(() => f.Evidence.CaptureAsync(f.Trigger, default)),
+            Task.Run(() => f.Evidence.CaptureAsync(f.Trigger, default)));
+
+        Assert.Equal(captures[0], captures[1]);
+        Assert.Equal(2, materials.Arrived);
+        await using var db = f.Contexts.CreateDbContext();
+        var stored = Assert.Single(await db.RecoveryMaterials.ToListAsync());
+        Assert.Equal(RecoverySnapshot.Hash(captures[0]), stored.Hash);
+        var rows = await db.LedgerEntries.Where(e => e.Step == RecoverySnapshot.Step).ToListAsync();
+        Assert.Equal(rows.Count, rows.Select(e => e.WorkItemId).Distinct().Count());
+        Assert.Equal(f.Trigger.Merges[0].Item, Assert.Single(rows).WorkItemId);
+        Assert.Equal(stored.Hash, RecoveryCapture.FromDetail(rows[0].Detail)!.Material);
+    }
+
+    private sealed class Barrier2
+    {
+        private readonly TaskCompletionSource _all = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _arrived;
+        public int Arrived => Volatile.Read(ref _arrived);
+        public async Task ArriveAsync()
+        {
+            if (Interlocked.Increment(ref _arrived) >= 2) _all.TrySetResult();
+            await Task.WhenAny(_all.Task, Task.Delay(TimeSpan.FromSeconds(3)));
+        }
+    }
+
+    private sealed class MaterialSaves(Barrier2 barrier) : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context!.ChangeTracker.Entries<RecoveryMaterial>().Any(e => e.State == EntityState.Added)) await barrier.ArriveAsync();
+            return result;
+        }
+    }
+
+    private sealed class RecordReads(Barrier2 barrier) : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.Contains($"'{RecoverySnapshot.Step}'", StringComparison.Ordinal)) await barrier.ArriveAsync();
+            return result;
+        }
+    }
 }

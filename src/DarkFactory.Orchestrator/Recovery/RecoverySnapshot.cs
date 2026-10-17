@@ -84,6 +84,8 @@ public sealed record RecoverySnapshot(string Id, string IncidentSnapshot, string
 public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts, IGateGitHub github,
     Func<ItemNaming, IWorkSource> sources, TimeSpan? acquisitionTimeout = null, TimeProvider? time = null)
 {
+    private const int CaptureLockClass = 0x4446_5243; // "DFRC": a capture's ledger record, per anchor item
+
     public async Task<string> CaptureAsync(HotFileSnapshot trigger, CancellationToken ct)
     {
         var snapshot = await SnapshotAsync(trigger, ct);
@@ -112,14 +114,25 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         }
         var record = JsonSerializer.Serialize(new RecoveryCapture(hash, snapshot.Id, snapshot.IncidentSnapshot, snapshot.Repo,
             snapshot.Generation, Encoding.UTF8.GetByteCount(material), snapshot.Missing));
-        if (anchor is { } itemId && !await db.LedgerEntries.AnyAsync(e => e.WorkItemId == itemId
-                && e.Step == RecoverySnapshot.Step && e.Detail == record, persist))
+        if (anchor is { } itemId)
         {
-            var state = (await db.WorkItems.SingleAsync(i => i.Id == itemId, persist)).State;
-            db.LedgerEntries.Add(new LedgerEntry { WorkItemId = itemId, State = state,
-                Step = RecoverySnapshot.Step, Detail = record, RecordedAt = DateTimeOffset.UtcNow,
-                Outcome = StepOutcomes.Of(state, state, RecoverySnapshot.Step, record) });
-            await db.SaveChangesAsync(persist);
+            // Check and insert as one step per item: two captures of the same material at once (two drivers, or a driver
+            // and a run's revalidation) record it once. On Postgres a transaction-scoped two-key advisory lock of the item
+            // (its own key space: never a run lock, which is single-key) serializes them; it ends with the transaction.
+            await using var serial = db.Database.IsNpgsql() ? await db.Database.BeginTransactionAsync(persist) : null;
+            if (serial is not null)
+                await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_xact_lock({0}, {1})",
+                    [CaptureLockClass, unchecked((int)(itemId ^ (itemId >> 32)))], persist);
+            if (!await db.LedgerEntries.AnyAsync(e => e.WorkItemId == itemId
+                && e.Step == RecoverySnapshot.Step && e.Detail == record, persist))
+            {
+                var state = (await db.WorkItems.SingleAsync(i => i.Id == itemId, persist)).State;
+                db.LedgerEntries.Add(new LedgerEntry { WorkItemId = itemId, State = state,
+                    Step = RecoverySnapshot.Step, Detail = record, RecordedAt = DateTimeOffset.UtcNow,
+                    Outcome = StepOutcomes.Of(state, state, RecoverySnapshot.Step, record) });
+                await db.SaveChangesAsync(persist);
+            }
+            if (serial is not null) await serial.CommitAsync(persist);
         }
         if (!snapshot.Complete) throw new InvalidOperationException("Incomplete recovery snapshot: "
             + string.Join("; ", snapshot.Missing.Select(m => $"{m.Category}: {m.Reason}")));

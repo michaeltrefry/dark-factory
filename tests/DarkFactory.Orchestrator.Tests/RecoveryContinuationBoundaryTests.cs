@@ -231,10 +231,86 @@ public sealed class RecoveryContinuationBoundaryTests
         }
         finally { release.TrySetResult(); await blocker; }
         var result = await run;
-        Assert.Equal(change == "none" ? WorkState.Review : WorkState.Implement, result.State);
-        Assert.Equal(change == "none" ? 1 : 0, calls);
+        // The item's own requirements revoke the restart; a delivery base tip moving is not about it and does not.
+        var authorized = change != "spec";
+        Assert.Equal(authorized ? WorkState.Review : WorkState.Implement, result.State);
+        Assert.Equal(authorized ? 1 : 0, calls);
         await using var db = f.Contexts.CreateDbContext();
-        Assert.Equal(change == "none", await db.LedgerEntries.AnyAsync(e => e.Step == RecoveryRedirect.Started));
+        Assert.Equal(authorized, await db.LedgerEntries.AnyAsync(e => e.Step == RecoveryRedirect.Started));
+        Assert.Equal(authorized ? "Resolved" : "Refreshing", (await db.HotFileIncidents.SingleAsync()).State);
+    }
+
+    [Theory]
+    [InlineData("row")]
+    [InlineData("commit")]
+    public async Task Real_capture_the_redirected_items_own_new_evidence_still_sends_the_incident_back_to_a_fresh_assessment(string change)
+    {
+        var f = await SeedSafe(two: true);
+        await using var recovery = Recovery(f);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var own = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-2");
+            if (change == "row")
+            {
+                // Not continuation progress (a claim or an unpause): something happened to sc-2 itself since the safe answer.
+                db.Add(new LedgerEntry { WorkItemId = own.Id, State = WorkState.Paused, Step = RunPipeline.Steps.Verdict, Detail = "{}", Outcome = StepOutcome.Passed });
+                own.Version++;
+            }
+            else
+            {
+                // A disposition for sc-2 the safe answer never saw: another commit to restart from.
+                var seen = RecoveryRedirect.Parse((await db.LedgerEntries.Where(e => e.Step == RecoveryRedirect.Step)
+                    .OrderByDescending(e => e.Id).ToListAsync()).Select(e => e.Detail).First(d => RecoveryRedirect.Parse(d)!.Item == "sc-2"))!;
+                db.Add(new LedgerEntry { WorkItemId = own.Id, State = WorkState.Paused, Step = RecoveryRedirect.Step,
+                    Detail = JsonSerializer.Serialize(seen with { Commit = new string('e', 40) }), Outcome = StepOutcome.Deferred });
+            }
+            await db.SaveChangesAsync();
+        }
+        var before = await IncidentAsync(f);
+        await Assert.ThrowsAsync<RecoveryContinuationDeferredException>(() => recovery.RedirectAsync("sc-2", default));
+        var after = await IncidentAsync(f);
+        Assert.Equal(("Refreshing", before.Version + 1), (after.State, after.Version));
+        await using (var db = f.Contexts.CreateDbContext())
+            Assert.False(await db.LedgerEntries.AnyAsync(e => e.Step == RecoveryRedirect.Started));
+    }
+
+    [Fact]
+    public async Task Real_capture_another_pending_item_merging_first_does_not_reopen_the_incident_for_an_unconsumed_redirect()
+    {
+        var f = await SeedSafe(two: true);
+        var captures = 0;
+        await using var recovery = Counting(f, () => captures++);
+        // sc-3 was held in MergeGate; its hold lifted and it merged before sc-2's dispatch reached its redirect. The merge
+        // moves the delivery base and appends rows other than a claim or an unpause to sc-3's pending evidence.
+        f.GitHub.Compare = _ => new("new-default-tip", 0);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var other = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-3");
+            db.Add(new LedgerEntry { WorkItemId = other.Id, State = WorkState.Merge, Detail = new string('8', 40), Outcome = StepOutcome.Passed });
+            db.Add(new LedgerEntry { WorkItemId = other.Id, State = WorkState.Watch, Outcome = StepOutcome.Passed });
+            other.State = WorkState.Watch;
+            other.Version += 2;
+            await db.SaveChangesAsync();
+        }
+        var resolved = await IncidentAsync(f);
+        Assert.NotEqual(HotFileAssessment.FromDetail(resolved.Answer)!.Material, await f.Evidence.CaptureAsync(f.Trigger, default));
+        captures = 0;
+
+        Assert.NotNull(await recovery.RedirectAsync("sc-2", default));
+        Assert.Equal(1, captures);
+        var spaces = new FakeWorkspaces();
+        var calls = 0;
+        var result = await Run(f, recovery, 2, spaces, new FakeWorker(async call =>
+        {
+            calls++; Assert.Null(call.Resume); Assert.Contains(Delivered, call.Prompt);
+            await call.Callbacks.OnSession!("fresh", default); return Ok with { SessionId = "fresh" };
+        }));
+
+        Assert.Equal(WorkState.Review, result.State);
+        Assert.Equal(1, calls);
+        var after = await IncidentAsync(f);
+        Assert.Equal(("Resolved", 0, resolved.Version), (after.State, after.Refreshes, after.Version));
+        Assert.Null(await recovery.HeldAsync(Repo, default));
     }
 
     /// <summary>A recovery whose capture is counted: a disposition already acted on must need none.</summary>

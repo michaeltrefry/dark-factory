@@ -925,14 +925,22 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   retries after 30 s, then 120 s; at most one assessment per repository and two across processes (two advisory seats beside a
   process limiter); snapshots refuse more than 50 contributing merges, 100 pending items or 2 MiB as incomplete, never safe. A capture's body
   is stored once per content hash in `recovery_materials` (`RecoveryMaterial`, migration `RecoveryMaterials`) before any
-  router call, and its `recovery-snapshot` ledger row is a small `RecoveryCapture` naming that hash (with what was missing),
+  router call (two concurrent captures of one material: the loser of the key race finds it stored and goes on), and its
+  `recovery-snapshot` ledger row is a small `RecoveryCapture` naming that hash (with what was missing), written once per item
+  (on Postgres the check and the insert are serialized per item by a transaction-scoped two-key advisory lock, never a run lock),
   so captures at every authority boundary never add multi-MiB rows to an item's history; the full material stays in the
   assessment's own answer.
   Assessment (E4/E5): a fresh router session on `high` (`RouterHotFileAssessor`, the compiled-in `hot-file-assessment`
   prompt, read-only tools pinned to snapshot commits; the request carries an index of the evidence — each entry's id,
   category, provenance, commits, SHA-256 and size, `RouterHotFileAssessor.Index` — and the model reads each body through
   `read_evidence`, so the tool budget is not spent on inline material), its answer bound to incident, generation, snapshot, repo and evidence
-  hash and parsed strictly (`RecoveryDecision`); only the exact current safe answer resolves, acknowledging exactly its
+  hash and parsed strictly (`RecoveryDecision`). A safe or unsafe answer counts only over evidence it read whole
+  (`RouterHotFileAssessor.Unread`, sc-26335): every id it cites, top level and per finding, and for a safe answer every
+  `merged-diff` entry of the incident, must have been served by a successful `read_evidence` whose result reached the model
+  uncut (`RecoveryAssessmentTools.FullyRead`); otherwise the answer is inconclusive, naming the unread ids, and the prompt says
+  so. Consequence, accepted: a diff over one tool result's cap (60,000 bytes serialized), diffs together past the session's
+  tool budget (about 200,000 characters) or more required reads than `RouterReviewer.MaxToolCalls` (24) cannot be judged safe —
+  the incident is reassessed until its budgets escalate it to a human. Only the exact current safe answer resolves, acknowledging exactly its
   (merge row, base, file) tuples beyond the window and restarts (a later merge of a reviewed file opens a new generation).
   Correction (E7/E8): an accepted unsafe merged finding materializes ONE `rc-<n>` work item per attempt in exactly the
   incident's repository and recorded base (`RecoveryWorkSource`, internal, no board credential; its spec is planner-like data),
@@ -951,8 +959,13 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   is returned as recorded with no capture, lock or write (another item's merge moving the base, or another pending item
   advancing, says nothing about a restart already made); one the item outgrew without restarting (Merge, Watch, Done,
   Cancelled, a plan coordinator) is void; one of an older incident is returned without capture when the newest incident is
-  resolved and deferred while it is not. Only the newest incident's own unconsumed disposition may send that incident back to
-  Refreshing on a mismatch, so an old generation is never reopened. Every unresolved incident of a repository holds it, and
+  resolved and deferred while it is not. The newest incident's own unconsumed disposition is revalidated only against what
+  authorizes that restart (`HotFileRecovery.RedirectStillAuthorized`): the incident's snapshot, repository and generation, the
+  redirect's base and commit (the disposition the safe answer saw, or for one recorded with it one of the incident's merge
+  commits), and the item's own pending evidence (only a claim or an unpause may be added) and its own spec. Another item
+  merging or advancing, or a delivery base tip moving, does not reopen it (it would race the same way after every safe
+  answer until the refresh budget escalated it); only a mismatch of those may send that incident back to Refreshing, so an
+  old generation is never reopened. Every unresolved incident of a repository holds it, and
   every one is advanced (`AdvanceAsync`, oldest generation first) and re-armed (`reassess` re-arms each escalated incident,
   each to the next generation after all of the repository's). Held work: an item a hold stops mid-run is recorded `recovery-held` when only the incident holds it
   (resumes by itself once it resolves; dashboard phase "held by repository recovery"), and so is a correction whose boundary
