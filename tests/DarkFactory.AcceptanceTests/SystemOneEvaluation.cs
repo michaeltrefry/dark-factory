@@ -4,6 +4,7 @@ using System.Text.Json;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Issues;
 using DarkFactory.Orchestrator.Git;
+using DarkFactory.Orchestrator.Worker;
 
 namespace DarkFactory.AcceptanceTests;
 
@@ -158,12 +159,21 @@ public static class SystemOneEvaluation
             foreach (var mode in i % 2 == 0 ? new[] { "disabled", "advisory" } : new[] { "advisory", "disabled" })
             {
                 CheckCancellation();
-                await runner.RunAsync(corpus.Reports[i], mode, async observation =>
+                try
                 {
-                    observations.Add(observation);
-                    // Not the campaign token: an interrupt must not cancel evidence persistence.
-                    if (checkpoint is not null) { await checkpoint(observations, null); }
-                }, ct);
+                    await runner.RunAsync(corpus.Reports[i], mode, async observation =>
+                    {
+                        observations.Add(observation);
+                        // Not the campaign token: an interrupt must not cancel evidence persistence.
+                        if (checkpoint is not null) { await checkpoint(observations, null); }
+                    }, ct);
+                }
+                catch (Xunit.Sdk.SkipException)
+                {
+                    // Live opt-in gating precedes this loop. A missing arm prerequisite is not a green skipped campaign.
+                    // Do not include the original exception: shared harness diagnostics may contain URLs/secrets/bodies.
+                    throw new InvalidOperationException("Evaluation arm prerequisite unavailable; campaign incomplete (no automatic retry).");
+                }
             }
         }
         CheckCancellation();
@@ -283,10 +293,124 @@ internal sealed class EvaluationCancellation : IAsyncDisposable
     }
 }
 
+// Evaluation-only ownership. The parent is owner-controlled; workers have fully unwound before disposal.
+// Like GitWorkspace's owner-side fallback, Directory.Delete(recursive: true) unlinks directory symlinks,
+// never traversing their targets. No extra sandbox helper (and hence no uid sweep) is launched here.
+public sealed class EvaluationWorkRoot
+{
+    private static readonly System.Collections.Concurrent.ConcurrentBag<IDisposable> RetainedLocks = new();
+    private bool workerMayBeRunning;
+    private int active;
+    private readonly int workerSlots;
+    public string Path { get; }
+    private EvaluationWorkRoot(string path, int workerSlots) => (Path, this.workerSlots) = (path, workerSlots);
+
+    public static EvaluationWorkRoot Create(string parent, string name, int workerSlots = 1)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0)
+        { throw new InvalidDataException("Evaluation root must be a unique child directory."); }
+        if (workerSlots is < 1 or > WorkerSlots.MaxSlots) { throw new ArgumentOutOfRangeException(nameof(workerSlots)); }
+        var path = System.IO.Path.Combine(System.IO.Path.GetFullPath(parent), name);
+        RequireNoLinkedAncestors(path);
+        if (System.IO.Path.Exists(path)) { throw new IOException("Evaluation root already exists; refusing to adopt it."); }
+        Directory.CreateDirectory(path);
+        return new EvaluationWorkRoot(path, workerSlots);
+    }
+
+    private static void RequireNoLinkedAncestors(string path)
+    {
+        for (var directory = new DirectoryInfo(path); directory is not null; directory = directory.Parent)
+        {
+            if (directory.LinkTarget is not null)
+            { throw new InvalidDataException("Evaluation root or ancestor is a symlink; refusing cleanup/creation."); }
+        }
+    }
+
+    public async Task RunAsync(Func<Task> run)
+    {
+        Interlocked.Increment(ref active);
+        try { await run(); }
+        catch (Exception ex) when (DarkFactory.Orchestrator.Worker.WorkerStillRunning.IsMarked(ex))
+        {
+            workerMayBeRunning = true;
+            throw;
+        }
+        finally { Interlocked.Decrement(ref active); }
+    }
+
+    // Guard the runner itself: IssueIntake can record/swallow a triage failure before it reaches the arm.
+    public ITriageRunner Guard(ITriageRunner runner) => new GuardedRunner(this, runner);
+    private sealed class GuardedRunner(EvaluationWorkRoot root, ITriageRunner inner) : ITriageRunner
+    {
+        public async Task<WorkerResult> RunAsync(DarkFactory.Orchestrator.Ledger.WorkItem item, RepoRef repo, string prompt,
+            Func<string, CancellationToken, Task> onSession, Func<string, string, CancellationToken, Task> onTaint, CancellationToken ct)
+        {
+            WorkerResult? result = null;
+            await root.RunAsync(async () => { result = await inner.RunAsync(item, repo, prompt, onSession, onTaint, ct); });
+            return result!;
+        }
+    }
+
+    public async Task DisposeAsync(Func<Task> dropLedger, IDisposable? heldLocks)
+    {
+        if (workerMayBeRunning || Volatile.Read(ref active) != 0)
+        {
+            // The unsafe arm cannot continue. Keep the real machine locks strongly rooted until this process exits;
+            // operator inspection is required, rather than deleting under a worker or starting another sweeping helper.
+            if (heldLocks is not null) { RetainedLocks.Add(heldLocks); }
+            throw new InvalidOperationException($"Evaluation worker may still be running; retained ledger, locks and work root {Path}. Stop/inspect the runner before manual cleanup.");
+        }
+        var stopped = new List<IDisposable>();
+        try
+        {
+            // Exception markers alone are insufficient: probe cancellation can be unmarked, and recorder cleanup
+            // can replace a worker's exception. EndAsync/KeepUntil retains the actual isolated slot lock in both cases.
+            RequireNoLinkedAncestors(Path);
+            for (var slot = 1; slot <= workerSlots; slot++)
+            {
+                var lockPath = WorkerLock.For(Path, slot).Path;
+                RequireNoLinkedAncestors(System.IO.Path.GetDirectoryName(lockPath)!);
+                if (new FileInfo(lockPath).LinkTarget is not null) { throw new InvalidDataException("Linked evaluation lock file."); }
+                stopped.Add(WorkerLock.Acquire(Path, slot)); // Nonblocking; no process/helper/probe.
+            }
+        }
+        catch (Exception ex)
+        {
+            stopped.ForEach(held => held.Dispose());
+            if (heldLocks is not null) { RetainedLocks.Add(heldLocks); }
+            throw new InvalidOperationException($"Evaluation sandbox quiescence not established ({ex.GetType().Name}); retained ledger, machine locks and work root {Path}. Inspect the runner before manual cleanup.");
+        }
+        try
+        {
+            try { await dropLedger(); }
+            finally
+            {
+                RequireNoLinkedAncestors(Path);
+                if (Directory.Exists(Path)) { Directory.Delete(Path, recursive: true); }
+            }
+        }
+        finally
+        {
+            stopped.ForEach(held => held.Dispose());
+            heldLocks?.Dispose();
+        }
+    }
+}
+
 // Evaluation-only prerequisites. No board, GitHub App, gate or review credentials are read.
 // The caller transfers the held machine sandbox locks to the isolated ledger on success.
 public static class EvaluationSetup
 {
+    public static async Task RequireRouterAsync(Func<CancellationToken, Task> probe, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        try { await probe(ct); }
+        catch (Exception ex) when (!ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException)
+        {
+            throw new InvalidOperationException($"Evaluation router prerequisite unreachable ({ex.GetType().Name}); campaign incomplete (no automatic retry).");
+        }
+    }
+
     public static async Task<T> StartAsync<T>(FactoryOptions options, Func<IDisposable> acquireLocks,
         Func<T, Task> sandboxProbe, Func<IDisposable, Task<T>> createIsolatedLedger, CancellationToken ct = default) where T : IAsyncDisposable
     {

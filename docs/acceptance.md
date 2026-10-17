@@ -51,6 +51,26 @@ The watcher is stopped, drained and disposed on every exit. An incomplete/cancel
 that is not a completed performance/quality result and does not authorize rerunning or relabeling the frozen corpus.
 An already-running older harness cannot acquire this feature retroactively.
 
+Evaluation gating is separate from campaign completion: absent live opt-ins or missing model/report configuration
+may intentionally skip **before** the campaign starts. Once the campaign loop is entered, any arm prerequisite skip
+is a failure, not a successful skipped run. Router reachability failures (including between arms) name the prerequisite
+and exception type only, never the raw response, URL or key. There are no automatic inference retries; completed arms
+stay in the `incomplete` file and no final summary is emitted.
+
+Each evaluation arm creates and owns its unique `<Factory:WorkRoot>/e2e/df_systemone_eval_<guid>` directory.
+After the production triage runner has fully unwound, teardown first acquires every isolated worker-slot lock
+nonblocking and holds them through ledger/root cleanup. A helper that outlives shutdown retains that actual lock
+through production `KeepUntil`, even if cancellation is unmarked or recorder cleanup replaces its exception.
+Only once all isolated locks are held does teardown drop that arm's ledger and remove only that directory
+before releasing the machine sandbox locks. Owner-side recursive deletion unlinks nested symlinks without following
+their targets; a symlink at the root or any ancestor is refused. This adds no helper, uid sweep, chmod/chown or signal.
+An inaccessible leftover is a teardown failure (not a reason to launch a privileged cleanup helper). If a probe or triage
+reports a worker still running, or any isolated lock cannot be acquired (including unsafe linked lock paths), the harness
+refuses ledger/root teardown and retains the machine locks until its process exits; inspect/stop the runner before any
+manual cleanup or new sandbox activity. Existing older campaign directories
+are not adopted or swept by this code: collect only individually verified owned roots after the terminal runner is stopped,
+with evidence stored outside them. Do not use a wildcard or a sandbox helper to clean up historical roots.
+
 ## Safety first (read before any live run)
 
 - **The `_factory` user is single-tenant** — and so is each further sandbox user of a machine set up with worker slots

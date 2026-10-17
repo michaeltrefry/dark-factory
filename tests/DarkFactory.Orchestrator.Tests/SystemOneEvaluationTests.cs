@@ -316,6 +316,229 @@ public class SystemOneEvaluationTests
         finally { Directory.Delete(directory, true); }
     }
 
+    [Fact]
+    public async Task Prerequisite_skip_after_one_arm_is_a_non_skip_failure_without_retry_or_summary()
+    {
+        var directory = NewCancellationArtifactDirectory();
+        var output = Path.Combine(directory, "evidence.json");
+        var calls = 0;
+        try
+        {
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => new DelegateEvaluationArm((input, mode, _) => ++calls == 1
+                    ? Task.FromResult(Sample(input, mode))
+                    : throw Xunit.Sdk.SkipException.ForSkip("PRIVATE_ROUTER_BODY_KEY")), CancellationToken.None));
+            Assert.Contains("prerequisite", failure.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("PRIVATE_ROUTER_BODY_KEY", failure.ToString());
+            Assert.Equal(2, calls);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(await File.ReadAllTextAsync(output))!;
+            Assert.Equal(("incomplete", 1, (EvaluationReport?)null), (evidence.Status, evidence.Observations.Count, evidence.Summary));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    private sealed class OutageArm(string parent, List<string> trace) : IEvaluationArm
+    {
+        private int calls;
+        public async Task RunAsync(EvaluationInput input, string mode, Func<EvaluationObservation, Task> completed, CancellationToken ct)
+        {
+            if (++calls == 2)
+            {
+                await EvaluationSetup.RequireRouterAsync(_ => throw new HttpRequestException("PRIVATE_ROUTER_BODY_KEY"), ct);
+            }
+            var root = EvaluationWorkRoot.Create(parent, "arm-" + calls);
+            try
+            {
+                await root.RunAsync(() => { trace.Add("runner-stopped"); return Task.CompletedTask; });
+                await completed(Sample(input, mode));
+                trace.Add("checkpoint");
+            }
+            finally
+            {
+                await root.DisposeAsync(() => { trace.Add("ledger"); return Task.CompletedTask; },
+                    new CallbackDisposable(() => { Assert.False(Directory.Exists(root.Path)); trace.Add("unlock"); }));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Router_outage_after_one_arm_preserves_incomplete_evidence_and_unwinds_owned_resources_in_order()
+    {
+        var parent = NewCancellationArtifactDirectory();
+        var output = Path.Combine(parent, "evidence.json");
+        var trace = new List<string>();
+        try
+        {
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output,
+                _ => new OutageArm(parent, trace), CancellationToken.None));
+            Assert.Contains("router", failure.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("PRIVATE_ROUTER_BODY_KEY", failure.ToString());
+            Assert.Equal(new[] { "runner-stopped", "checkpoint", "ledger", "unlock" }, trace);
+            Assert.Empty(Directory.GetDirectories(parent));
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(await File.ReadAllTextAsync(output))!;
+            Assert.Equal(("incomplete", 1, (EvaluationReport?)null), (evidence.Status, evidence.Observations.Count, evidence.Summary));
+        }
+        finally { Directory.Delete(parent, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_root_removes_only_its_owned_tree_after_runner_and_ledger_before_unlock()
+    {
+        var parent = NewCancellationArtifactDirectory();
+        var trace = new List<string>();
+        try
+        {
+            var root = EvaluationWorkRoot.Create(parent, "arm", workerSlots: 2);
+            var foreign = Directory.CreateDirectory(Path.Combine(parent, "foreign")).FullName;
+            var sentinel = Path.Combine(foreign, "sentinel");
+            await File.WriteAllTextAsync(sentinel, "owner");
+            var nested = Directory.CreateDirectory(Path.Combine(root.Path, "nested")).FullName;
+            await File.WriteAllTextAsync(Path.Combine(nested, "owned"), "inert");
+            Directory.CreateSymbolicLink(Path.Combine(nested, "outside"), foreign);
+            File.CreateSymbolicLink(Path.Combine(nested, "file-link"), sentinel);
+            File.CreateSymbolicLink(Path.Combine(nested, "dangling"), Path.Combine(foreign, "missing"));
+            await root.RunAsync(async () => { await Task.Yield(); trace.Add("runner-stopped"); });
+            await root.DisposeAsync(() =>
+            {
+                Assert.True(Directory.Exists(root.Path));
+                Assert.Throws<InvalidOperationException>(() => WorkerLock.Acquire(root.Path));
+                Assert.Throws<InvalidOperationException>(() => WorkerLock.Acquire(root.Path, 2));
+                trace.Add("ledger");
+                return Task.CompletedTask;
+            }, new CallbackDisposable(() =>
+            {
+                Assert.False(Directory.Exists(root.Path));
+                trace.Add("unlock");
+            }));
+            Assert.Equal(new[] { "runner-stopped", "ledger", "unlock" }, trace);
+            Assert.Equal("owner", await File.ReadAllTextAsync(sentinel));
+            Assert.Throws<IOException>(() => EvaluationWorkRoot.Create(parent, "foreign"));
+            Assert.Throws<InvalidDataException>(() => EvaluationWorkRoot.Create(parent, "../foreign"));
+        }
+        finally { Directory.Delete(parent, true); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Evaluation_root_rejects_linked_ancestor_or_replaced_root_and_releases_safe_locks(bool ancestor)
+    {
+        var parent = NewCancellationArtifactDirectory();
+        var released = false;
+        try
+        {
+            var root = EvaluationWorkRoot.Create(parent, "arm");
+            var outside = Directory.CreateDirectory(Path.Combine(parent, "foreign")).FullName;
+            var sentinel = Path.Combine(outside, "sentinel");
+            await File.WriteAllTextAsync(sentinel, "owner");
+            var alias = Path.Combine(parent, "alias");
+            Directory.CreateSymbolicLink(alias, outside);
+            Assert.Throws<InvalidDataException>(() => EvaluationWorkRoot.Create(alias, "child"));
+            if (ancestor)
+            {
+                Directory.Move(root.Path, Path.Combine(parent, "saved"));
+                Directory.CreateSymbolicLink(root.Path, outside);
+            }
+            var failure = await Record.ExceptionAsync(() => root.DisposeAsync(() => throw new IOException("fake-ledger-teardown"),
+                new CallbackDisposable(() => released = true)));
+            if (ancestor) { Assert.IsType<InvalidOperationException>(failure); }
+            else { Assert.IsType<IOException>(failure); }
+            Assert.Equal(!ancestor, released); // Unknown quiescence at a replaced root retains the machine locks.
+            Assert.Equal("owner", await File.ReadAllTextAsync(sentinel));
+            if (ancestor) { Assert.NotNull(new DirectoryInfo(root.Path).LinkTarget); }
+            else { Assert.False(Directory.Exists(root.Path)); }
+        }
+        finally { Directory.Delete(parent, true); }
+    }
+
+    [Fact]
+    public async Task Evaluation_root_cleanup_failure_surfaces_and_unlocks_but_unstopped_worker_retains_everything()
+    {
+        var parent = NewCancellationArtifactDirectory();
+        var released = false;
+        var ledger = false;
+        try
+        {
+            var root = EvaluationWorkRoot.Create(parent, "arm");
+            var foreign = Directory.CreateDirectory(Path.Combine(parent, "foreign")).FullName;
+            await Assert.ThrowsAsync<InvalidDataException>(() => root.DisposeAsync(() =>
+            {
+                // A fake deletion failure after quiescence is established must still release locks.
+                Directory.Move(root.Path, Path.Combine(parent, "saved"));
+                Directory.CreateSymbolicLink(root.Path, foreign);
+                return Task.CompletedTask;
+            }, new CallbackDisposable(() => released = true)));
+            Assert.True(released);
+            var running = EvaluationWorkRoot.Create(parent, "running");
+            released = false;
+            var triage = new IssueIntakeTests.FakeTriage();
+            triage.Answers.Add(() => throw DarkFactory.Orchestrator.Worker.WorkerStillRunning.Mark(new InvalidOperationException("fake-worker-running")));
+            // Simulate intake swallowing the exception: the guarded runner must remember it independently.
+            await Assert.ThrowsAsync<InvalidOperationException>(() => running.Guard(triage).RunAsync(new WorkItem { ExternalId = "gh-1", Source = "github", Title = "Synthetic", Repo = "synthetic/repo" },
+                RepoRef.Parse("synthetic/repo"), "synthetic", (_, _) => Task.CompletedTask, (_, _, _) => Task.CompletedTask, CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => running.DisposeAsync(() => { ledger = true; return Task.CompletedTask; },
+                new CallbackDisposable(() => released = true)));
+            Assert.False(ledger);
+            Assert.False(released);
+            Assert.True(Directory.Exists(running.Path));
+        }
+        finally { Directory.Delete(parent, true); } // Inert fake only; no worker exists.
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Evaluation_teardown_refuses_an_isolated_slot_still_held_without_a_worker_exception_marker(int busySlot)
+    {
+        var parent = NewCancellationArtifactDirectory();
+        var released = false;
+        var ledgerDropped = false;
+        try
+        {
+            var root = EvaluationWorkRoot.Create(parent, "arm", workerSlots: 2);
+            using var busy = WorkerLock.Acquire(root.Path, busySlot); // Inert real file lock; no process/helper.
+            // The outer production call can hide a marker or return cancellation; the underlying hold is the authority.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => root.RunAsync(() => throw new OperationCanceledException()));
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => root.DisposeAsync(
+                () => { ledgerDropped = true; return Task.CompletedTask; }, new CallbackDisposable(() => released = true)));
+            Assert.Contains("retained", failure.Message);
+            Assert.False(ledgerDropped);
+            Assert.False(released);
+            Assert.True(Directory.Exists(root.Path));
+            if (busySlot == 2)
+            {
+                // An unsuccessful acquire-all releases its own partial hold, never the real machine locks.
+                using var first = WorkerLock.Acquire(root.Path, 1);
+            }
+        }
+        finally { Directory.Delete(parent, true); }
+    }
+
+    private sealed class CallbackDisposable(Action dispose) : IDisposable
+    {
+        public void Dispose() => dispose();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Evaluation_router_outage_fails_with_sanitized_diagnostic_and_preserves_caller_cancellation(bool cancelled)
+    {
+        using var cancel = new CancellationTokenSource();
+        if (cancelled) { cancel.Cancel(); }
+        Task Probe(CancellationToken ct) => cancelled ? Task.FromCanceled(ct) : throw new HttpRequestException("PRIVATE_BODY_KEY_URL");
+        if (cancelled)
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EvaluationSetup.RequireRouterAsync(Probe, cancel.Token));
+        }
+        else
+        {
+            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => EvaluationSetup.RequireRouterAsync(Probe, cancel.Token));
+            Assert.Contains("router", failure.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("PRIVATE_BODY_KEY_URL", failure.ToString());
+        }
+    }
+
     private static EvaluationObservation Sample(EvaluationInput input, string mode) =>
         new(input.CaseId, mode, 1, 0, "Question", false, null, null, null, null, null,
             new Dictionary<string, int>(), "prompt-sha", "repository-sha", null);
