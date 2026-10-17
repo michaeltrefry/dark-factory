@@ -31,7 +31,8 @@ public class SystemOneEvaluationLiveTests
         // SandboxTriageRunner itself refuses an unsandboxed triage (covered by a non-live self-test).
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(TimeSpan.FromMinutes(100));
-        var result = await SystemOneEvaluation.RunToFileAsync(root, output, corpus => new LiveEvaluationArm(corpus, model), timeout.Token);
+        var cancelFile = Environment.GetEnvironmentVariable("FACTORY_E2E_SYSTEMONE_CANCEL_FILE");
+        var result = await SystemOneEvaluation.RunToFileAsync(root, output, corpus => new LiveEvaluationArm(corpus, model), timeout.Token, cancelFile);
         Assert.Equal(15, result.Pairs.Count);
         // Failed performance/quality goals remain measured evidence, not a reason to relabel or rerun the corpus.
         Console.WriteLine($"SystemOne paired report: {output}; corpus {result.CorpusIdentity}; {result.Pairs.Count} pairs; optimization not established.");
@@ -43,7 +44,7 @@ internal sealed class LiveEvaluationArm(EvaluationCorpus corpus, string model) :
     public async Task RunAsync(EvaluationInput input, string mode, Func<EvaluationObservation, Task> completed, CancellationToken ct)
     {
         // Every arm gets its own migrated database, controls, work root, checkout and fresh Claude session.
-        await using var e2e = await E2e.StartEvaluationAsync("df_systemone_eval");
+        await using var e2e = await E2e.StartEvaluationAsync("df_systemone_eval", ct);
         var options = e2e.Options(new Dictionary<string, string?>
         {
             ["GitHub:Watch:Repos"] = input.PermissionContext.IssueRepository,

@@ -87,11 +87,13 @@ internal sealed class E2e : IAsyncDisposable
     }
 
     /// <summary>Synthetic local evaluation: router, real sandbox and isolated ledger only; no board or gate Apps.</summary>
-    public static async Task<E2e> StartEvaluationAsync(string prefix)
+    public static async Task<E2e> StartEvaluationAsync(string prefix, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Harness.RequireOptIn();
         Harness.RequireSecret(o => o.RouterKey);
-        await Harness.RequireRouterAsync();
+        await Harness.RequireRouterAsync(); // Existing bounded (3 s) prerequisite; no inference.
+        ct.ThrowIfCancellationRequested();
         return await EvaluationSetup.StartAsync(Harness.Options, AcquireRealLocks, async isolated =>
         {
             // Unlike the full-pipeline harness, take every sandbox lock BEFORE probing a helper (which sweeps its user).
@@ -100,9 +102,10 @@ internal sealed class E2e : IAsyncDisposable
             var options = isolated.Options();
             foreach (var slot in options.WorkerSlots!.All)
             {
-                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+                ct.ThrowIfCancellationRequested();
+                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, ct);
             }
-        }, held => CreateIsolatedAsync(prefix, held));
+        }, held => CreateIsolatedAsync(prefix, held, ct), ct);
     }
 
     private static IDisposable AcquireRealLocks()
@@ -127,7 +130,7 @@ internal sealed class E2e : IAsyncDisposable
         return realLock ?? (IDisposable)new RealLocks();
     }
 
-    private static async Task<E2e> CreateIsolatedAsync(string prefix, IDisposable realLock)
+    private static async Task<E2e> CreateIsolatedAsync(string prefix, IDisposable realLock, CancellationToken ct = default)
     {
         var realRoot = Harness.Options.WorkRoot;
         var admin = new NpgsqlConnectionStringBuilder(Harness.Options.LedgerConnectionString);
@@ -148,13 +151,16 @@ internal sealed class E2e : IAsyncDisposable
         var e2e = new E2e(admin, database, realLock, workRoot);
         try
         {
-            await LedgerMigrations.MigrateAsync(e2e.Ledger, CancellationToken.None);
+            // CREATE DATABASE above is uncancelled until ownership is established, so a cancelled command cannot
+            // leave an ambiguously-created database. Everything after ownership cancels through the usual cleanup.
+            ct.ThrowIfCancellationRequested();
+            await LedgerMigrations.MigrateAsync(e2e.Ledger, ct);
             await using (var ledger = new NpgsqlConnection(e2e.Ledger))
             {
-                await ledger.OpenAsync();
+                await ledger.OpenAsync(ct);
                 await using var restart = new NpgsqlCommand(
                     $"ALTER TABLE kanban_items ALTER COLUMN \"Id\" RESTART WITH {KanbanKeyStart(DateTimeOffset.UtcNow)}", ledger);
-                await restart.ExecuteNonQueryAsync();
+                await restart.ExecuteNonQueryAsync(ct);
             }
         }
         catch

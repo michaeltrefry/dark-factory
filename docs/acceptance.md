@@ -3,6 +3,47 @@
 How to run each epic acceptance test, what is automated and what the owner does by hand. Everything live is
 opt-in: the tests skip, naming the missing prerequisite, unless their gate variable is set.
 
+## SystemOne S6 evaluation-only graceful cancellation (sc-26354)
+
+For a **new, explicitly authorized** held-out campaign only (not an instruction to start or stop an existing run):
+choose a unique artifact directory outside every repository, frozen fixture and worker context, with no symlinked
+ancestors. On macOS use a real path such as `/private/tmp`, not `/tmp` or `/var`. Preserve the existing prerequisites
+(router, Postgres, sandbox setup, catalog model and exclusive sandbox locks).
+
+```sh
+# Example only: this starts paid live inference. Do not run alongside an existing campaign.
+artifacts="$(mktemp -d /private/tmp/systemone-evaluation.XXXXXXXX)"
+export FACTORY_E2E=1 FACTORY_E2E_SYSTEMONE_EVALUATION=1
+export FACTORY_E2E_SYSTEMONE_REPORT="$artifacts/evidence.json"
+export FACTORY_E2E_SYSTEMONE_CANCEL_FILE="$FACTORY_E2E_SYSTEMONE_REPORT.cancel"
+# Issues__Classification__Model must already name the approved SystemOne catalog model.
+dotnet test --project tests/DarkFactory.AcceptanceTests \
+  --filter-method '*Frozen_corpus_paired_disabled_vs_advisory_live_campaign'
+```
+
+From another shell, create **that run's exact flag** (substitute the printed/recorded artifact path):
+
+```sh
+# Existence only; the harness never reads the file body. No process signals.
+touch /private/tmp/systemone-evaluation.XXXXXXXX/evidence.json.cancel
+```
+
+The dedicated variable is read only after both live opt-ins. It has **no default**, and must equal the absolute
+report path plus `.cancel`; the report itself is reserved with create-new semantics, preventing shared campaign
+ownership. With the variable absent, no file watcher runs. Flags in a repository, another campaign's flag, relative
+paths and symlinked artifact ancestors are refused before client construction. A pre-existing flag writes initial
+`incomplete` evidence and stops before client construction/inference; do not delete a flag to resume a campaign.
+
+The linked token preserves the caller's cancellation and 100-minute deadline, checks synchronously between arms
+and polls existence every 100 ms during the current arm. It cancels the normal await, **not** the process directly;
+the existing production runner unwinds its sandbox cleanup before the arm disposes its ledger/locks. This mechanism
+adds no signals and does not bypass production controls or change existing sandbox cleanup. Await termination
+before touching artifacts or starting any other sandbox work. Completed observations remain durably checkpointed;
+an interrupted arm has no fabricated observation, no summary is published, and evidence stays `incomplete`.
+The watcher is stopped, drained and disposed on every exit. An incomplete/cancelled test exits non-successfully;
+that is not a completed performance/quality result and does not authorize rerunning or relabeling the frozen corpus.
+An already-running older harness cannot acquire this feature retroactively.
+
 ## Safety first (read before any live run)
 
 - **The `_factory` user is single-tenant** — and so is each further sandbox user of a machine set up with worker slots
