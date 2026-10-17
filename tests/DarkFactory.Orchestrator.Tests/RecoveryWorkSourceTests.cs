@@ -266,22 +266,28 @@ public sealed class RecoveryGrantTests
         var f = new RecoveryWorkSourceTests.Fixture(); await f.Initialize();
         var c = await f.Materialize();
         var controls = new LedgerControls(f.Seed.Contexts, f.Seed.Time);
+        var workspaces = new RunPipelineTests.FakeWorkspaces();
+        var worker = new RunPipelineTests.FakeWorker();
         var entered = false;
         await using var recovery = f.Recovery(() =>
         {
-            // Inject inside the final session-entry capture, not dispatch's earlier authorization.
-            if (Environment.StackTrace.Contains("RunSessionAsync", StringComparison.Ordinal))
+            // This run's preparation precedes its final session-entry capture. Ambient caller names say nothing
+            // about this item's phase: a parallel test's continuation may still have RunSessionAsync on its stack.
+            if (!entered && workspaces.Calls.Any(call => call.StartsWith("prepare ", StringComparison.Ordinal)))
             {
                 entered = true;
+                Assert.Empty(worker.Calls);
+                using var read = f.Seed.Contexts.CreateDbContext();
+                Assert.Equal(WorkState.Implement, read.WorkItems.Single(i => i.ExternalId == $"rc-{c.Id}").State);
                 controls.SetAsync($"item:rc-{c.Id}", state, "human", default).GetAwaiter().GetResult();
             }
             return f.Answer.Material!;
         });
-        var worker = new RunPipelineTests.FakeWorker();
         await using var db = f.Seed.Contexts.CreateDbContext();
-        var outcome = await new RunPipeline(f.Source, new WorkLedger(db, f.Seed.Time), f.Seed.Locks,
-            new RunPipelineTests.FakeWorkspaces(), worker, new RunPipelineTests.FakePullRequests(),
-            RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: controls, recovery: recovery).RunAsync(c.Id, default);
+        // An unrelated caller with this name must not make dispatch look like final session entry.
+        var outcome = await RunSessionAsync(() => new RunPipeline(f.Source, new WorkLedger(db, f.Seed.Time), f.Seed.Locks,
+            workspaces, worker, new RunPipelineTests.FakePullRequests(),
+            RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: controls, recovery: recovery).RunAsync(c.Id, default));
         Assert.True(entered);
         Assert.Empty(worker.Calls);
         Assert.Equal(state == ControlState.Stopping ? WorkState.Cancelled : WorkState.Paused, outcome.State);
@@ -293,6 +299,10 @@ public sealed class RecoveryGrantTests
         }
         else Assert.Equal("human", (await controls.GetAsync($"item:rc-{c.Id}", default))!.ChangedBy);
     }
+
+    // Keep the ambient frame visible: the old fixture searched every caller, including unrelated test-runner continuations.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static Task<RunOutcome> RunSessionAsync(Func<Task<RunOutcome>> run) => run();
 
     [Theory]
     [InlineData("correction")]

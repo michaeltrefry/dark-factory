@@ -1001,6 +1001,29 @@ public class GitHubGateTests
         Assert.Equal(["contents", "pull_requests", "checks", "statuses"], permissions.EnumerateObject().Select(p => p.Name));
     }
 
+    [Theory]
+    [InlineData("gate[bot]", "Bot", "main", Head, "merged", true)]
+    [InlineData("owner", "User", "main", Head, "merged", false)]
+    [InlineData("other[bot]", "Bot", "main", Head, "merged", false)]
+    [InlineData("gate[bot]", "User", "main", Head, "merged", false)]
+    [InlineData(null, null, "main", Head, "merged", false)]
+    [InlineData("gate[bot]", "Bot", "other", Head, "merged", false)]
+    [InlineData("gate[bot]", "Bot", "main", "other", "merged", false)]
+    [InlineData("gate[bot]", "Bot", "main", Head, "other", false)]
+    public async Task Correction_merge_observation_requires_the_authenticated_gate_App_and_exact_delivery(string? login, string? type,
+        string deliveryBase, string head, string commit, bool expected)
+    {
+        var body = JsonSerializer.Serialize(new { number = 7, html_url = "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7",
+            state = "closed", merged = true, draft = false, merge_commit_sha = commit, changed_files = 1,
+            head = new { @ref = "factory/rc-1", sha = head }, @base = new { @ref = deliveryBase, sha = "b0" },
+            merged_by = new { login, type } });
+        var (gate, api) = Gate(a => a.On($"GET {Repo}/pulls/7", HttpStatusCode.OK, body)
+            .On("GET /app", HttpStatusCode.OK, "{\"slug\":\"gate\"}"));
+        var facts = new PullFacts(7, "https://github.com/michaeltrefry/dark-factory-sandbox/pull/7", false, true, false, Head, "main", "b0", "merged");
+        Assert.Equal(expected, await gate.IsGateMergeAsync(Sandbox, facts, default));
+        Assert.All(TokenPermissions(api).SelectMany(p => p.EnumerateObject()), p => Assert.Equal("read", p.Value.GetString()));
+    }
+
     [Fact]
     public async Task Reads_the_policy_from_the_base_branch_and_reports_a_missing_one_as_null()
     {

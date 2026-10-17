@@ -245,7 +245,18 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
     }
 
     /// <summary>Fresh dispatch/worker-entry authority; only this exact grant's own incident hold is excepted.</summary>
-    public async Task<bool> AuthorizeCorrectionAsync(string externalId, string repository, CancellationToken ct)
+    public async Task<string?> CorrectionBaseShaAsync(string externalId, CancellationToken ct)
+    {
+        if (!ItemNaming.Recovery.TryParse(externalId, out var id)) return null;
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var correction = await RecoveryWorkSource.ValidAsync(db, id, ct);
+        if (correction is null) return null;
+        var incident = await db.HotFileIncidents.AsNoTracking().SingleAsync(i => i.Id == correction.IncidentId, ct);
+        return RecoverySnapshot.FromDetail(HotFileAssessment.FromDetail(incident.Answer)?.Material)?.BaseTips.GetValueOrDefault(correction.Base);
+    }
+
+    public async Task<bool> AuthorizeCorrectionAsync(string externalId, string repository, CancellationToken ct,
+        string? deliveryBase = null, string? baseSha = null, IReadOnlyList<string>? paths = null)
     {
         if (!ItemNaming.Recovery.TryParse(externalId, out var id) || capture is null || policy is null) return false;
         await using var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
@@ -271,7 +282,13 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
                 ?? throw new InvalidOperationException("Correction base has no gate policy.");
             var currentPolicy = GatePolicy.Parse(yaml);
             provenStale = true; // A verified policy that excludes the envelope is definitive, unlike an unavailable read.
-            RecoveryCorrections.ValidateEnvelope(JsonSerializer.Deserialize<string[]>(correction.Paths)!, currentPolicy);
+            var envelope = JsonSerializer.Deserialize<string[]>(correction.Paths)!;
+            RecoveryCorrections.ValidateEnvelope(envelope, currentPolicy);
+            if (deliveryBase is not null && deliveryBase != correction.Base
+                || baseSha is not null && baseSha != snapshot.BaseTips[correction.Base])
+                throw new InvalidOperationException("Correction delivery base no longer matches its pinned grant.");
+            if (paths is not null && paths.Any(p => !envelope.Contains(p, StringComparer.Ordinal)))
+                throw new InvalidOperationException("Correction diff leaves its authorized repair envelope.");
             return true;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)

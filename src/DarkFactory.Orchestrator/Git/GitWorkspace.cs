@@ -88,6 +88,10 @@ public interface IRepoWorkspace
     /// </remarks>
     Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct);
 
+    /// <summary>All committed, staged, unstaged and untracked publishable paths relative to a pinned base, without rename collapsing.</summary>
+    Task<IReadOnlyList<string>> CorrectionPathsAsync(Workspace workspace, string baseSha, CancellationToken ct) =>
+        throw new NotSupportedException("This workspace cannot verify a correction's repair envelope.");
+
     /// <summary>The commit the worktree's HEAD is at (after <see cref="CommitAndPushAsync"/>: the commit it pushed).</summary>
     Task<string> HeadAsync(Workspace workspace, CancellationToken ct);
 
@@ -100,6 +104,10 @@ public interface IRepoWorkspace
 
     /// <summary>Pushes the worktree's HEAD to its <c>factory/*</c> branch as a fast-forward only (never forced): a branch that moved on origin refuses it.</summary>
     Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
+
+    /// <summary>A correction's owner-side base update: revalidate its exact authority at the remote-write boundary too.</summary>
+    Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task> authorize) =>
+        throw new NotSupportedException("This workspace cannot authorize a correction base-update push.");
 
     /// <summary>Of <paramref name="paths"/>, those whose content at commit <paramref name="sha"/> (in the clone) still has a conflict marker line.</summary>
     Task<IReadOnlyList<string>> ConflictMarkersAsync(RepoRef repo, string sha, IReadOnlyList<string> paths, CancellationToken ct);
@@ -869,10 +877,19 @@ public sealed class GitWorkspace(
         }
     }
 
+    public async Task<IReadOnlyList<string>> CorrectionPathsAsync(Workspace workspace, string baseSha, CancellationToken ct)
+    {
+        string[] tree = [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}"];
+        var tracked = await Git(workspace.Path, null, ct, [.. tree, "diff", "--name-only", "--no-renames", "-z", "--end-of-options", baseSha, "--"]);
+        var untracked = await Git(workspace.Path, null, ct, [.. tree, "ls-files", "--others", "--exclude-standard", "-z"]);
+        return (tracked + untracked).Split('\0', StringSplitOptions.RemoveEmptyEntries).Distinct(StringComparer.Ordinal).ToArray();
+    }
+
     public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
     {
         // No grant, no push token (E4): only the ledger's taint check issues one.
         ArgumentNullException.ThrowIfNull(grant);
+        await grant.ValidateAsync(ct);
         EnsureFactoryBranch(workspace.Branch);
         var dir = workspace.Path;
         if (sandbox is not null && shareWithWorker)
@@ -893,7 +910,9 @@ public sealed class GitWorkspace(
         {
             return false;
         }
-        // The push token, minted before the lock: no GitHub call is made while the clone is held.
+        await grant.ValidateAsync(ct);
+        // Mint the token before the lock. A correction additionally refreshes its bounded authority after this lock's wait;
+        // that callback reads evidence and this worktree only, and never takes the clone's lock again.
         var auth = await AuthEnvironment(repo, ct);
         // The commit moves the branch in the clone's refs, and the push its remote-tracking ref.
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
@@ -906,6 +925,7 @@ public sealed class GitWorkspace(
         {
             return false;
         }
+        await grant.ValidateAsync(ct);
         // A changeset branch holds its plan's merged stories: a fix round on it only ever adds to what origin has.
         await Git(dir, auth, ct, GitRemoteWrites.Push(tree, workspace.Branch, force: !ItemNaming.IsChangesetBranch(workspace.Branch)));
         return true;
@@ -942,11 +962,18 @@ public sealed class GitWorkspace(
         return new Gate.BaseMerge(baseSha, await HeadAsync(workspace, ct), []);
     }
 
-    public async Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct)
+    public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => PushCoreAsync(repo, workspace, ct, null);
+
+    public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task> authorize) =>
+        PushCoreAsync(repo, workspace, ct, authorize);
+
+    private async Task PushCoreAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task>? authorize)
     {
         EnsureFactoryBranch(workspace.Branch);
+        if (authorize is not null) await authorize(ct);
         var auth = await AuthEnvironment(repo, ct);
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
+        if (authorize is not null) await authorize(ct);
         await Git(workspace.Path, auth, ct,
             GitRemoteWrites.Push([$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}"], workspace.Branch, force: false));
     }

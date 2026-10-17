@@ -426,7 +426,7 @@ public class MultiRepoPipelineTests
         public Task<CiFacts> GetCiAsync(RepoRef repo, string sha, CancellationToken ct) => Of(repo).GetCiAsync(repo, sha, ct);
         public Task<string> GetCheckLogAsync(RepoRef repo, CheckFact check, CancellationToken ct) => Of(repo).GetCheckLogAsync(repo, check, ct);
         public Task<BaseComparison> CompareAsync(RepoRef repo, string baseRef, string headSha, CancellationToken ct) => Of(repo).CompareAsync(repo, baseRef, headSha, ct);
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct) => Of(repo).MergeAsync(repo, number, headSha, ct);
+        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null) => Of(repo).MergeAsync(repo, number, headSha, ct, authorize);
         public Task<Workspace> PrepareAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => Of(repo).PrepareAsync(repo, branch, ct, baseBranch);
         public Task<Workspace> RestoreAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => Of(repo).RestoreAsync(repo, branch, ct, baseBranch);
         public Task<Workspace?> ReopenAsync(RepoRef repo, string branch, CancellationToken ct, string? baseBranch = null) => Of(repo).ReopenAsync(repo, branch, ct, baseBranch);

@@ -308,7 +308,12 @@ public sealed partial class RunPipeline
                 new BaseUpdate(BaseUpdate.Kinds.Update, head, merge.BaseSha, merge.Head).ToDetail(), ct);
             await ThrowIfControlledAsync(item, ct);
             await ThrowIfFrozenAsync(item, ct);
-            await workspaces.PushAsync(repo, workspace, ct);
+            if (Naming == ItemNaming.Recovery)
+            {
+                await workspaces.PushAsync(repo, workspace, ct, token => ValidateCorrectionPushAsync(run, token));
+                await RecordCorrectionPushAsync(run, ct);
+            }
+            else await workspaces.PushAsync(repo, workspace, ct);
             log.WriteLine($"[queue] merged {pull.BaseRef} ({Ci.Short(merge.BaseSha)}) into {Ci.Short(head)} as {Ci.Short(merge.Head)} and pushed it");
             return UpdateOutcome.Updated;
         }
@@ -521,7 +526,8 @@ public sealed partial class RunPipeline
         MergeResult merged;
         try
         {
-            merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct);
+            merged = await Gate.GitHub.MergeAsync(run.Repo, pull.Number, pull.HeadSha, ct,
+                Naming == ItemNaming.Recovery ? token => ValidateCorrectionMergeAsync(run, pull, files, token) : null);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -556,7 +562,7 @@ public sealed partial class RunPipeline
     /// </summary>
     private async Task RecordFoundMergedAsync(Run run, List<LedgerEntry> history, PullFacts pull, CancellationToken ct)
     {
-        if (GatePassedAt(history, pull) is { } commit)
+        if (GatePassedAt(history, pull) is { } commit && await CorrectionMergeWasAuthorizedAsync(run.Repo, history, pull, ct))
         {
             log.WriteLine($"[merge] {pull.HtmlUrl} was merged by the gate at {Ci.Short(pull.HeadSha)} as {commit}; recording it");
             await ledger.RecordAsync(run.Item, WorkState.Merge, null, commit, ct);

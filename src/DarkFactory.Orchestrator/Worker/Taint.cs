@@ -242,4 +242,9 @@ public sealed class PushGrant
 
     /// <summary>The worker sessions whose work the push publishes, none tainted when the grant was issued.</summary>
     public IReadOnlyList<string> Sessions { get; }
+
+    // Additional incident authority never replaces the ledger's taint grant.
+    internal Func<CancellationToken, Task>? BeforePublish { get; init; }
+    internal Task ValidateAsync(CancellationToken ct) => BeforePublish?.Invoke(ct) ?? Task.CompletedTask;
+    internal PushGrant WithValidation(Func<CancellationToken, Task> validate) => new(Sessions) { BeforePublish = validate };
 }

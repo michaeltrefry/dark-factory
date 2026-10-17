@@ -98,6 +98,60 @@ public class GitWorkspaceTests
     }
 
     [Fact]
+    public async Task Correction_paths_include_committed_staged_unstaged_untracked_and_both_rename_sides()
+    {
+        var git = Workspace();
+        var ws = await git.PrepareAsync(Repo, "factory/rc-1", default);
+        var pinned = (await git.HeadAsync(ws, default)).Trim();
+        File.WriteAllText(Path.Combine(ws.Path, "committed.txt"), "first");
+        await git.CommitAndPushAsync(Repo, ws, "first", TestGrants.Untainted, default);
+        File.Move(Path.Combine(ws.Path, "README.md"), Path.Combine(ws.Path, "renamed.txt"));
+        File.WriteAllText(Path.Combine(ws.Path, "staged.txt"), "stage");
+        Git(ws.Path, "add", "staged.txt");
+        File.WriteAllText(Path.Combine(ws.Path, "committed.txt"), "modified");
+        File.WriteAllText(Path.Combine(ws.Path, "untracked.txt"), "new");
+        File.WriteAllText(Path.Combine(ws.Path, "line\nbreak.txt"), "new");
+        var paths = await git.CorrectionPathsAsync(ws, pinned, default);
+        Assert.Equal(new[] { "README.md", "committed.txt", "line\nbreak.txt", "renamed.txt", "staged.txt", "untracked.txt" }, paths.Order(StringComparer.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task Correction_authority_is_checked_before_staging_token_mint_and_final_push(int refusal)
+    {
+        var git = Workspace();
+        var ws = await git.PrepareAsync(Repo, "factory/rc-2", default);
+        File.WriteAllText(Path.Combine(ws.Path, "repair.txt"), "repair");
+        _gitCalls.Clear();
+        var tokens = _tokenRequests;
+        var reads = 0;
+        var grant = TestGrants.Untainted.WithValidation(_ => ++reads == refusal
+            ? Task.FromException(new InvalidOperationException("stale incident grant")) : Task.CompletedTask);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => git.CommitAndPushAsync(Repo, ws, "repair", grant, default));
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
+        if (refusal == 1) Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "add");
+        if (refusal <= 2) Assert.Equal(tokens, _tokenRequests);
+        Assert.Equal(refusal, reads);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Correction_base_update_push_rechecks_authority_after_waits(int refusal)
+    {
+        var git = Workspace();
+        var ws = await git.PrepareAsync(Repo, "factory/rc-3", default);
+        _gitCalls.Clear();
+        var reads = 0;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => git.PushAsync(Repo, ws, default, _ => ++reads == refusal
+            ? Task.FromException(new InvalidOperationException("stale incident grant")) : Task.CompletedTask));
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
+        Assert.Equal(refusal, reads);
+    }
+
+    [Fact]
     public async Task Every_network_git_call_carries_the_app_token_and_no_call_puts_it_in_argv_or_config()
     {
         var workspace = Workspace();

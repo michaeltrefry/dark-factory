@@ -112,6 +112,7 @@ public static class StepOutcomes
     {
         Recovery.RecoveryCorrections.RefusalStep => StepOutcome.GateRejected,
         Recovery.RecoveryCorrections.StateStep when detail?.StartsWith("Stopped", StringComparison.Ordinal) == true => StepOutcome.Escalated,
+        Recovery.RecoveryCorrections.StateStep when detail?.StartsWith("Failed", StringComparison.Ordinal) == true => StepOutcome.Failed,
         Recovery.HotFileAssessment.Step => Recovery.HotFileAssessment.FromDetail(detail)?.Decision switch
         {
             "safe" => StepOutcome.Passed,
