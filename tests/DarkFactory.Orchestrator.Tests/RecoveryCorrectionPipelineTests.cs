@@ -31,9 +31,11 @@ public class RecoveryCorrectionPipelineTests
         internal bool Tainted;
         internal string Material = "";
         internal string[] Paths = ["src/a.cs", FakeTestRunner.NewTestFile];
+        /// <summary>When set, the correction is materialized by the production scheduler's unsafe assessment, not directly.</summary>
+        internal bool Assessed;
         internal async Task Initialize()
         {
-            await Recovery.Initialize();
+            await Recovery.Initialize(recordUnsafe: !Assessed);
             var material = RecoverySnapshot.FromDetail(Recovery.Answer.Material)! with
             { BaseTips = new Dictionary<string, string> { ["main"] = GatePipelineTests.FakeGateGitHub.BaseSha } };
             if (BeforeMaterialize is not null) material = await BeforeMaterialize(material);
@@ -41,7 +43,14 @@ public class RecoveryCorrectionPipelineTests
             Material = JsonSerializer.Serialize(material);
             Recovery.Answer = Recovery.Answer with { Material = Material, MaterialHash = RecoverySnapshot.Hash(Material),
                 Findings = [finding], CorrectionFindings = [finding] };
-            Correction = await Recovery.Materialize();
+            if (Assessed)
+            {
+                await using var recovery = Recovery.Recovery(() => Material);
+                await recovery.AdvanceAsync("owner/alpha", default);
+                await using var db = Recovery.Seed.Contexts.CreateDbContext();
+                Correction = await db.RecoveryCorrections.SingleAsync();
+            }
+            else Correction = await Recovery.Materialize();
             Workspaces.CorrectionPaths = () => Paths;
             Workspaces.Head = () => GitHub.Head;
             GitHub.Diff = _ => string.Concat(Paths.Select(p => TestPolicies.Diff(p)));

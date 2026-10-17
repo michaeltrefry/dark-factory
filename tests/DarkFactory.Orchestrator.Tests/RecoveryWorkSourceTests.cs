@@ -18,7 +18,7 @@ public sealed class RecoveryWorkSourceTests
         internal HotFileIncident Incident = null!;
         internal HotFileAssessment Answer = null!;
         internal readonly GatePolicy Policy = GatePolicy.Parse(TestPolicies.Standard());
-        internal async Task Initialize()
+        internal async Task Initialize(bool recordUnsafe = true)
         {
             for (var i = 0; i < 8; i++) await Seed.Merge();
             Incident = (await Seed.Recovery.HeldAsync("owner/alpha", default))!;
@@ -34,6 +34,8 @@ public sealed class RecoveryWorkSourceTests
                 MaterialHash = RecoverySnapshot.Hash(JsonSerializer.Serialize(material)), Session = "assessment", Prompt = "prompt",
                 Citations = ["merge:1"], Findings = [finding], CorrectionFindings = [finding]
             };
+            // AT2's integrated path leaves the incident Held so the production scheduler assesses and materializes it.
+            if (!recordUnsafe) return;
             await using var db = Seed.Contexts.CreateDbContext();
             var incident = await db.HotFileIncidents.SingleAsync();
             incident.Answer = JsonSerializer.Serialize(Answer);

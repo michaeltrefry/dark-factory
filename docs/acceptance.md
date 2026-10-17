@@ -1323,3 +1323,99 @@ reviewer models, with no served model class — is not escalated for it: the gat
 panel (high class) reviews that head once, then it merges as usual. This happens once per head: if the new verdict's calls
 still break the rule (e.g. the router answers without an `X-Weave-Model-Class: high` header), the gate escalates with the
 reason rather than reviewing again.
+
+# Autonomous hot-file recovery (epic sc-26335; terminal story sc-26345)
+
+The epic's eight acceptance tests (AT1–AT8, in the epic description), the evidence for each, and the runbook of the two live
+runs AT8 needs. Non-live evidence is ordinary `dotnet test` (unit tests, and the Postgres ones against the compose Postgres,
+which CI provides). Live evidence is `HotFileRecoveryAcceptanceTests`, which SKIPS without its opt-in: skipped is not passed.
+
+## Evidence matrix
+
+Classes are in `tests/DarkFactory.Orchestrator.Tests` unless noted. The last column's tests are this story's integrated paths
+in `RecoveryAcceptanceTests`; the per-story tests prove each stage on its own.
+
+| AT | Existing evidence | Missing before sc-26345 | Added by sc-26345 / still open |
+| --- | --- | --- | --- |
+| AT1 safe skeleton | `HotFileRecoveryTests` (7 then 8 merges hold; a fresh high safe answer resolves; exact acknowledgement not re-assessed; a 9th merge opens generation 2; another file later hot; threshold, window, repo case, base, normalised paths, changeset exclusion; only the exact current high-class safe answer releases; production evidence and router assessor over 8 real pipeline merges; Postgres restart keeps the acknowledgement), `FreezeTests` hot-file count rules, `RecoveryRefreshTests` | the inclusive window boundary; the 8/24 defaults asserted | `AT1_a_merge_exactly_one_window_old_still_counts_and_one_tick_older_does_not`. Live: the AT8 safe case |
+| AT2 dangerous path | `RecoveryWorkSourceTests` (one immutable correction per attempt, envelope, pending-only, Stop), `RecoveryCorrectionPipelineTests` (ordinary panel, CI, new tests, taint, queue, merge; re-authorisation at every boundary), `RecoveryReassessmentTests` (a gate merge is not a safe verdict; an unsafe reassessment gives one second bounded repair), `RecoveryRedirectTests` (fresh restart from the corrected base), `RecoveryAssessmentTests.Pending_only_defect_…` | one chained run from the production scheduler's unsafe answer to resumed work; a second repair after a REAL gate rejection of the first | `AT2_an_assessed_merged_defect_is_corrected_reassessed_safe_and_affected_work_restarts`, `AT2_a_gate_rejected_first_correction_gets_one_second_attempt_that_delivers_and_resolves`. Live: the AT8 defect case |
+| AT3 isolation | `RecoveryControlTests` (live worker paused, queued PR not dispatched and its claim renewable, fresh item not claimed, issue-triage preparation held only in the held repo, two-repo plan releases B while A is held, repository Stop, Stop during assessment, `run` of an existing item), `HotFileRecoveryTests` (another repo completes meanwhile; intake admission; scheduler off the poll) | two simultaneous incidents in two repositories | `AT3_two_simultaneous_incidents_in_two_repositories_have_independent_outcomes` (both assessed at once with fresh sessions; A safe and resumes; B inconclusive stays held until its own retry is safe) |
+| AT4 human supremacy | `RecoveryControlTests` (safe racing a manual Pause; Continue lifts only its scope), `RecoveryWorkSourceTests` (own-incident exception never bypasses a manual or other control; Pause during authorisation; Stop settles, never replaced), `RecoveryRedirectTests`/`RecoveryReassessmentTests` (a safe reassessment cannot restart a paused or stopped item or clear a repository Pause), `HotFileRecoveryTests.Manual_and_legacy_freeze_rows_…`, `RecoveryPostgresTests.Upgrade_and_safe_resolution_preserve_…` | the global freeze and usage rows and unrelated manual scopes unchanged across the CORRECTIVE path | the first AT2 test seeds a lifted freeze row with red-tip and check-failed acknowledgements, a usage row and two unrelated manual Pauses, and compares them byte for byte at the end |
+| AT5 authorisation negatives | `RecoveryAssessmentTests` (wrong class, malformed, bounds, tool surface), `HotFileRecoveryTests.Assessment_parser_refuses_…`, `RecoveryWorkSourceTests` (wrong binding, sealed/protected/escaping envelope, unbounded repair, stale evidence or policy, ordinary work and another incident), `RecoveryCorrectionPipelineTests` (wrong base/tip/diff, outside the envelope, another incident, moved head, high-class review and CI, vacuous test, taint) | a negative fixture per predicate, proven by mutation | `AT5_each_grant_predicate_alone_refuses_the_correction`, `AT5_each_assessment_binding_alone_refuses_a_correction`, `AT5_the_correction_envelope_is_at_most_twenty_explicit_paths`; mutation table below |
+| AT6 durability | `RecoveryPostgresTests` (racing drivers and a lost PR-creation answer, uncertain PR reconciliation, budgets across restarts, 30/120 s retries then escalation, the refresh cap across drivers, stale CAS, usage/shutdown spend nothing, a real child-process crash at a checkpoint, reserved attempts, the legacy freeze on upgrade), `RecoveryCorrectionCrashTests`, `HotFileRecoveryTests.Postgres_restart_…`, `RecoveryWorkSourceTests.Postgres_retains_grant_…` | none found | — |
+| AT7 evidence and reports | `RecoverySnapshotTests` (pinning, hashes, missing inputs explicit, a changed spec/tip/head invalidates), `RecoveryAssessmentTests` (pinned tools, the final freshness read after cost, lagging/zero/unknown cost, session and tool provenance), `HotFileRecoveryTests.Production_router_assessor_uses_fresh_high_sessions_…`, `RecoveryReassessmentTests.Post_delivery_uses_…` | dashboard and CLI status equal to the ledger | open: S9 (sc-26344, PR #136: `RecoveryDashboardTests`, the CLI recovery command), not on this branch until it merges |
+| AT8 terminal | build, unit tests, Postgres tests and gateway lint in CI | the two controlled sandbox runs; the feature-end review; integration with main; tracker readback | `tests/DarkFactory.AcceptanceTests/HotFileRecoveryAcceptanceTests.cs` (live, below) and `HotFileLiveTests` (not live: its pass/fail rules). Open: the live runs (not run yet), the review, integration and readback |
+
+### Authorisation mutations (AT5)
+
+One predicate weakened alone in `src/DarkFactory.Orchestrator/Recovery`, the recovery suites (`*Recovery*`, `*HotFile*`, 319
+tests) run, the source restored and the suites green again (2026-10-17). "Killed by" names the tests that went red.
+
+| Predicate (file) | Mutation | Killed by |
+| --- | --- | --- |
+| grant: correction Pending/Claimed (`RecoveryCorrections.Grants`) | always true | `AT5_each_grant_predicate_…`, `Correction_reauthorizes_after_the_merge_token_…`, `A_change_during_final_merge_reads_…` |
+| grant: repository | always true | `AT5_each_grant_predicate_…` (survived before sc-26345) |
+| grant: correction item not Cancelled | always true | `AT5_each_grant_predicate_…` (survived before) |
+| grant: own incident Correcting | dropped | `AT5_each_grant_predicate_…` (survived before) |
+| grant: incident generation and evidence hash | dropped | `AT5_each_grant_predicate_…` (survived before) |
+| grant: no other unresolved incident in the repo | always true | `AT5_each_grant_predicate_…`, `Another_incident_cannot_borrow_…` |
+| grant: no stopped ancestor | always false | `AT5_each_grant_predicate_…` (survived before) |
+| assessment: served class high (`ValidateAssessment`) | dropped | `AT5_each_assessment_binding_…`, `Wrong_assessment_binding_is_not_authority` |
+| assessment: session | dropped | `AT5_each_assessment_binding_…` (survived before) |
+| assessment: material hash | always false | `AT5_each_assessment_binding_…`, `Wrong_assessment_binding_is_not_authority` |
+| assessment: repository | dropped | survives: equivalent — `RecoveryDecision.Parse` refuses a repo other than the trigger's on the same call, so the binding test's repository row is still refused |
+| assessment: decision unsafe | dropped | survives: equivalent — `RecoveryDecision.Parse` refuses safe with blocking findings, and a safe or inconclusive answer has no correction finding (`correction && Count == 0`) |
+| envelope: sealed/protected (`ValidateEnvelope`) | dropped | `Invalid_or_sealed_or_protected_envelope_…`, `Fresh_evidence_and_current_policy_…`, `Definitive_invalid_envelope_…` (+3) |
+| envelope: at most 20 paths | upper bound dropped | `AT5_the_correction_envelope_is_at_most_twenty_…` (survived before) |
+| attempt cap 2 (`MaterializeAsync`) | upper bound dropped | `An_unsafe_reassessment_creates_only_the_second_…` |
+| second attempt only after a failed first is reassessed (`RefreshAfterCorrectionAsync`) | escalate at attempt ≥ 1 | `AT2_a_gate_rejected_first_correction_…`, `A_failed_correction_is_observed_once_…` |
+| reassessment after delivery | never refresh | 24 tests, both AT2 integrated tests among them |
+| detection scoped to the repository (`HotFileRecovery.DetectLockedAsync`) | every repository's incidents | `AT3_two_simultaneous_incidents_…` (the whole recovery suite also hangs) |
+| hot-file window inclusive (`EvidenceAsync`) | `>=` → `>` | `AT1_a_merge_exactly_one_window_old_…` |
+
+## AT8 live runs — `HotFileRecoveryAcceptanceTests`
+
+Both run the real `factory work` host (`FactoryHost.BuildWork`): real implementers, the real panel and gate, the merge queue,
+and the production recovery scheduler with its router high-class assessor, against a throwaway ledger and work root (`E2e`).
+They set `Freeze:HotFileMerges=2` (its minimum: an explicit valid setting, E1) and `Factory:DefaultRepo` to the sandbox, so two
+stories that touch one file open the incident. They write no control: manual Pause, Continue and Stop stay the owner's, and the
+owner's ledger, controls and freezes are never read or written. Pass or fail is decided by `HotFileLive` (tested in every
+`dotnet test` by `HotFileLiveTests`): a run FAILS on no incident, an unresolved or escalated one, an assessment not served on
+`high`, an assessment session that is reused or is also a worker or review session, a last assessment that is not safe, and —
+the safe case — any correction. The defect case also fails unless exactly one correction merged with a `gate-passed` row (at
+most two attempts) and a safe assessment came after that merge, and it fails INCONCLUSIVE when the first assessment was not
+unsafe with a merged correction finding. Both check that no global freeze row was written.
+
+Prerequisites: the shared harness's (`FACTORY_E2E=1`, the router and an enrolled plan, both GitHub Apps on the sandbox with
+its rulesets, the Shortcut token, a watch scope `FACTORY_E2E_WATCH_EPIC` holding ONLY the two stories, `docker compose up
+-d`), no real `factory work`/`factory run` running, and `FACTORY_E2E_HOTFILE_REPO=<owner/name>`: a disposable sandbox
+repository (e.g. `michaeltrefry/dark-factory-sandbox`) whose CI runs for pull requests. Each run needs two fresh To Do
+stories (the test skips naming one that is not To Do).
+
+Safe case, `FACTORY_E2E_HOTFILE_SAFE_STORIES=sc-<a>,sc-<b>`, in a dedicated epic: story a "Append the line `hot-file safe a`
+to `docs/hotfile-e2e.md` (create it if missing)", story b the same with `hot-file safe b`. Expected: both merge, the second
+merge opens one incident, one fresh high-class assessment answers safe, the incident is Resolved, no correction exists.
+
+Merged-defect case, `FACTORY_E2E_HOTFILE_DEFECT_STORIES=sc-<d1>,sc-<d2>`, in a dedicated epic whose description states the
+requirement "`HotFileCount.Words(string text)` returns the number of runs of non-whitespace characters; empty or
+whitespace-only text has 0 words." Story d1: "Add `public static int Words(string text) => text.Split(' ').Length;` exactly
+as written to a new `HotFileCount` class in the sandbox library, with a test that `Words("a b")` is 2" — it merges code that
+violates its epic's requirement (`Words("")` is 1). Story d2: "Add `Lines(string text)` (the number of `\n`-separated lines)
+to `HotFileCount`, with a test." Give d1 the higher priority so it is worked first. Expected: both merge, the incident opens
+on the `HotFileCount` file, the first assessment is unsafe with a merged finding, exactly one `rc-<n>` correction is worked in
+the sandbox repository and merged through the gate, and a fresh high-class reassessment of the delivered commit is safe.
+Risks, stated: the panel reads d1's story and may reject its instruction (no incident: the run fails `found 0`), and the live
+assessor may judge the defect differently (INCONCLUSIVE). Both are failures, not skips.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_WATCH_EPIC=<safe epic> FACTORY_E2E_HOTFILE_REPO=<owner/name> \
+  FACTORY_E2E_HOTFILE_SAFE_STORIES=sc-<a>,sc-<b> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*AT8_safe*" --report-xunit-xml
+FACTORY_E2E=1 FACTORY_E2E_WATCH_EPIC=<defect epic> FACTORY_E2E_HOTFILE_REPO=<owner/name> \
+  FACTORY_E2E_HOTFILE_DEFECT_STORIES=sc-<d1>,sc-<d2> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*AT8_merged_defect*" --report-xunit-xml
+```
+
+Bounds: the safe case waits up to 2 h and the defect case 4 h for the incident to end (Resolved or Escalated). Cost: four
+real implementer sessions (five with the correction), their panels, and two to four high-class assessments. They leave merged
+pull requests, `docs/hotfile-e2e.md` and `HotFileCount` on the sandbox, and clones under `<Factory:WorkRoot>/e2e/`.
