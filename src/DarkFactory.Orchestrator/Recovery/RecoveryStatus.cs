@@ -171,6 +171,8 @@ public sealed class RecoveryStatusReader(IDbContextFactory<LedgerDbContext> cont
             foreach (var item in ordinary)
             {
                 var applicable = ItemScopes(item, incident.Repo, parents);
+                // A listed/parked child may not have acquired PlanItemId yet; recorded membership still composes its parent control.
+                foreach (var membership in memberships.Where(m => m.Item == item.ExternalId)) AddScopes(applicable, membership.Parent);
                 if (incident.State != "Resolved" || controls.Any(c => applicable.Contains(c.Scope) && Holding(c, now)))
                     held.Add($"{Text(item.ExternalId)} ({item.State}; {(incident.State != "Resolved" ? "automatic incident hold" : "applicable manual/other control")})");
             }

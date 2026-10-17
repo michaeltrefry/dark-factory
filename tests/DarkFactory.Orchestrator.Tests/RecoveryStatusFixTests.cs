@@ -186,6 +186,9 @@ public sealed partial class RecoveryDashboardTests
         Assert.Contains(row.Controls, x => x.Contains("item:sc-20") && x.Contains("human Pause"));
         Assert.Contains("controls still hold", row.Hold);
         Assert.Contains(row.Redirects, x => x.Contains("sc-1"));
+        db.WorkItems.Add(new() { Id = 21, Source = "shortcut", ExternalId = "sc-21", Repo = "owner/alpha", Title = "listed child", State = WorkState.Intake });
+        await db.SaveChangesAsync();
+        Assert.Contains((await new RecoveryStatusReader(_contexts, _time).ReadAsync(default)).Repositories.Single().HeldItems, x => x.Contains("sc-21"));
         var pause = await db.Controls.SingleAsync(); pause.State = ControlState.Running;
         await db.SaveChangesAsync();
         Assert.Empty((await new RecoveryStatusReader(_contexts, _time).ReadAsync(default)).Repositories.Single().HeldItems);
