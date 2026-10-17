@@ -14,7 +14,9 @@ public static class FactoryCli
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
         Func<string, string, CancellationToken, Task<int>> control,
-        Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null)
+        Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null,
+        Func<CancellationToken, Task<int>>? recoveryStatus = null,
+        Func<int, CancellationToken, Task<int>>? recoveryPageStatus = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
@@ -148,9 +150,16 @@ public static class FactoryCli
             : parse.GetValue(kanbanEpicOption) is { } epic ? kanbanKey(epic, true, ct)
             : kanbanKey(parse.GetValue(kanbanItemArgument), false, ct));
 
+        var recoveryStatusCommand = new Command("status", "Report repository incidents, blockers, correction PRs and controls from the ledger only; never advances recovery.");
+        var recoveryPage = new Option<int>("--page") { Description = "Zero-based recovery page (unresolved incidents first)." };
+        recoveryPage.Validators.Add(result => { if (result.GetValueOrDefault<int>() < 0 || result.GetValueOrDefault<int>() > int.MaxValue / Recovery.RecoveryStatusReader.MaxRepositories) result.AddError("Recovery page is out of range."); });
+        recoveryStatusCommand.Options.Add(recoveryPage);
+        recoveryStatusCommand.SetAction((parse, ct) => recoveryPageStatus is not null ? recoveryPageStatus(parse.GetValue(recoveryPage), ct)
+            : recoveryStatus?.Invoke(ct) ?? Task.FromResult(1));
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
+            new Command("recovery", "Read-only repository recovery observations") { recoveryStatusCommand },
             new Command("kanban", "KanbanBoard work items") { kanbanKeyCommand },
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),

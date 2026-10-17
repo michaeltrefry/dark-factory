@@ -243,6 +243,12 @@ public interface IDashboardData
 
     Task<SessionHeader?> SessionAsync(string claudeSessionId, CancellationToken ct);
 
+    /// <summary>Recovery observations from the ledger only; no recovery is triggered by rendering.</summary>
+    Task<Recovery.RecoveryStatusReport> RecoveryAsync(CancellationToken ct) =>
+        Task.FromResult(new Recovery.RecoveryStatusReport(DateTimeOffset.MinValue, []));
+
+    Task<Recovery.RecoveryStatusReport> RecoveryPageAsync(int page, CancellationToken ct) => RecoveryAsync(ct);
+
     /// <summary>Every scope's control (factory, epics, items).</summary>
     Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Control>>([]);
 
@@ -300,6 +306,12 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
     private static readonly WorkState[] Finished = [WorkState.Done, WorkState.Cancelled];
 
     public TimeSpan QuietThreshold { get; } = quietThreshold ?? DefaultQuietThreshold;
+
+    public Task<Recovery.RecoveryStatusReport> RecoveryAsync(CancellationToken ct) =>
+        new Recovery.RecoveryStatusReader(contexts, time).ReadAsync(ct);
+
+    public Task<Recovery.RecoveryStatusReport> RecoveryPageAsync(int page, CancellationToken ct) =>
+        new Recovery.RecoveryStatusReader(contexts, time).ReadPageAsync(page, ct);
 
     public async Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct)
     {

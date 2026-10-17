@@ -14,6 +14,25 @@ namespace DarkFactory.Orchestrator.Ledger;
 /// </summary>
 public static class LedgerReport
 {
+    /// <summary>The same ledger observation used by the dashboard and the read-only recovery CLI.</summary>
+    public static string RecoveryStatus(Recovery.RecoveryStatusReport report)
+    {
+        var text = new StringBuilder($"Repository recovery — ledger observation {report.ReadAt:u} (not authorization)\n");
+        if (report.Note is { } note) text.AppendLine(note);
+        foreach (var row in report.Repositories)
+        {
+            text.AppendLine($"{row.Repo}: incident {row.Incident}, generation {row.Generation}, {row.Stage} — {row.Hold}");
+            foreach (var line in new[] { row.Attempts, "Hot files: " + string.Join("; ", row.HotFiles), row.Evidence, row.Assessment,
+                "Controls: " + (row.Controls.Count == 0 ? "none recorded at observation time" : string.Join("; ", row.Controls)),
+                "Held items: " + string.Join("; ", row.HeldItems), "Redirects: " + string.Join("; ", row.Redirects), row.Blocker, row.Remedy }.OfType<string>())
+                text.AppendLine("  " + line);
+            foreach (var correction in row.Corrections)
+                text.AppendLine($"  Correction {correction.Item}, attempt {correction.Attempt}: {correction.State}; PR {correction.PullRequest ?? "unavailable (not recorded or wrong repository)"}");
+        }
+        if (report.Repositories.Count == 0) text.AppendLine("No repository recovery incidents recorded.");
+        return text.ToString();
+    }
+
     /// <summary>The steps reported as checks run.</summary>
     public static readonly IReadOnlySet<string> CheckSteps =
         new HashSet<string> { RunPipeline.Steps.GateDecision, RunPipeline.Steps.CiFailure, RunPipeline.Steps.NewTests, RunPipeline.Steps.MergeConflict };
@@ -244,6 +263,14 @@ public static class LedgerReport
             .Distinct(StringComparer.Ordinal).ToList();
         head.Append(CultureInfo.InvariantCulture, $"- Worker sessions: {List(sessions)}\n");
 
+        foreach (var row in history.Where(e => e.Step is Recovery.RecoveryCorrections.Step or Recovery.RecoveryCorrections.StateStep
+            or Recovery.RecoveryCorrections.RefusalStep or Recovery.RecoveryRedirect.Step or Recovery.RecoveryRedirect.Started).TakeLast(10))
+            head.AppendLine($"- Recovery ledger row {row.Id} ({row.RecordedAt:u}, {row.Step}): {Code(Recovery.RecoveryStatusReader.Text(row.Detail, 400))}");
+        foreach (var row in history.Where(e => e.Step == Recovery.HotFileAssessment.Step).TakeLast(3))
+        {
+            var assessment = Recovery.HotFileAssessment.FromDetail(row.Detail);
+            head.AppendLine($"- Recovery assessment ledger row {row.Id}: {Code(assessment?.Decision ?? "unavailable")}, snapshot {Code(assessment?.MaterialSnapshot ?? "unavailable")}; cost {(assessment?.CostUsd is { } cost ? cost.ToString("C4", CultureInfo.GetCultureInfo("en-US")) : "N/A")}");
+        }
         var checks = history.Where(e => e.Step is { } step && CheckSteps.Contains(step)).ToList();
         var verdicts = history.Where(e => e.Step == RunPipeline.Steps.Verdict).ToList();
         var checkLines = checks.Select(row => $"- {Outcome(row)} {Check(row)}\n").ToList();

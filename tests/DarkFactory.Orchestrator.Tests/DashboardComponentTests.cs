@@ -210,7 +210,7 @@ public class DashboardComponentTests : BunitContext
         Assert.Equal(["pause", "stop"], row.QuerySelectorAll("td.control form").Select(f => f.GetAttribute("data-action")));
 
         // Two epic control rows, one per source: the Kanban epic's posts `epic:kb-5` (paused: Continue), the Shortcut epic's `epic:5`.
-        Assert.Equal(["factory", "epic:5", "epic:kb-5"], cut.FindAll("div.controls").Select(d => d.GetAttribute("data-scope")));
+        Assert.Equal(["factory", "repo:acme/widgets", "epic:5", "epic:kb-5"], cut.FindAll("div.controls").Select(d => d.GetAttribute("data-scope")));
         var kanban = cut.Find("div.controls[data-scope='epic:kb-5']");
         Assert.Contains("Epic kb-5: paused", kanban.TextContent);
         Assert.Equal([("continue", "epic:kb-5"), ("stop", "epic:kb-5")],

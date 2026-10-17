@@ -7,7 +7,30 @@ using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync, recoveryPageStatus: RecoveryStatusAsync).Parse(args).InvokeAsync();
+
+static async Task<int> RecoveryStatusAsync(int page, CancellationToken ct)
+{
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    try
+    {
+        // No worker, board, router or recovery service: migrate before reading, as every ledger reader does.
+        await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+        var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+        var report = await new DarkFactory.Orchestrator.Recovery.RecoveryStatusReader(contexts, TimeProvider.System).ReadPageAsync(page, ct);
+        Console.Write(LedgerReport.RecoveryStatus(report));
+        await using var db = contexts.CreateDbContext();
+        var freeze = await db.Controls.FindAsync([DarkFactory.Orchestrator.Controls.ControlScope.Freeze], ct);
+        if (freeze is { State: not DarkFactory.Orchestrator.Controls.ControlState.Running, Reason: "hot-file" })
+            Console.WriteLine("Legacy global hot-file freeze predates repository incident recovery; remains held until explicit human factory continue --freeze. No automatic acknowledgement.");
+        return 0;
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        Console.Error.WriteLine($"Recovery status unavailable: {ex.GetType().Name}. Could not read the ledger; no recovery or control action was performed.");
+        return 1;
+    }
+}
 
 static async Task<int> KanbanKeyAsync(Guid id, bool epic, CancellationToken ct)
 {
