@@ -151,6 +151,28 @@ public sealed class RecoveryReassessmentTests
     }
 
     [Fact]
+    public async Task A_failed_correction_is_observed_once_not_refreshed_again_after_reassessment_exhaustion()
+    {
+        var f = new RecoveryCorrectionPipelineTests.Fixture(); await f.Initialize();
+        f.Tests.Answer = spec => FakeTestRunner.Report(spec.Steps, TestCaseResult.Passed);
+        Assert.Equal(WorkState.Escalated, (await f.Run()).State);
+        var assessor = new Assessor(f) { Decision = "inconclusive" };
+        await using var recovery = assessor.Recovery();
+        await recovery.AdvanceAsync("owner/alpha", default);
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(30));
+        await recovery.AdvanceAsync("owner/alpha", default);
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(120));
+        await recovery.AdvanceAsync("owner/alpha", default);
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(120));
+        await recovery.AdvanceAsync("owner/alpha", default);
+        Assert.Equal(3, assessor.Calls.Count);
+        await recovery.AdvanceAsync("owner/alpha", default);
+        Assert.Equal(3, assessor.Calls.Count);
+        await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+        Assert.Equal("Escalated", (await db.HotFileIncidents.SingleAsync()).State);
+    }
+
+    [Fact]
     public async Task Safe_reassessment_never_clears_a_human_repository_pause()
     {
         var f = new RecoveryCorrectionPipelineTests.Fixture(); await f.Initialize(); await f.Run();

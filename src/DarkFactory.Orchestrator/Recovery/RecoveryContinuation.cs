@@ -33,7 +33,7 @@ public sealed partial class HotFileRecovery
         var merge = rows.LastOrDefault(e => e.Step == null && e.State == WorkState.Merge);
         if (correction.State == "Merged" && (merge is null || !rows.Any(e => e.Step == "recovery-delivered"))) return;
         if (merge is not null && old.Merges.Any(m => m.Row == merge.Id)) return;
-        if (correction.State == "Failed" && incident.State != "Escalated") return;
+        if (correction.State == "Failed" && (incident.State != "Escalated" || rows.Any(e => e.Step == "recovery-reassessment"))) return;
         var merges = old.Merges.ToList();
         if (merge is not null)
         {
@@ -50,6 +50,9 @@ public sealed partial class HotFileRecovery
         incident.NextAttemptAt = null;
         incident.Answer = null;
         incident.Version++;
+        db.LedgerEntries.Add(new() { WorkItemId = item.Id, State = item.State, Step = "recovery-reassessment",
+            Detail = $"incident {incident.Id}: correction attempt {correction.Attempt} observed for snapshot {snapshot.Id}",
+            RecordedAt = time.GetUtcNow(), Outcome = StepOutcome.Passed });
         if (merge is not null)
         {
             // A newer delivery updates the same incident/item disposition; an old snapshot can never release it.
