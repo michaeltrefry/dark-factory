@@ -291,7 +291,7 @@ committed: they come from env/user-secrets or the macOS login keychain
 | `GitHub:AppId`, `GitHub:PrivateKeyPem` | keychain `github-app-id`, `github-app-private-key` (written by `factory github-app setup`) |
 | `GitHub:Gate:AppId`, `GitHub:Gate:PrivateKeyPem` | keychain `github-gate-app-id`, `github-gate-app-private-key` (written by `factory github-app setup --gate`): the merge gate's App, the only credential that merges |
 | `Review:Models`, `Review:Correctness:Models`, `Review:SpecConformance:Models`, `Review:Security:Models`, `Review:Confirm:Models` | retired (sc-25626, epic E8): no reviewer or second-opinion model is pinned — every panel call names the router's `high` model class. Any of them set (even empty) is refused at start-up (`FactoryOptions.RejectReviewModelSettings`, `ReviewConfigurationException`: `factory run` and `factory work` print the reason and exit 2, before any router call) rather than silently ignored |
-| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call, its whole answer stream included) |
+| `Review:TimeoutMinutes` | `10` (> 0: one reviewer call, its whole answer stream included; for the hot-file assessor, each turn of its conversation, whose whole is bounded by its own 30 minutes, sc-26444) |
 | `Gate:CiPollSeconds`, `Gate:CiTimeoutMinutes` | `30`, `30` (each > 0: CI on the PR head is polled until it finishes; still running at the timeout escalates) |
 | `Gate:TestTimeoutMinutes` | `20` (> 0: one sandboxed run — restore, build, the new tests — of the `new-tests-fail-on-base` check; still running at the timeout fails the check) |
 | `Factory:DefaultRepo` | `michaeltrefry/dark-factory-sandbox` (a story line `Repo: owner/name` overrides) |
@@ -917,8 +917,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `LedgerDbContext.SaveChanges`; anchored on the first contributing merge's item; typed deferred, a resolution passed — never
   escalated, so no item's escalation metric counts an incident). Durability: the repository's advisory lock
   (`HotFileRecovery.LockKey`) serializes detection, dispatch and acceptance across processes; `Version` CAS tokens; an
-  attempt is reserved (`recovery_assessment_attempts`, leased `StageTimeout` 15 min: a 5-minute capture plus the 10-minute
-  Review conversation) and committed BEFORE dispatch, so a crash spends it (`Uncertain`) and nothing replays endlessly; usage
+  attempt is reserved (`recovery_assessment_attempts`, leased `StageTimeout` 40 min: a 5-minute capture, the assessor's own
+  30-minute conversation deadline and 5 minutes for cost accounting and the revalidating capture; sc-26444) and committed BEFORE dispatch, so a crash spends it (`Uncertain`) and nothing replays endlessly; usage
   waits and shutdown spend none. Bounds (E11): 3 assessment sessions per evidence generation, 2 correction PR attempts per
   generation (`RecoveryCorrections.CorrectionLimit`; attempt numbers stay monotone per incident, a generation counts from the
   last attempt before it, `BaselineAsync`), 3 evidence refreshes per incident (reset only by a human re-arm); a failed or inconclusive assessment
@@ -936,11 +936,36 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   `read_evidence`, so the tool budget is not spent on inline material), its answer bound to incident, generation, snapshot, repo and evidence
   hash and parsed strictly (`RecoveryDecision`). A safe or unsafe answer counts only over evidence it read whole
   (`RouterHotFileAssessor.Unread`, sc-26335): every id it cites, top level and per finding, and for a safe answer every
-  `merged-diff` entry of the incident, must have been served by a successful `read_evidence` whose result reached the model
-  uncut (`RecoveryAssessmentTools.FullyRead`); otherwise the answer is inconclusive, naming the unread ids, and the prompt says
-  so. Consequence, accepted: a diff over one tool result's cap (60,000 bytes serialized), diffs together past the session's
-  tool budget (about 200,000 characters) or more required reads than `RouterReviewer.MaxToolCalls` (24) cannot be judged safe —
-  the incident is reassessed until its budgets escalate it to a human. Only the exact current safe answer resolves, acknowledging exactly its
+  `merged-diff` entry of the incident, must have been read in full — every one of its pages served by a successful
+  `read_evidence` whose result reached the model uncut (`RecoveryAssessmentTools.FullyRead`); otherwise the answer is
+  inconclusive, naming the unread ids, and the prompt says so. Paged evidence (sc-26444; each entry paged once per assessment
+  and shared by the index, the up-front check and every read, `EvidencePages`): `read_evidence(id, page)` serves one
+  page — at most `RecoveryAssessmentTools.PageBytes` (50,000) UTF-8 bytes of the entry's content, never splitting a character,
+  behind a one-line JSON header (id, category, provenance, commits, hash, page, pages, byte offset, bytes, total bytes), so no
+  page reaches the 60,000-byte per-result cap; the index gives each entry's `Pages`, and an entry counts as read once its pages
+  together cover the whole content (a page skipped, cut or failed leaves it unread). The assessor has
+  its own explicit limits, stated in the request (`limits`) and apart from the reviewer panel's (8 turns, 24 calls, 200,000
+  characters: unchanged): `MaxSessionChars` 400,000 characters of tool results less the request (every turn resends the
+  conversation, so this is what the model holds at the end — about 100,000–130,000 tokens, inside the high class's smallest
+  200,000-token context with the prompt and answer), `MaxSessionTokens` 140,000 estimated tokens of tool results less the request's
+  (`EstimatedTokens`: an ASCII character a third of a token, any other character a whole one — characters are not tokens, and
+  dense or non-Latin text near a token a character would otherwise pass the character budget and be refused 400/413 by the
+  router in a late turn; at run time a result that would pass the remaining token budget is answered an error, served nothing),
+  `MaxToolCalls` 80 (a page per call), `MaxTurns` 12 with tools — the twelfth answers its calls "not run" (the turn cap), so
+  the request's `limits` state `toolTurns` 11 (`ToolTurns`). Time (E11 as amended by sc-26444): the panel's `Review:TimeoutMinutes`
+  (10 min) bounds the whole of a review session, but each TURN of an assessment — with the stream's 2-minute idle bound — while
+  the assessment conversation as a whole has its own deadline, `RecoveryAssessmentTools.ConversationTimeout` (30 min: 13 turns
+  each resending up to about 140,000 tokens), and `StageTimeout` is sized from it; so a live conversation goes on past 10
+  minutes while any stalled turn fails, and an incident the up-front check passes is not spent on timeouts of its length.
+  They do not reach the snapshot's 2 MiB bound —
+  no single conversation can hold 2 MiB (500,000+ tokens) — so before any router call `RouterHotFileAssessor.Unreadable` sums
+  the pages every merged diff takes and holds them to each budget LESS a reserve kept for the other reads a safe answer needs
+  (requirements, executed results, pending work, `read_file` of code): a quarter of the calls (`ReservedCalls` 20, so diffs
+  may take 60 — a first page of each of up to 50 merged diffs), of the characters (`ReservedChars` 100,000) and of the tokens
+  (`ReservedTokens` 35,000). Past any of them the answer is inconclusive with that reason and
+  `HotFileAssessment.Oversized`, no session is opened, and the recovery escalates the incident at once ("Assessment cannot read
+  the required evidence: …") rather than spend its remaining attempts on the same evidence: a change too large to read in one
+  session is one a human must review. Only the exact current safe answer resolves, acknowledging exactly its
   (merge row, base, file) tuples beyond the window and restarts (a later merge of a reviewed file opens a new generation).
   Correction (E7/E8): an accepted unsafe merged finding materializes ONE `rc-<n>` work item per attempt in exactly the
   incident's repository and recorded base (`RecoveryWorkSource`, internal, no board credential; its spec is planner-like data),

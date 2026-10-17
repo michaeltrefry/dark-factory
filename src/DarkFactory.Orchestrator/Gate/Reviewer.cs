@@ -207,14 +207,21 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// One review or second-opinion session: turns until the model stops for anything but <c>tool_use</c>, or a turn is not served
     /// on the high class (its class then makes the answer unusable). A model still asking for tools in its <see cref="MaxTurns"/>th
     /// turn gets those calls answered as not run, and one more turn with no tool callable (<c>tool_choice: none</c>) for its final
-    /// answer (sc-25706); asking for tools again there is unusable. The client's timeout bounds the whole session.
+    /// answer (sc-25706); asking for tools again there is unusable. The client's timeout bounds the whole session (an assessment's: each
+    /// turn, the conversation bounded by <see cref="AssessmentToolBindings.Deadline"/>, sc-26444).
     /// </summary>
     private async Task<SessionEnd> ConverseAsync(string session, string system, string user, string repo, PullFacts pull, CodeGraphOverlay? overlay,
         bool confirm, CancellationToken ct, AssessmentToolBindings? assessment = null)
     {
-        using var timer = new CancellationTokenSource(http.Timeout, time ?? TimeProvider.System);
+        // A review's whole session is bounded by the client's timeout (Review:TimeoutMinutes). The recovery assessor's conversation
+        // has a deadline of its own sized for its turns (sc-26444), and the client's timeout then bounds each of its turns instead.
+        var limit = assessment?.Deadline ?? http.Timeout;
+        using var timer = new CancellationTokenSource(limit, time ?? TimeProvider.System);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timer.Token);
         var calls = new List<ToolCall>();
+        // The recovery assessor brings its own explicit limits (sc-26444); every review and second opinion keeps the panel's.
+        var maxTurns = assessment?.MaxTurns ?? MaxTurns;
+        var maxToolCalls = assessment?.MaxToolCalls ?? MaxToolCalls;
         var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length, overlay);
         var definitions = assessment?.Definitions ?? await _tools.DefinitionsAsync(toolSession, deadline.Token);
         if (toolSession.KanbanTools.Count > 0)
@@ -231,13 +238,16 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         {
             for (var turn = 1; ; turn++)
             {
-                var final = turn > MaxTurns;
+                var final = turn > maxTurns;
                 StreamedAnswer answer;
                 string? servedClass;
                 IReadOnlyList<string>? retried;
+                using var turnTimer = assessment is null ? null : new CancellationTokenSource(http.Timeout, time ?? TimeProvider.System);
+                using var turnDeadline = turnTimer is null ? null : CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, turnTimer.Token);
                 try
                 {
-                    (answer, servedClass, retried) = await TurnWithRetriesAsync(session, system, messages, definitions, final, deadline.Token);
+                    (answer, servedClass, retried) = await TurnWithRetriesAsync(session, system, messages, definitions, final,
+                        turnDeadline?.Token ?? deadline.Token);
                 }
                 catch (RouterRefusedRequestException refused) when (turn > 1)
                 {
@@ -260,7 +270,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 SessionEnd Unusable(string why) => new(answer.Served, servedClass, answer.StopReason, answer.Text, why, Calls(), final, Turns());
                 if (final)
                 {
-                    return Unusable($"the reviewer asked for tools again in its final-answer turn, after {MaxTurns} turns with tools.");
+                    return Unusable($"the reviewer asked for tools again in its final-answer turn, after {maxTurns} turns with tools.");
                 }
                 var uses = answer.ToolUses.ToList();
                 if (uses.Count == 0 || uses.Any(u => string.IsNullOrEmpty(u.Id)))
@@ -271,15 +281,15 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 var results = new List<object>();
                 foreach (var use in uses)
                 {
-                    var outcome = turn == MaxTurns ? ReviewTools.AtTurnCap(use, MaxTurns)
-                        : calls.Count < MaxToolCalls ? assessment is null
+                    var outcome = turn == maxTurns ? ReviewTools.AtTurnCap(use, maxTurns)
+                        : calls.Count < maxToolCalls ? assessment is null
                             ? await _tools.RunAsync(use, toolSession, deadline.Token)
                             : await assessment.Run(use, deadline.Token)
-                        : ReviewTools.OverBudget(use, MaxToolCalls);
+                        : ReviewTools.OverBudget(use, maxToolCalls);
                     calls.Add(outcome.Record);
                     results.Add(new { type = "tool_result", tool_use_id = use.Id, content = PromptFence.Block(ToolResultTag, outcome.Content), is_error = outcome.IsError });
                 }
-                if (turn == MaxTurns)
+                if (turn == maxTurns)
                 {
                     // The turn cap: the next turn is the last, and only for the final answer.
                     results.Add(new { type = AnswerBlock.TextType, text = assessment is null ? FinalAnswerRequest(confirm) : "No more tools. Return only the assessment JSON now." });
@@ -298,7 +308,13 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             var problem = $"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.";
-            if (assessment is not null) return new SessionEnd(null, null, null, "", problem, Calls(), Turns: Turns());
+            if (assessment is not null)
+            {
+                problem = timer.IsCancellationRequested
+                    ? $"The assessment conversation did not finish within {limit.TotalMinutes:0.##} min."
+                    : $"A turn of the assessment conversation did not finish within {http.Timeout.TotalMinutes:0.##} min.";
+                return new SessionEnd(null, null, null, "", problem, Calls(), Turns: Turns());
+            }
             throw new InvalidOperationException(problem);
         }
     }
@@ -591,7 +607,11 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     }
 }
 
+/// <summary>
+/// The recovery assessor's tools and its own session limits (turns with tools, tool calls, the whole conversation's deadline),
+/// apart from the panel's; the client's timeout bounds each of its turns.
+/// </summary>
 internal sealed record AssessmentToolBindings(string Repo, IReadOnlyList<object> Definitions,
-    Func<AnswerBlock, CancellationToken, Task<ToolOutcome>> Run);
+    Func<AnswerBlock, CancellationToken, Task<ToolOutcome>> Run, int MaxTurns, int MaxToolCalls, TimeSpan Deadline);
 internal sealed record AssessmentConversation(string? Class, string? Stop, string Text, string? Problem,
     IReadOnlyList<ToolCall> Tools, IReadOnlyList<ServedTurn> Turns);

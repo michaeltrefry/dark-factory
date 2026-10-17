@@ -25,7 +25,12 @@ public sealed partial class HotFileRecovery
 {
     internal const int AssessmentLimit = 3;
     internal const int RefreshLimit = 3;
-    internal static readonly TimeSpan StageTimeout = TimeSpan.FromMinutes(15); // five-minute capture + ten-minute conversation
+    /// <summary>
+    /// One assessment attempt's lease and deadline: a five-minute capture, the assessor's own conversation deadline
+    /// (<see cref="RecoveryAssessmentTools.ConversationTimeout"/>, 30 min; sc-26444), and five minutes for cost accounting and the
+    /// revalidating capture after it.
+    /// </summary>
+    internal static readonly TimeSpan StageTimeout = TimeSpan.FromMinutes(5) + RecoveryAssessmentTools.ConversationTimeout + TimeSpan.FromMinutes(5);
     private static TimeSpan RetryDelay(int attempt) => TimeSpan.FromSeconds(attempt == 1 ? 30 : 120);
 
     private static void Escalate(HotFileIncident incident, string reason)

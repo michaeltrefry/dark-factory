@@ -233,30 +233,272 @@ public sealed class RecoveryAssessmentTests
     [Fact]
     public async Task The_assessor_is_sent_an_index_of_the_evidence_and_reads_each_body_through_read_evidence()
     {
-        // About 1.5 MiB of evidence: inline it would leave the tool budget at its floor and overrun the context.
-        var large = new string('d', 1_500_000);
+        // About 250 KB of evidence: inline it would crowd the tool budget; paged through read_evidence it is read whole.
+        var large = new string('d', 250_000);
         var material = Snapshot with { Evidence = [Snapshot.Evidence[0] with { Content = large, Hash = RecoverySnapshot.Hash(large) },
             Snapshot.Evidence[1]] };
-        var turns = 0;
-        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
-            ? SseAnswers.ToolTurn(("read", "read_evidence", """{"id":"diff:1"}"""))
-            : SseAnswers.Answer(Answer("safe"))));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer("safe")));
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "indexed", CancellationToken.None);
-        // A body past one tool result's cap reaches the model cut, so it cannot support a safe answer.
-        Assert.Equal("inconclusive", result.Decision);
-        Assert.Contains("diff:1", result.Problem);
+        Assert.Equal("safe", result.Decision);
         var first = api.Requests[0].Body!;
         Assert.True(first.Length < 64 * 1024, $"the first request inlines the evidence ({first.Length} chars)");
         Assert.DoesNotContain(new string('d', 1000), first);
-        // The index names each entry, its hash and its size; the body arrives only as read_evidence's result.
+        // The index names each entry, its hash, its size and its pages; the body arrives only as read_evidence's results.
         Assert.Contains("diff:1", first);
         Assert.Contains(RecoverySnapshot.Hash(large), first);
-        Assert.Contains("1500000", first);
+        Assert.Contains("250000", first);
+        using var sent = JsonDocument.Parse(first);
+        var request = sent.RootElement.GetProperty("messages")[0].GetProperty("content").GetString()!;
+        Assert.Contains("\"Pages\":5", request);
         Assert.Contains("pending:sc-2", first);
+        Assert.Contains("\"limits\":{\"pageBytes\":50000,\"toolCalls\":80,\"toolTurns\":11,\"toolResultChars\":400000,\"toolResultTokens\":140000}", request);
         Assert.Contains(new string('d', 1000), api.Requests[1].Body!);
-        Assert.False(Assert.Single(result.Tools).Error);
+        Assert.Equal(5, result.Tools.Count);
+        Assert.All(result.Tools, t => Assert.False(t.Error));
+    }
+
+    [Fact]
+    public void Pages_cover_the_whole_content_in_order_each_within_the_page_and_result_caps_never_splitting_a_character()
+    {
+        // 'é' is 2 UTF-8 bytes and the emoji a surrogate pair of 4: page edges must fall between characters.
+        var content = string.Concat(Enumerable.Repeat("é😀abc\n", 20_000));
+        var evidence = new RecoveryEvidence("diff:1", "merged-diff", "PR:1", Tip, "hash", content);
+        var pages = RecoveryAssessmentTools.Pages(evidence);
+        var bodies = new List<string>();
+        var offset = 0;
+        for (var n = 0; n < pages.Count; n++)
+        {
+            var newline = pages[n].IndexOf('\n');
+            using var header = JsonDocument.Parse(pages[n][..newline]);
+            var body = pages[n][(newline + 1)..];
+            Assert.Equal("diff:1", header.RootElement.GetProperty("Id").GetString());
+            Assert.Equal(n + 1, header.RootElement.GetProperty("Page").GetInt32());
+            Assert.Equal(pages.Count, header.RootElement.GetProperty("Pages").GetInt32());
+            Assert.Equal(offset, header.RootElement.GetProperty("Offset").GetInt32());
+            Assert.Equal(System.Text.Encoding.UTF8.GetByteCount(body), header.RootElement.GetProperty("Bytes").GetInt32());
+            Assert.True(System.Text.Encoding.UTF8.GetByteCount(body) <= RecoveryAssessmentTools.PageBytes);
+            Assert.True(System.Text.Encoding.UTF8.GetByteCount(pages[n]) <= ReviewTools.MaxResultBytes);
+            Assert.False(char.IsHighSurrogate(body[^1]));
+            offset += System.Text.Encoding.UTF8.GetByteCount(body);
+            bodies.Add(body);
+        }
+        Assert.Equal(content, string.Concat(bodies));
+        Assert.True(pages.Count > 1);
+        Assert.Single(RecoveryAssessmentTools.Pages(evidence with { Content = "" }));
+    }
+
+    [Theory]
+    [InlineData("1,2,3", "safe")]
+    [InlineData("3,1,2", "safe")]
+    [InlineData("1,3", "inconclusive")]
+    [InlineData("1,1,2", "inconclusive")]
+    [InlineData("1,2", "inconclusive")]
+    [InlineData("1,2,4", "inconclusive")]
+    [InlineData("0,1,2,3", "safe")]
+    public async Task A_diff_over_one_result_cap_counts_as_read_only_once_every_page_was_read(string read, string expected)
+    {
+        // 150,000 bytes: three pages, and more than one 60,000-byte tool result could carry.
+        var large = new string('d', 150_000);
+        var material = Snapshot with { Evidence = [Snapshot.Evidence[0] with { Content = large, Hash = RecoverySnapshot.Hash(large) },
+            Snapshot.Evidence[1]] };
+        var pages = read.Split(',').Select(int.Parse).ToArray();
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
+            ? SseAnswers.ToolTurn(pages.Select((page, n) => ($"read{n}", "read_evidence", JsonSerializer.Serialize(new { id = "diff:1", page }))).ToArray())
+            : SseAnswers.Answer(Answer())));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "paged", CancellationToken.None);
+        Assert.Equal(expected, result.Decision);
+        Assert.Equal(pages.Length, result.Tools.Count);
+        // A page that does not exist (0, 4) is an error, served nothing.
+        Assert.Equal(pages.Select(p => p is < 1 or > 3), result.Tools.Select(t => t.Error));
+        if (expected == "inconclusive") Assert.Contains("did not read in full: diff:1", result.Problem);
+    }
+
+    [Theory]
+    [InlineData("{\"id\":\"diff:1\",\"page\":\"1\"}")]
+    [InlineData("{\"id\":\"diff:1\",\"page\":1.5}")]
+    [InlineData("{\"id\":\"diff:1\",\"offset\":0}")]
+    [InlineData("{\"id\":\"diff:1\",\"id\":\"diff:1\"}")]
+    [InlineData("{\"page\":1}")]
+    public async Task A_malformed_read_evidence_call_is_an_error_and_reads_nothing(string input)
+    {
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(++turns == 1
+            ? SseAnswers.ToolTurn(("read", "read_evidence", input)) : SseAnswers.Answer(Answer())));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot))).AssessAsync(Trigger, "malformed", CancellationToken.None);
+        Assert.True(Assert.Single(result.Tools).Error);
+        Assert.Equal("inconclusive", result.Decision);
+    }
+
+    [Theory]
+    [InlineData("one-huge-diff", "characters of pages exceed the")]
+    [InlineData("many-diffs", "65 read_evidence pages exceed the 60 of the assessor's 80 tool calls")]
+    public async Task An_incident_whose_merged_diffs_cannot_fit_one_session_is_inconclusive_before_any_router_call(string shape, string reason)
+    {
+        // Within the snapshot's own limits (2 MiB, 50 merges) yet past one assessment session's.
+        var material = shape == "one-huge-diff"
+            ? Snapshot with { Evidence = [Snapshot.Evidence[0] with { Content = new string('d', 1_500_000) }, Snapshot.Evidence[1]] }
+            : Snapshot with { Evidence = [.. Enumerable.Range(1, 65).Select(n => new RecoveryEvidence($"diff:{n}", "merged-diff", $"PR:{n}", Tip,
+                "hash", "d")), Snapshot.Evidence[1]] };
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "oversized", CancellationToken.None);
+        Assert.Empty(api.Requests);
+        Assert.Equal("inconclusive", result.Decision);
+        Assert.True(result.Oversized);
+        Assert.Contains(reason, result.Problem);
+        Assert.Contains("a human must review it", result.Problem);
+        Assert.Equal("oversized", result.Session);
+        Assert.NotNull(result.Material);
+    }
+
+    [Fact]
+    public async Task The_largest_incident_that_fits_one_session_is_read_page_by_page_and_judged_safe()
+    {
+        // Merged diffs inside one session and its reserve for other reads: about 270,000 characters over 10 pages and several turns.
+        var material = Snapshot with { Evidence = [.. Enumerable.Range(1, 5).Select(n => new RecoveryEvidence($"diff:{n}", "merged-diff",
+            $"PR:{n}", Tip, "hash", new string('d', 54_000))), Snapshot.Evidence[1]] };
+        Assert.Null(RouterHotFileAssessor.Unreadable(material, 20_000, 7_000));
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
+        using var http = api.Client("http://router.test/");
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(material))).AssessAsync(Trigger, "fits", CancellationToken.None);
+        Assert.Equal("safe", result.Decision);
+        Assert.Equal(10, result.Tools.Count);
+        Assert.True(result.Turns.Count > 1);
+    }
+
+    [Theory]
+    [InlineData("chars", "characters of pages exceed the 280000 of the assessor's tool-result budget left after 100000 kept for other reads")]
+    [InlineData("calls", "61 read_evidence pages exceed the 60 of the assessor's 80 tool calls left after 20 kept for other reads")]
+    [InlineData("tokens", "tokens of pages exceed the 98000 of the assessor's token budget left after 35000 kept for other reads")]
+    public void Merged_diffs_that_would_leave_no_room_for_the_other_reads_or_overrun_the_context_in_tokens_are_refused_up_front(
+        string shape, string reason)
+    {
+        // Each fits the session's whole budget, yet not with room for requirements, results and code beside it; or, as dense
+        // non-Latin text (about a token a character), its characters fit while its tokens would overrun the context.
+        var diffs = shape switch
+        {
+            "chars" => Enumerable.Range(1, 6).Select(n => new string('d', 54_000)),
+            "calls" => Enumerable.Range(1, 61).Select(n => "d"),
+            _ => [new string('\u6f22', 110_000)],
+        };
+        var material = Snapshot with { Evidence = [.. diffs.Select((d, n) => new RecoveryEvidence($"diff:{n}", "merged-diff", $"PR:{n}", Tip, "hash", d)),
+            Snapshot.Evidence[1]] };
+        var oversized = RouterHotFileAssessor.Unreadable(material, 20_000, 7_000);
+        Assert.NotNull(oversized);
+        Assert.Contains(reason, oversized);
+        // Without the reserve (chars, calls), or counting characters only (tokens), the same diffs fit the session.
+        var pages = material.Evidence.Where(e => e.Category == "merged-diff").Select(RecoveryAssessmentTools.Pages).ToArray();
+        Assert.True(pages.Sum(p => p.Count) <= RecoveryAssessmentTools.MaxToolCalls);
+        Assert.True(pages.Sum(p => p.Sum(page => page.Length)) <= RecoveryAssessmentTools.Budget(20_000));
+    }
+
+    [Fact]
+    public async Task A_result_past_the_session_token_budget_is_refused_and_does_not_count_as_read()
+    {
+        var dense = new string('\u6f22', 10_000);
+        var material = Snapshot with { Evidence = [Snapshot.Evidence[0] with { Content = dense }, Snapshot.Evidence[1]] };
+        // A request that has left 2,666 estimated tokens: one page of dense text (10,000 tokens) does not fit, though its 10,000
+        // characters fit the character budget many times over.
+        var tools = new RecoveryAssessmentTools(material, null, 1_000, RecoveryAssessmentTools.MaxSessionTokens);
+        var outcome = await tools.Bindings.Run(new AnswerBlock(AnswerBlock.ToolUse, null, "r", "read_evidence", "{\"id\":\"diff:1\"}"),
+            CancellationToken.None);
+        Assert.True(outcome.IsError);
+        Assert.StartsWith("Assessment token budget exhausted", outcome.Content);
+        Assert.DoesNotContain(dense[..100], outcome.Content);
+        Assert.Empty(tools.FullyRead);
+        // The same read with the budget free is served whole.
+        var free = new RecoveryAssessmentTools(material, null, 1_000, 1_000);
+        Assert.False((await free.Bindings.Run(new AnswerBlock(AnswerBlock.ToolUse, null, "r", "read_evidence", "{\"id\":\"diff:1\"}"),
+            CancellationToken.None)).IsError);
+        Assert.Contains("diff:1", free.FullyRead);
+    }
+
+    [Fact]
+    public async Task An_entry_is_paged_once_for_every_read_of_the_session()
+    {
+        var large = new string('d', 150_000);
+        var material = Snapshot with { Evidence = [Snapshot.Evidence[0] with { Content = large }, Snapshot.Evidence[1]] };
+        var pages = new EvidencePages();
+        var tools = new RecoveryAssessmentTools(material, null, 1_000, 1_000, pages);
+        foreach (var page in new[] { 1, 2, 3, 2 })
+            Assert.False((await tools.Bindings.Run(new AnswerBlock(AnswerBlock.ToolUse, null, $"r{page}", "read_evidence",
+                JsonSerializer.Serialize(new { id = "diff:1", page })), CancellationToken.None)).IsError);
+        Assert.Equal(1, pages.Paged);
+        Assert.Same(pages.Of(material.Evidence[0]), pages.Of(material.Evidence[0]));
+        Assert.Contains("diff:1", tools.FullyRead);
+    }
+
+    [Fact]
+    public void The_turns_the_request_states_are_those_in_which_tools_run()
+    {
+        // The turn cap's own calls are answered "not run", so tools run in one turn fewer than the cap.
+        Assert.Equal(RecoveryAssessmentTools.MaxTurns - 1, RecoveryAssessmentTools.ToolTurns);
+        Assert.Contains("toolTurns = 11", RouterHotFileAssessor.Limits.ToString());
+    }
+
+    [Theory]
+    [InlineData(3, 9, "safe", null)]
+    [InlineData(2, 11, "inconclusive", "A turn of the assessment conversation did not finish within 10 min.")]
+    [InlineData(4, 9, "inconclusive", "The assessment conversation did not finish within 30 min.")]
+    public async Task Each_turn_is_bounded_by_the_review_timeout_and_the_conversation_by_the_assessors_own_deadline(
+        int turnsTaken, int minutesPerTurn, string expected, string? problem)
+    {
+        // Review:TimeoutMinutes 10: a conversation of several turns, each well inside it, goes on past 10 minutes in all; a
+        // single stalled turn, or a conversation past its own 30 minutes, ends inconclusive.
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var turns = 0;
+        var api = new FakeApi().On("POST /v1/messages", _ =>
+        {
+            turns++;
+            time.Advance(TimeSpan.FromMinutes(minutesPerTurn));
+            return SseAnswers.Response(turns < turnsTaken
+                ? SseAnswers.ToolTurn(($"read{turns}", "read_evidence", "{\"id\":\"diff:1\"}"))
+                : SseAnswers.Answer(Answer()));
+        });
+        using var http = api.Client("http://router.test/");
+        http.Timeout = TimeSpan.FromMinutes(10);
+        var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test", time: time),
+            (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot))).AssessAsync(Trigger, "timed", CancellationToken.None);
+        Assert.Equal(expected, result.Decision);
+        if (problem is not null) Assert.Equal(problem, result.Problem);
+    }
+
+    [Fact]
+    public void The_stage_timeout_holds_the_capture_the_assessors_conversation_and_what_follows_it()
+    {
+        Assert.Equal(TimeSpan.FromMinutes(30), RecoveryAssessmentTools.ConversationTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(40), HotFileRecovery.StageTimeout);
+    }
+
+    [Fact]
+    public async Task An_oversized_incident_escalates_at_once_with_its_reason_and_opens_no_router_session()
+    {
+        var fixture = new HotFileRecoveryTests.Fixture();
+        for (var n = 0; n < 8; n++) await fixture.Merge();
+        var api = new FakeApi().On("POST /v1/messages", r => AssessmentReads.Respond(r, Answer()));
+        using var http = api.Client("http://router.test/");
+        var assessor = new RouterHotFileAssessor(new RouterReviewer(http, "test"), (trigger, _) =>
+            Task.FromResult(JsonSerializer.Serialize(Snapshot with { IncidentSnapshot = trigger.Id, Generation = trigger.Generation,
+                Evidence = [Snapshot.Evidence[0] with { Content = new string('d', 1_500_000) }, Snapshot.Evidence[1]] })));
+        await using var recovery = new HotFileRecovery(fixture.Contexts, fixture.Locks, fixture.Options, fixture.Time, assessor);
+        await recovery.AdvanceAsync(Repo, CancellationToken.None);
+        await using var db = fixture.Contexts.CreateDbContext();
+        var incident = Assert.Single(db.HotFileIncidents);
+        Assert.Empty(api.Requests);
+        Assert.Equal("Escalated", incident.State);
+        Assert.Equal(1, incident.Attempts);
+        Assert.StartsWith("Assessment cannot read the required evidence: Not assessed: a safe answer must read all 1 merged diffs", incident.Error);
+        Assert.Contains("tool-result budget", incident.Error);
+        Assert.True(JsonSerializer.Deserialize<HotFileAssessment>(incident.Answer!)!.Oversized);
     }
 
     [Theory]
@@ -587,14 +829,14 @@ public sealed class RecoveryAssessmentTests
     }
 
     [Fact]
-    public async Task Assessment_uses_the_shared_turn_cap_and_forces_a_final_JSON_answer_without_more_tools()
+    public async Task Assessment_uses_its_own_turn_cap_and_forces_a_final_JSON_answer_without_more_tools()
     {
         var calls = 0;
         var api = new FakeApi().On("POST /v1/messages", r =>
         {
             calls++;
             using var doc = JsonDocument.Parse(r.Body!);
-            var final = calls == RouterReviewer.MaxTurns + 1;
+            var final = calls == RecoveryAssessmentTools.MaxTurns + 1;
             Assert.Equal(final ? "none" : "auto", doc.RootElement.GetProperty("tool_choice").GetProperty("type").GetString());
             return SseAnswers.Response(final ? SseAnswers.Answer(Answer("inconclusive"))
                 : SseAnswers.ToolTurn(($"lookup{calls}", "read_evidence", "{\"id\":\"diff:1\"}")));
@@ -602,8 +844,8 @@ public sealed class RecoveryAssessmentTests
         using var http = api.Client("http://router.test/");
         var result = await new RouterHotFileAssessor(new RouterReviewer(http, "test"),
             (_, _) => Task.FromResult(JsonSerializer.Serialize(Snapshot))).AssessAsync(Trigger, "fresh", CancellationToken.None);
-        Assert.Equal(RouterReviewer.MaxTurns + 1, calls);
-        Assert.Equal(RouterReviewer.MaxTurns, result.Tools.Count);
+        Assert.Equal(RecoveryAssessmentTools.MaxTurns + 1, calls);
+        Assert.Equal(RecoveryAssessmentTools.MaxTurns, result.Tools.Count);
         Assert.True(result.Tools[^1].Error);
         Assert.Equal("inconclusive", result.Decision);
     }
