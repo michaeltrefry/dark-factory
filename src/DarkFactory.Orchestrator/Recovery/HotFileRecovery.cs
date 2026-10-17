@@ -208,6 +208,7 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                 if (answer.Snapshot == snapshot.Id && answer.Generation == incident.Generation && answer.Repo == repo
                     && answer.ServedClass == "high" && answer.Decision == "safe" && answer.EvidenceHash == incident.EvidenceHash && !changed)
                 {
+                    await RecordRedirectsAsync(db, incident, answer, time.GetUtcNow(), ct);
                     incident.State = "Resolved";
                     incident.ResolvedAt = time.GetUtcNow();
                     incident.Error = null;

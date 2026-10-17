@@ -104,7 +104,7 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
         var detail = System.Text.Json.JsonSerializer.Serialize(redirect);
         if (redirect.Item != item.ExternalId || !RepoRef.Parse(redirect.Repo).Is(RepoRef.Parse(item.Repo))
             || !await db.HotFileIncidents.AnyAsync(i => i.Id == redirect.Incident && i.State == "Resolved", ct)
-            || !await db.LedgerEntries.AnyAsync(e => e.WorkItemId == item.Id && e.Step == Recovery.RecoveryRedirect.Step && e.Detail == detail, ct))
+            || !await db.LedgerEntries.AnyAsync(e => e.Step == Recovery.RecoveryRedirect.Step && e.Detail == detail, ct))
             throw new InvalidOperationException("No exact safe recovery disposition authorizes this restart.");
         Lifecycle.Ensure(item.State, WorkState.Implement, (await ContextAsync(item, ct)) with { RecoveryRestart = true });
         await AppendAsync(item, WorkState.Implement, null, null, "fresh coding after recovery: " + detail, ct);

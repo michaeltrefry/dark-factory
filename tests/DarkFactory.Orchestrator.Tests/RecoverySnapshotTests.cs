@@ -55,9 +55,9 @@ public sealed class RecoverySnapshotTests
     }
 
     private const string Repo = "owner/alpha";
-    private sealed class Fixture
+    internal sealed class Fixture(DbContextOptions<LedgerDbContext>? options = null)
     {
-        public readonly LedgerDbContextFactory Contexts = new(new DbContextOptionsBuilder<LedgerDbContext>()
+        public readonly LedgerDbContextFactory Contexts = new(options ?? new DbContextOptionsBuilder<LedgerDbContext>()
             .UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
         public readonly GatePipelineTests.FakeGateGitHub GitHub = new() { Merged = true, MergeCommitSha = new string('9', 40) };
         public FakeWorkSource Source = new(new WorkStory(1, "requirements", "original spec", "chore", "board/story", ItemNaming.Shortcut))
@@ -354,7 +354,7 @@ public sealed class RecoverySnapshotTests
     [InlineData(false, true)]
     [InlineData(true, true)]
     [InlineData(true, false)]
-    public async Task Retained_coding_is_incomplete_even_paused_or_with_an_old_published_attempt(bool oldPublication, bool started)
+    public async Task Retained_coding_is_explicitly_unreviewed_and_requires_discard_even_with_an_old_publication(bool oldPublication, bool started)
     {
         var f = new Fixture(); await f.Seed();
         await using (var db = f.Contexts.CreateDbContext())
@@ -378,8 +378,13 @@ public sealed class RecoverySnapshotTests
         var snapshot = await f.Evidence.SnapshotAsync(f.Trigger, CancellationToken.None);
         if (started)
         {
-            Assert.False(snapshot.Complete);
-            Assert.Contains(snapshot.Missing, m => m.Category == "pending" && m.Reason.Contains("Unpublished coding work"));
+            Assert.True(snapshot.Complete);
+            var pending = Assert.Single(snapshot.Evidence, e => e.Category == "pending" && e.Content.Contains("sc-2"));
+            using var json = JsonDocument.Parse(pending.Content);
+            Assert.Null(pending.Commit);
+            Assert.Equal("unpublished-unreviewed", json.RootElement.GetProperty("headState").GetString());
+            Assert.True(json.RootElement.GetProperty("requiredDiscardRestart").GetBoolean());
+            Assert.NotEmpty(await f.Evidence.CaptureAsync(f.Trigger, default));
         }
         else
         {

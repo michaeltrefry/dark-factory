@@ -7,7 +7,10 @@ using DarkFactory.Orchestrator.WorkSources;
 namespace DarkFactory.Orchestrator.Git;
 
 /// <param name="GitDir">The worktree's git admin dir in the owner's clone, recorded before the worker runs.</param>
-public sealed record Workspace(string Path, string Branch, string BaseBranch, string GitDir);
+public sealed record Workspace(string Path, string Branch, string BaseBranch, string GitDir)
+{
+    public IReadOnlyList<string> RecoveryConflicts { get; init; } = [];
+}
 
 /// <summary>A throwaway directory (<paramref name="Path"/>) holding a checkout of each of several repositories, each in its own directory under it.</summary>
 public sealed record SeatWorkspace(string Path, IReadOnlyList<(RepoRef Repo, Workspace Workspace)> Checkouts);
@@ -177,8 +180,18 @@ public sealed class GitWorkspace(
         // A plan child keeps its own changeset base and blockers. Bring the delivered correction into this fresh branch,
         // not into the plan's shared branch, under the ordinary owner-git and clone-lock rules.
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
-        await Git(workspace.Path, null, ct, [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}",
-            "-c", $"user.name={CommitterName}", "-c", $"user.email={CommitterEmail}", "merge", "--no-edit", correctedCommit]);
+        try
+        {
+            await Git(workspace.Path, null, ct, [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}",
+                "-c", $"user.name={CommitterName}", "-c", $"user.email={CommitterEmail}", "merge", "--no-ff", "--no-edit", correctedCommit]);
+        }
+        catch (InvalidOperationException)
+        {
+            var conflicts = (await Git(workspace.Path, null, ct, [$"--git-dir={workspace.GitDir}", $"--work-tree={workspace.Path}",
+                "diff", "--name-only", "-z", "--diff-filter=U"])).Split('\0', StringSplitOptions.RemoveEmptyEntries);
+            if (conflicts.Length == 0) throw;
+            return workspace with { RecoveryConflicts = conflicts };
+        }
         return workspace;
     }
 

@@ -27,6 +27,9 @@ public sealed partial class RunPipeline
         await InWorkerPhaseAsync(run.Item, "restart redirected coding", async () =>
         {
             await ThrowIfControlledAsync(run.Item, ct);
+            var current = await recovery!.RedirectAsync(run.Item.ExternalId, ct);
+            if (current != redirect) throw new Recovery.RecoveryContinuationDeferredException("Recovery disposition changed while waiting for a slot.");
+            await ThrowIfControlledAsync(run.Item, ct);
             var attempt = CurrentWorkerAttempt(history);
             if (OrphanedWorkerPid(attempt) is { } pid)
                 await worker.StopOrphanAsync(pid, ct);
