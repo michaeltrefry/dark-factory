@@ -45,7 +45,7 @@ public class SystemOneAcceptanceTests
                 return Malformed ? Results.Text("{}", "application/json") : Results.Json(new
                 {
                     model = "upstream-d3",
-                    answers = new { issue_kind = new { pick = "bug", probabilities = new { bug = .8, feature = .05, question = .05, possible_duplicate = .05, unclear = .05 }, confidence = .6 } },
+                    answers = new { issue_kind = new { type = "choice", choice = "bug", probabilities = new { bug = .8, feature = .05, question = .05, possible_duplicate = .05, unclear = .05 }, confidence = .6 } },
                     usage = new { input_tokens = 83, output_tokens = 0 }
                 });
             });
