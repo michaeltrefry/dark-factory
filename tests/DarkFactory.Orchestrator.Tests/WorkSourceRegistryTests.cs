@@ -135,7 +135,7 @@ public class WorkSourceRegistryTests
         Assert.Contains("Kanban:Watch:Projects", WorkSourceRegistry.KindOf(ItemNaming.Kanban).Settings);
         Assert.Contains("GitHub:Watch:Repos", WorkSourceRegistry.KindOf(ItemNaming.GitHubIssue).Settings);
         // The refusal with no source names all of them, and how work already in flight is finished by id.
-        Assert.All(WorkSourceRegistry.Kinds, k => Assert.Contains(k.Settings, WorkSourceRegistry.NoneConfigured));
+        Assert.All(WorkSourceRegistry.Kinds.Where(k => !k.Internal), k => Assert.Contains(k.Settings, WorkSourceRegistry.NoneConfigured));
         Assert.Equal(WorkSourceRegistry.NoneConfigured + " An item the factory already works needs no watch scope to be finished by hand: "
             + "`factory stop --item <id>` cancels it, `factory run <id> --ignore-scope` runs it on.", WorkSourceRegistry.NothingWatched);
         // The credential alone is what an item named by id needs: it names no watch scope.
@@ -387,10 +387,10 @@ public class WorkSourceRegistryTests
 
         var lanes = sources.Lanes(source => { runners.Add(source); return b.Runner(source); }, new IntakeStatus(TimeProvider.System), TextWriter.Null);
 
-        Assert.Equal(["shortcut", "github", "kanban"], lanes.Select(l => l.Source.Naming.Source));
+        Assert.Equal(["shortcut", "github", "kanban", "recovery"], lanes.Select(l => l.Source.Naming.Source));
         Assert.Equal(lanes.Select(l => l.Source), runners);
         // GitHub issues are triaged before they are listed; a board's ready items are listed as they are.
-        Assert.Equal([false, true, false], lanes.Select(l => l.Prepare is not null));
+        Assert.Equal([false, true, false, false], lanes.Select(l => l.Prepare is not null));
 
         static List<(string Source, bool Prepared)> Of(Boards b, WorkSourceRegistry registry) =>
             [.. registry.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null).Select(l => (l.Source.Naming.Source, l.Prepare is not null))];
@@ -399,16 +399,16 @@ public class WorkSourceRegistryTests
         // was emptied — but it is not prepared: no issue is triaged for an issues source that watches no repository. (The
         // workers' GitHub App, which every run needs, is the issues source's credential.)
         using var kanbanWatched = b.Registry(Options(Core, Kanban));
-        Assert.Equal([("github", false), ("kanban", false)], Of(b, kanbanWatched));
+        Assert.Equal([("github", false), ("kanban", false), ("recovery", false)], Of(b, kanbanWatched));
         using var tokensOnly = b.Registry(Options(Core, Kanban, ShortcutToken));
-        Assert.Equal([("shortcut", false), ("github", false), ("kanban", false)], Of(b, tokensOnly));
+        Assert.Equal([("shortcut", false), ("github", false), ("kanban", false), ("recovery", false)], Of(b, tokensOnly));
         using var kanbanCleared = b.Registry(Options(Core, Shortcut, KanbanToken));
-        Assert.Equal([("shortcut", false), ("github", false), ("kanban", false)], Of(b, kanbanCleared));
+        Assert.Equal([("shortcut", false), ("github", false), ("kanban", false), ("recovery", false)], Of(b, kanbanCleared));
         // No credential, no lane; and nothing at all gives no lane.
         using var kanbanAlone = b.Registry(Options(Kanban));
-        Assert.Equal([("kanban", false)], Of(b, kanbanAlone));
+        Assert.Equal([("kanban", false), ("recovery", false)], Of(b, kanbanAlone));
         using var none = b.Registry(Options());
-        Assert.Empty(Of(b, none));
+        Assert.Equal([("recovery", false)], Of(b, none));
         // A watched source without its credential is refused, not given a lane that cannot work.
         using var tokenless = b.Registry(Options(Core, Kanban, new() { ["Shortcut:Watch:Epics"] = "7" }));
         Assert.Contains("Shortcut:ApiToken", Assert.Throws<MissingCredentialException>(() => Of(b, tokenless)).Message);
@@ -423,7 +423,7 @@ public class WorkSourceRegistryTests
         var item = b.Kanban.Board.AddItem(b.Kanban.Project, "Count words");
         var options = Options(Core, ShortcutToken, KanbanToken);
         using var sources = b.Registry(options);
-        Assert.Equal(["shortcut", "github", "kanban"], sources.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null).Select(l => l.Source.Naming.Source));
+        Assert.Equal(["shortcut", "github", "kanban", "recovery"], sources.Lanes(b.Runner, new IntakeStatus(TimeProvider.System), TextWriter.Null).Select(l => l.Source.Naming.Source));
 
         await b.Loop(sources).PollOnceAsync(None);
 
@@ -711,7 +711,7 @@ public class WorkSourceRegistryTests
     public async Task An_epic_scope_reaches_only_its_own_sources_items_and_asks_each_its_own_board()
     {
         // Shortcut's epics are named by their number, Kanban's by a ledger key with the prefix; an issue is in no epic.
-        Assert.Equal([("shortcut", EpicNaming.Number), ("github", EpicNaming.None), ("kanban", EpicNaming.Key)],
+        Assert.Equal([("shortcut", EpicNaming.Number), ("github", EpicNaming.None), ("kanban", EpicNaming.Key), ("recovery", EpicNaming.None)],
             ItemNaming.All.Select(n => (n.Source, n.Epics)));
         var b = new Boards();
         await using (var db = b.Kanban.Db())

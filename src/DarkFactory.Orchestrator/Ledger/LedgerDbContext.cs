@@ -247,8 +247,28 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<SessionTaint> SessionTaints => Set<SessionTaint>();
     public DbSet<Recovery.HotFileIncident> HotFileIncidents => Set<Recovery.HotFileIncident>();
 
+    public DbSet<Recovery.RecoveryCorrection> RecoveryCorrections => Set<Recovery.RecoveryCorrection>();
+    public DbSet<Recovery.RecoveryAncestor> RecoveryAncestors => Set<Recovery.RecoveryAncestor>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<Recovery.RecoveryCorrection>(e =>
+        {
+            e.ToTable("recovery_corrections");
+            e.Property(x => x.Repo).HasMaxLength(200);
+            e.Property(x => x.State).HasMaxLength(32);
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => new { x.IncidentId, x.Attempt }).IsUnique();
+            e.HasOne<Recovery.HotFileIncident>().WithMany().HasForeignKey(x => x.IncidentId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<Recovery.RecoveryAncestor>(e =>
+        {
+            e.ToTable("recovery_ancestors");
+            e.HasKey(x => new { x.CorrectionId, x.WorkItemId, x.Scope });
+            e.Property(x => x.Scope).HasMaxLength(240);
+            e.HasOne(x => x.Correction).WithMany().HasForeignKey(x => x.CorrectionId).OnDelete(DeleteBehavior.Restrict);
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId).OnDelete(DeleteBehavior.Restrict);
+        });
         modelBuilder.Entity<Recovery.HotFileIncident>(e =>
         {
             e.ToTable("hot_file_incidents");

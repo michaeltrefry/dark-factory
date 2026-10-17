@@ -130,7 +130,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
                 });
             }
             var known = await db.WorkItems.AsNoTracking().OrderBy(i => i.Id).ToListAsync(token);
-            var items = known.Where(i => Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
+            var items = known.Where(i => i.Source != ItemNaming.Recovery.Source && Pending(i) && RepoRef.Parse(i.Repo).Is(repo)).ToList();
             // Backlog/released children have no item row until intake sees them. A parent may currently be in another repo.
             var plans = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RunPipeline.Steps.PlanStories)
                 .OrderBy(e => e.Id).ToListAsync(token);

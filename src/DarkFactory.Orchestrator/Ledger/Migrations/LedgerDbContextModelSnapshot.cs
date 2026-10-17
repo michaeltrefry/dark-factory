@@ -438,6 +438,92 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("hot_file_incidents", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAncestor", b =>
+                {
+                    b.Property<int>("CorrectionId")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("WorkItemId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Scope")
+                        .HasMaxLength(240)
+                        .HasColumnType("character varying(240)");
+
+                    b.HasKey("CorrectionId", "WorkItemId", "Scope");
+
+                    b.HasIndex("WorkItemId");
+
+                    b.ToTable("recovery_ancestors", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("Attempt")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Base")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("EvidenceHash")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int>("Generation")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("IncidentId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("MaterialHash")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("MaterialSnapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Paths")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Repo")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("Snapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Spec")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("IncidentId", "Attempt")
+                        .IsUnique();
+
+                    b.ToTable("recovery_corrections", (string)null);
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.LedgerEntry", b =>
                 {
                     b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
@@ -483,6 +569,32 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .WithMany()
                         .HasForeignKey("WorkItemId")
                         .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAncestor", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", "Correction")
+                        .WithMany()
+                        .HasForeignKey("CorrectionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
+                        .WithMany()
+                        .HasForeignKey("WorkItemId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Correction");
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Recovery.HotFileIncident", null)
+                        .WithMany()
+                        .HasForeignKey("IncidentId")
+                        .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
                 });
 

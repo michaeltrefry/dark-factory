@@ -72,7 +72,9 @@ public interface IHotFileAssessor
 /// Repository advisory locks serialize creation, dispatch and acceptance across processes. No worker slot is involved.
 /// </summary>
 public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts, IRunLocks locks, FreezeOptions options,
-    TimeProvider time, IHotFileAssessor assessor, IReadOnlyList<IDisposable>? owned = null) : IAsyncDisposable
+    TimeProvider time, IHotFileAssessor assessor, IReadOnlyList<IDisposable>? owned = null,
+    Func<HotFileSnapshot, CancellationToken, Task<string>>? capture = null,
+    Func<RepoRef, string, CancellationToken, Task<string?>>? policy = null) : IAsyncDisposable
 {
     private readonly CancellationTokenSource _shutdown = new();
 
@@ -158,7 +160,7 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
         if (held is null) return;
         await using var db = await contexts.CreateDbContextAsync(ct);
         var incident = await DetectLockedAsync(db, repo, ct);
-        if (incident is null || incident.State == "Escalated" || incident.NextAttemptAt > time.GetUtcNow()) return;
+        if (incident is null || incident.State is "Escalated" or "Correcting" || incident.NextAttemptAt > time.GetUtcNow()) return;
         if (incident.Attempts >= 3)
         {
             incident.State = "Escalated";
@@ -202,6 +204,27 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
                     incident.ResolvedAt = time.GetUtcNow();
                     incident.Error = null;
                 }
+                else if (!changed && answer.Decision == "unsafe" && answer.CorrectionFindings.Count > 0 && policy is not null && capture is not null)
+                {
+                    try
+                    {
+                        incident.State = "Unsafe";
+                        var material = RecoveryCorrections.ValidateAssessment(incident, answer, snapshot);
+                        if (await capture(snapshot, ct) != answer.Material)
+                            throw new InvalidOperationException("Snapshot evidence changed before correction authorization.");
+                        var bases = snapshot.Merges.Select(m => m.Base).Distinct().ToArray();
+                        if (bases.Length != 1) throw new InvalidOperationException("Correction spans more than one delivery base.");
+                        var yaml = await policy(RepoRef.Parse(repo), material.BaseTips[bases[0]], ct)
+                            ?? throw new InvalidOperationException("Correction base has no gate policy.");
+                        await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(yaml), time.GetUtcNow(), ct);
+                    }
+                    catch (Exception ex) when (!ct.IsCancellationRequested)
+                    {
+                        incident.State = "Escalated";
+                        incident.Error = "Correction refused; repository remains held: " + ex.Message;
+                        await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct);
+                    }
+                }
                 else
                 {
                     incident.State = "Held";
@@ -219,6 +242,38 @@ public sealed class HotFileRecovery(IDbContextFactory<LedgerDbContext> contexts,
             await db.SaveChangesAsync(ct);
         }
         finally { Assessments.Release(); }
+    }
+
+    /// <summary>Fresh dispatch/worker-entry authority; only this exact grant's own incident hold is excepted.</summary>
+    public async Task<bool> AuthorizeCorrectionAsync(string externalId, string repository, CancellationToken ct)
+    {
+        if (!ItemNaming.Recovery.TryParse(externalId, out var id) || capture is null || policy is null) return false;
+        await using var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
+        if (held is null) return false;
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var correction = await RecoveryWorkSource.ValidAsync(db, id, ct);
+        if (correction is null || correction.Repo != Key(repository)) return false;
+        var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == correction.IncidentId, ct);
+        var trigger = HotFileSnapshot.Parse(incident.Snapshot);
+        try
+        {
+            var material = await capture(trigger, ct);
+            if (RecoverySnapshot.Hash(material) != correction.MaterialHash)
+                throw new InvalidOperationException("Snapshot evidence changed; correction authority is stale.");
+            var snapshot = RecoverySnapshot.FromDetail(material)!;
+            var yaml = await policy(RepoRef.Parse(repository), snapshot.BaseTips[correction.Base], ct)
+                ?? throw new InvalidOperationException("Correction base has no gate policy.");
+            RecoveryCorrections.ValidateEnvelope(JsonSerializer.Deserialize<string[]>(correction.Paths)!, GatePolicy.Parse(yaml));
+            return true;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            correction.State = "Revoked"; correction.Version++;
+            incident.State = "Held"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
+            await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct, externalId);
+            await db.SaveChangesAsync(ct);
+            return false;
+        }
     }
 
     /// <summary>Kick independent repo tasks without making intake wait for a model. Faults are observed and logged.</summary>

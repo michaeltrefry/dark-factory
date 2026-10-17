@@ -51,7 +51,8 @@ public sealed record WorkSourceKind(
     Func<FactoryOptions, string?> Unwatched,
     Func<FactoryOptions, IntakeStatus, TextWriter, Func<CancellationToken, Task>>? Prepare = null,
     Func<FactoryOptions, IBoardLinks>? Links = null,
-    Func<IDbContextFactory<LedgerDbContext>, long, CancellationToken, Task<bool>>? KnowsEpic = null);
+    Func<IDbContextFactory<LedgerDbContext>, long, CancellationToken, Task<bool>>? KnowsEpic = null,
+    bool Internal = false);
 
 /// <summary>
 /// The factory's work sources (sc-25982), keyed by <see cref="ItemNaming"/>: the one registry <c>factory work</c>'s intake loop and
@@ -119,6 +120,9 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
             Links: o => new KanbanLedgerLinks(o.KanbanWebUrl),
             // Needs none either: an epic key is the ledger's own.
             KnowsEpic: (contexts, key, ct) => new KanbanKeys(contexts).KnowsEpicAsync(key, ct)),
+        new(ItemNaming.Recovery, "Recovery", "no external credential", "ledger-backed incident grants",
+            _ => false, _ => true, _ => throw new InvalidOperationException("Internal recovery has no HTTP client."),
+            (_, _, contexts) => new Recovery.RecoveryWorkSource(contexts, TimeProvider.System), _ => null, Internal: true),
     ];
 
     /// <summary>
@@ -248,7 +252,7 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
     /// <summary>What would configure a work source for <c>factory work</c>: each source's credential and watch scope.</summary>
     public static string NoneConfigured =>
         "No work source is configured, so there is nothing the factory could work. Configure at least one: "
-        + string.Join("; ", Kinds.Select(k => $"{k.Name} — {k.Settings}")) + ".";
+        + string.Join("; ", Kinds.Where(k => !k.Internal).Select(k => $"{k.Name} — {k.Settings}")) + ".";
 
     /// <summary>
     /// Why <c>factory work</c> refuses to start when no source is watched (exit 2): <see cref="NoneConfigured"/>, then how work the
@@ -280,6 +284,12 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
         {
             if (!_sources.TryGetValue(kind.Naming, out var source))
             {
+                if (kind.Internal)
+                {
+                    // Internal factories never receive or allocate a transport.
+                    _sources[kind.Naming] = source = kind.Create(options, null!, contexts ?? Ledger(options));
+                    return source;
+                }
                 var client = http?.Invoke(kind.Naming) ?? kind.Http(options);
                 _clients.Add(client);
                 // Reads the credential: a missing one throws here, naming where to set it.

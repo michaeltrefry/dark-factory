@@ -221,6 +221,12 @@ public interface IWorkSource
 
     Task<WorkSpec> ReadSpecAsync(int id, CancellationToken ct);
 
+    /// <summary>Internal sources may bind dispatch to immutable ledger authorization; ignore-scope never skips it.</summary>
+    Task<ClaimResult> AuthorizeDispatchAsync(int id, RepoRef repository, CancellationToken ct) => Task.FromResult(ClaimResult.Ok);
+
+    /// <summary>A code-bound delivery base, when an internal grant requires one. Never chosen by model text.</summary>
+    Task<string?> DeliveryBaseAsync(int id, CancellationToken ct) => Task.FromResult<string?>(null);
+
     /// <summary>
     /// Moves the item on the board. <see cref="BoardState.Stopped"/> also releases the claim and
     /// requires <paramref name="comment"/>, which is posted on the item.
