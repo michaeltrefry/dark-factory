@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -354,12 +355,12 @@ public class IssueClassificationTests
     }
 
     /// <summary>
-    /// AC1: a second poll and a process restart both reuse the completed attempt for an unchanged issue version (no second
+    /// AC1: a real second poll reuses the completed attempt for an unchanged issue version (no second
     /// classifier call). The first poll models the interruption this reuse exists for: the attempt is persisted, then the
     /// authoritative triage fails before recording anything, so the next poll finds no triage record for the version.
     /// </summary>
     [Fact]
-    public async Task A_completed_attempt_is_reused_across_a_second_poll_and_a_process_restart_for_an_unchanged_version()
+    public async Task A_completed_attempt_is_reused_across_a_second_poll_for_an_unchanged_version()
     {
         using var router = new Router();
         using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
@@ -386,7 +387,7 @@ public class IssueClassificationTests
         Assert.Contains(IssueSteps.Triaged, await h.Steps());
         Assert.Equal([firstId], (await Attempts(h)).Select(a => a.Id));
 
-        // A process restart: a fresh intake over the same ledger reuses the attempt for the unchanged version.
+        // Once triaged, later comments also leave the attempt unchanged.
         h.GitHub.Reply(Repo, number, "visitor", "still there?");
         await h.Intake().PollAsync(CancellationToken.None);
         Assert.Equal(1, router.Calls);
@@ -454,51 +455,86 @@ public class IssueClassificationTests
     }
 
     /// <summary>
-    /// The interruption this reuse exists for (E9): the attempt is persisted, then the process dies before the authoritative
-    /// triage records anything. A real fresh EF context over the same Postgres ledger reuses the stored attempt — no second
-    /// classifier call — and the triage then runs once.
+    /// E9: a child process runs the production intake against Postgres and cancels at the triage runner boundary,
+    /// after classification has committed but before Triaged. It exits cleanly (not SIGKILL). The replacement
+    /// runtime has fresh intake, classifier, status, controls and EF contexts; only the Postgres ledger survives.
     /// </summary>
     [Fact]
     public async Task An_attempt_persisted_before_triage_is_reused_after_a_real_process_restart()
     {
-        await using var temp = await TempPostgresDatabase.CreateAsync("classification");
-        await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
-        var options = LedgerDbContext.PostgresOptions(temp.ConnectionString);
-        using var router = new Router();
-        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
-        var classifier = new IssueClassifier(http, "router-secret", "catalog-d3");
+        const string childConnection = "FACTORY_CLASSIFICATION_RESTART_TEST_LEDGER";
         const string title = "WordCount counts whitespace";
         const string body = "Synthetic private report body.";
         var version = IssueHashes.Version(title, body);
+        using var router = new Router();
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
 
-        // First process: the attempt is persisted, then the process dies before the triage is recorded.
-        long itemId;
-        await using (var writer = new LedgerDbContext(options))
+        if (Environment.GetEnvironmentVariable(childConnection) is { } connection)
         {
-            var item = await new WorkLedger(writer, TimeProvider.System)
-                .GetOrCreateAsync("github", "gh-1", "acme/widgets#12", "acme/widgets", "issue: https://example.test/1", CancellationToken.None);
-            itemId = item.Id;
-            writer.IssueClassifications.Add(await classifier.ClassifyAsync(itemId, version, title, body, CancellationToken.None));
-            await writer.SaveChangesAsync(CancellationToken.None);
+            // Run only fake HTTP/triage, never a worker/helper or a live classifier. Cancellation unwinds the
+            // actual intake after its independent classification SaveChangesAsync has completed.
+            var first = new IssueIntakeTests.Harness(Answer())
+            {
+                Contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(connection)),
+                Classifier = new IssueClassifier(http, "router-secret", "catalog-d3"),
+            };
+            await first.Watch();
+            first.GitHub.Open(Repo, 12, title, body, "visitor");
+            using var interrupt = new CancellationTokenSource();
+            first.Triage.Answers.Clear();
+            first.Triage.Answers.Add(() =>
+            {
+                interrupt.Cancel();
+                throw new OperationCanceledException(interrupt.Token);
+            });
+            try { await first.Intake().PollAsync(interrupt.Token); }
+            catch (OperationCanceledException) when (interrupt.IsCancellationRequested) { }
+            return;
         }
-        Assert.Equal(1, router.Calls);
 
-        // Restart: a fresh intake over the same ledger, with a fresh classifier instance, reuses the stored attempt.
+        await using var temp = await TempPostgresDatabase.CreateAsync("classification");
+        await LedgerMigrations.MigrateAsync(temp.ConnectionString, CancellationToken.None);
+        var start = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        {
+            RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false,
+        };
+        start.ArgumentList.Add(typeof(IssueClassificationTests).Assembly.Location);
+        start.ArgumentList.Add("-method");
+        start.ArgumentList.Add($"*{nameof(An_attempt_persisted_before_triage_is_reused_after_a_real_process_restart)}");
+        start.Environment[childConnection] = temp.ConnectionString;
+        using (var child = Process.Start(start)!)
+        {
+            var owned = OwnProcess.Of(child);
+            var stdout = child.StandardOutput.ReadToEndAsync();
+            var stderr = child.StandardError.ReadToEndAsync();
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+                await child.WaitForExitAsync(timeout.Token);
+                Assert.True(child.ExitCode == 0, $"Child intake failed: {await stdout} {await stderr}");
+            }
+            finally { owned.KillIfStillRunning(); }
+        }
+
         var h = new IssueIntakeTests.Harness(Answer())
         {
             Classifier = new IssueClassifier(http, "router-secret", "catalog-d3"),
-            Contexts = new LedgerDbContextFactory(options),
+            Contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(temp.ConnectionString)),
         };
+        // Read through the same factory the intake uses: these assertions must inspect the child's real writes.
+        var before = Assert.Single(await Attempts(h));
+        Assert.DoesNotContain(IssueSteps.Triaged, await h.Steps());
+        Assert.Contains(IssueSteps.TriageSession, await h.Steps());
+        Assert.Equal((version, "completed", "shadow"), (before.IssueVersion, before.Status, before.Mode));
+        h.Time.Advance(TimeSpan.FromSeconds(2));
         h.GitHub.Open(Repo, 12, title, body, "visitor");
-        await h.Intake().PollAsync(CancellationToken.None); // first poll only starts watching
-        h.Time.Advance(TimeSpan.FromSeconds(1));
         await h.Intake().PollAsync(CancellationToken.None);
 
-        Assert.Equal(1, router.Calls); // no second classifier call
-        Assert.Single(h.Triage.Prompts); // the authoritative triage still ran exactly once
-        await using var read = new LedgerDbContext(options);
-        var attempt = Assert.Single(await read.IssueClassifications.AsNoTracking().Where(a => a.WorkItemId == itemId).ToListAsync());
-        Assert.Equal((version, "completed", "shadow"), (attempt.IssueVersion, attempt.Status, attempt.Mode));
+        Assert.Equal(0, router.Calls); // the replacement process makes no classifier call
+        var attempt = Assert.Single(await Attempts(h));
+        Assert.Equal(before.Id, attempt.Id);
+        var recovered = TriageRecord.FromJson((await h.Rows()).Single(r => r.Step == IssueSteps.Triaged).Detail!);
+        Assert.Equal((version, IssueRoute.AwaitingApproval), (recovered.Version, recovered.Route));
         Assert.Equal(IssueClassifier.Version, attempt.ClassifierVersion);
         Assert.Equal(IssueClassifier.PromptVersion, attempt.PromptVersion);
         Assert.Equal("catalog-d3", attempt.RequestedModel);
