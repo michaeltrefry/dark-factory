@@ -1453,14 +1453,15 @@ owner's ledger, controls and freezes are never read or written. Pass or fail is 
 `dotnet test` by `HotFileLiveTests`): a run FAILS on no incident, an unresolved or escalated one, an assessment not served on
 `high`, an assessment session that is reused or is also a worker or review session, a last assessment that is not safe, and —
 the safe case — any correction. The defect case also fails unless exactly one correction merged with a `gate-passed` row (at
-most two attempts) and a safe assessment came after that merge, and it fails INCONCLUSIVE when the first assessment was not
-unsafe with a merged correction finding. Both check that no global freeze row was written.
+most two attempts) and a safe assessment came after that merge, unless d1 merged before d2, and it fails INCONCLUSIVE when the
+first assessment was not unsafe with a merged correction finding. Both check that no global freeze row was written. The
+harness's one tracker write is the defect case's release of d2 (Backlog → To Do) after d1 merged.
 
 Prerequisites: the shared harness's (`FACTORY_E2E=1`, the router and an enrolled plan, both GitHub Apps on the sandbox with
 its rulesets, the Shortcut token, a watch scope `FACTORY_E2E_WATCH_EPIC` holding ONLY the two stories, `docker compose up
 -d`), no real `factory work`/`factory run` running, and `FACTORY_E2E_HOTFILE_REPO=<owner/name>`: a disposable sandbox
-repository (e.g. `michaeltrefry/dark-factory-sandbox`) whose CI runs for pull requests. Each run needs two fresh To Do
-stories (the test skips naming one that is not To Do).
+repository (e.g. `michaeltrefry/dark-factory-sandbox`) whose CI runs for pull requests. Each run needs two fresh stories —
+both To Do for the safe case; d1 To Do and d2 in the Backlog for the defect case — and skips naming one in another state.
 
 Safe case, `FACTORY_E2E_HOTFILE_SAFE_STORIES=sc-<a>,sc-<b>`, in a dedicated epic: story a "Append the line `hot-file safe a`
 to `docs/hotfile-e2e.md` (create it if missing)", story b the same with `hot-file safe b`. Expected: both merge, the second
@@ -1471,7 +1472,9 @@ requirement "`HotFileCount.Words(string text)` returns the number of runs of non
 whitespace-only text has 0 words." Story d1: "Add `public static int Words(string text) => text.Split(' ').Length;` exactly
 as written to a new `HotFileCount` class in the sandbox library, with a test that `Words("a b")` is 2" — it merges code that
 violates its epic's requirement (`Words("")` is 1). Story d2: "Add `Lines(string text)` (the number of `\n`-separated lines)
-to `HotFileCount`, with a test." Give d1 the higher priority so it is worked first. Expected: both merge, the incident opens
+to `HotFileCount`, with a test." The factory does not order ready work by priority, so the order is made, not hoped for:
+leave d2 in the Backlog; the harness moves it to To Do (through the factory's own Shortcut source) only once d1's Merge row is
+in the throwaway ledger, and the run fails unless d1 merged before d2 (`HotFileLive.OrderProblem`). Expected: both merge, the incident opens
 on the `HotFileCount` file, the first assessment is unsafe with a merged finding, exactly one `rc-<n>` correction is worked in
 the sandbox repository and merged through the gate, and a fresh high-class reassessment of the delivered commit is safe.
 Risks, stated: the panel reads d1's story and may reject its instruction (no incident: the run fails `found 0`), and the live

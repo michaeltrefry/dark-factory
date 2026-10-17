@@ -56,6 +56,15 @@ public class HotFileLiveTests
     }
 
     [Fact]
+    public void The_defect_case_needs_the_defective_story_merged_before_the_second_whatever_their_priority()
+    {
+        Assert.Empty(OrderProblem(10, 20));
+        Assert.Contains(OrderProblem(20, 10), p => p.Contains("merged (row 10) before the defective story"));
+        Assert.Contains(OrderProblem(null, 10), p => p.Contains("(d1) has no Merge row"));
+        Assert.Contains(OrderProblem(10, null), p => p.Contains("(d2) has no Merge row"));
+    }
+
+    [Fact]
     public void A_safe_first_verdict_is_inconclusive_and_fails_rather_than_passing_vacuously()
     {
         Assert.Contains(DefectProblems(Defect(first: "safe", findings: 0), Repo), p => p.StartsWith("INCONCLUSIVE"));

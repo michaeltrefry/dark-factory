@@ -252,6 +252,19 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<Recovery.RecoveryAncestor> RecoveryAncestors => Set<Recovery.RecoveryAncestor>();
     public DbSet<Recovery.RecoveryAssessmentAttempt> RecoveryAssessmentAttempts => Set<Recovery.RecoveryAssessmentAttempt>();
 
+    // E3: an incident's state change is saved with its append-only ledger row (Recovery.IncidentTransitions).
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        Recovery.IncidentTransitions.Append(this);
+        return base.SaveChanges(acceptAllChangesOnSuccess);
+    }
+
+    public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+    {
+        await Recovery.IncidentTransitions.AppendAsync(this, cancellationToken);
+        return await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<Recovery.RecoveryAssessmentAttempt>(e =>

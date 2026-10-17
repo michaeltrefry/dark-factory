@@ -111,6 +111,9 @@ public static class StepOutcomes
     private static StepOutcome OfCheckpoint(string step, string? detail) => step switch
     {
         Recovery.RecoveryCorrections.RefusalStep => StepOutcome.GateRejected,
+        // An incident's state change (E3): resolving it passes; every hold, escalation included, defers the repository's work
+        // (an escalation is the incident's, not an item's, so it is not counted as one).
+        Recovery.IncidentTransitions.Step => detail?.Contains("→ Resolved", StringComparison.Ordinal) == true ? StepOutcome.Passed : StepOutcome.Deferred,
         Recovery.RecoveryCorrections.StateStep when detail?.StartsWith("Stopped", StringComparison.Ordinal) == true => StepOutcome.Escalated,
         Recovery.RecoveryCorrections.StateStep when detail?.StartsWith("Failed", StringComparison.Ordinal) == true => StepOutcome.Failed,
         Recovery.HotFileAssessment.Step => Recovery.HotFileAssessment.FromDetail(detail)?.Decision switch

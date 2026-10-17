@@ -350,7 +350,10 @@ public sealed class RecoveryAcceptanceTests
             Assert.Equal(incident.Repo, row.Repo);
             Assert.Equal(incident.Generation, row.Generation);
             Assert.Equal(incident.State, row.Stage);
-            var attempts = $"assessment {incident.Attempts}/3, correction {corrections.Select(c => c.Attempt).DefaultIfEmpty().Max()}/2, refresh {incident.Refreshes}/3";
+            // Correction attempts count per generation: from the last attempt spent before it (a human re-arm starts a new one).
+            var current = corrections.Where(c => c.Generation == incident.Generation).Select(c => c.Attempt).DefaultIfEmpty().Max();
+            var used = current == 0 ? 0 : current - corrections.Where(c => c.Generation < incident.Generation).Select(c => c.Attempt).DefaultIfEmpty().Max();
+            var attempts = $"assessment {incident.Attempts}/3, correction {used}/2, refresh {incident.Refreshes}/3";
             Assert.Equal(attempts, row.Attempts);
             Assert.Equal(corrections.Select(c => (ItemNaming.Recovery.Format(c.Id), c.Attempt)), row.Corrections.Select(c => (c.Item, c.Attempt)));
             Assert.All(corrections.Zip(row.Corrections), pair => Assert.StartsWith(pair.First.State, pair.Second.State));

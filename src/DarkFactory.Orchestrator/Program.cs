@@ -7,7 +7,19 @@ using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync, recoveryPageStatus: RecoveryStatusAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync, recoveryPageStatus: RecoveryStatusAsync, recoveryReassess: RecoveryReassessAsync).Parse(args).InvokeAsync();
+
+// The owner's CLI (the existing owner trust boundary, like pause/continue/stop): the one human re-arm of an escalated incident.
+static async Task<int> RecoveryReassessAsync(string repo, CancellationToken ct)
+{
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    await LedgerMigrations.MigrateAsync(options.LedgerConnectionString, ct);
+    var contexts = new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
+    var result = await new DarkFactory.Orchestrator.Recovery.RecoveryReassessment(contexts,
+        new PostgresRunLocks(options.LedgerConnectionString), TimeProvider.System).ReassessAsync(repo, $"{Environment.UserName} (cli)", ct);
+    (result.Ok ? Console.Out : Console.Error).WriteLine(result.Message);
+    return result.Ok ? 0 : 1;
+}
 
 static async Task<int> RecoveryStatusAsync(int page, CancellationToken ct)
 {

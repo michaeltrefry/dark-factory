@@ -340,8 +340,43 @@ else
 
     private void OnChanged(long? workItemId) => _ = InvokeAsync(ReloadAsync);
 
-    // Recovery writes need not notify work_items. Retry even after an initial failure or an empty idle read.
-    private Task OnTickAsync() => ReloadAsync();
+    private Task OnTickAsync()
+    {
+        // A run shown alive is asked about again too (sc-25991): one that died wrote no row, so no change announces it. A read
+        // that failed is retried whole, also on an idle page with no notification.
+        if (_stale || _rows is null || _rows.Any(r => r.Sessions.Any(s => s.Running) || r.Run?.Live == true))
+        {
+            return ReloadAsync();
+        }
+        // Recovery writes notify no work_items change: only the recovery panel (and the controls it shows) is polled on its own,
+        // never the whole page — a new or changed incident appears within one tick.
+        return ReloadRecoveryAsync();
+    }
+
+    private async Task ReloadRecoveryAsync()
+    {
+        if (_loading) return; // a full read in progress reads the recovery panel too
+        _loading = true;
+        try
+        {
+            _recovery = await Data.RecoveryPageAsync(_recoveryPage, _cts.Token);
+            _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
+        }
+        catch (Exception) when (_cts.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception)
+        {
+            _stale = true; // the next tick retries the whole page
+        }
+        finally
+        {
+            _loading = false;
+        }
+        if (_again) await ReloadAsync(); // a change that arrived meanwhile
+        else StateHasChanged();
+    }
 
     private int _recoveryPage;
     private Task ChangeRecoveryPageAsync(int page)

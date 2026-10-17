@@ -96,12 +96,17 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
 
     internal static long LockKey(string repo) => BitConverter.ToInt64(SHA256.HashData(Encoding.UTF8.GetBytes("hot-file:" + repo)), 0) | long.MinValue;
     private static string Key(string repo) => RepoRef.Parse(repo).Key;
-    private static string Hash(object value) => Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value)));
+    internal static string Hash(object value) => Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value)));
 
     private async Task<List<HotFileMerge>> EvidenceAsync(LedgerDbContext db, string repo, CancellationToken ct)
     {
         var from = time.GetUtcNow() - options.HotFileWindow;
-        var merges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge && e.RecordedAt >= from)
+        // Only this repository's merges in the window are read: its items' own, or a plan item's changeset pass into it (its
+        // merge-files row names the repository). The exact repository check below still decides; this only bounds the read.
+        var mention = "\"repo\":\"" + repo + "\"";
+        var merges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge && e.RecordedAt >= from
+                && db.WorkItems.Any(i => i.Id == e.WorkItemId && (i.Repo.ToLower() == repo || db.LedgerEntries.Any(f => f.WorkItemId == i.Id
+                    && f.Step == RunPipeline.Steps.MergeFiles && f.Detail != null && f.Detail.ToLower().Contains(mention)))))
             .OrderBy(e => e.Id).ToListAsync(ct);
         var ids = merges.Select(e => e.WorkItemId).Distinct().ToArray();
         var items = await db.WorkItems.AsNoTracking().Where(i => ids.Contains(i.Id)).ToDictionaryAsync(i => i.Id, ct);
@@ -330,6 +335,31 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         return RecoverySnapshot.FromDetail(HotFileAssessment.FromDetail(incident.Answer)?.Material)?.BaseTips.GetValueOrDefault(correction.Base);
     }
 
+    /// <summary>
+    /// The structural grant predicate alone (no evidence capture): true only for a correction whose current grant belongs to
+    /// <paramref name="incident"/> in <paramref name="repository"/>. Used by repeated hold checks; the four authority
+    /// boundaries revalidate in full with <see cref="AuthorizeCorrectionAsync"/>.
+    /// </summary>
+    public async Task<bool> GrantedAsync(string externalId, string repository, HotFileIncident incident, CancellationToken ct)
+    {
+        if (incident.Id == 0 || !ItemNaming.Recovery.TryParse(externalId, out _)) return false;
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        return await RecoveryCorrections.Grants(db, externalId, Key(repository)).AnyAsync(c => c.IncidentId == incident.Id, ct);
+    }
+
+    /// <summary>
+    /// Read-only (no detection, no lock): the unresolved incident that holds <paramref name="externalId"/> in
+    /// <paramref name="repository"/> now, or null — a correction is not held by its own incident while its grant is current.
+    /// </summary>
+    public async Task<HotFileIncident?> HoldingAsync(string externalId, string repository, CancellationToken ct)
+    {
+        var repo = Key(repository);
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var granted = RecoveryCorrections.Grants(db, externalId, repo).Select(c => c.IncidentId);
+        return await db.HotFileIncidents.AsNoTracking().Where(i => i.Repo == repo && i.State != "Resolved" && !granted.Contains(i.Id))
+            .OrderByDescending(i => i.Generation).FirstOrDefaultAsync(ct);
+    }
+
     public async Task<bool> AuthorizeCorrectionAsync(string externalId, string repository, CancellationToken ct,
         string? deliveryBase = null, string? baseSha = null, IReadOnlyList<string>? paths = null)
     {
@@ -381,11 +411,29 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         }
     }
 
+    /// <summary>
+    /// The repositories a poll must look at, in a fixed number of queries however many repositories the ledger has ever seen:
+    /// those with an unresolved incident, and those a factory merge inside the window went into (an item's own repository, or the
+    /// repository a changeset pass's merge-files row names). Any other repository can neither be held nor become hot this poll.
+    /// </summary>
+    internal async Task<string[]> CandidateReposAsync(LedgerDbContext db, CancellationToken ct)
+    {
+        var from = time.GetUtcNow() - options.HotFileWindow;
+        var unresolved = await db.HotFileIncidents.AsNoTracking().Where(i => i.State != "Resolved").Select(i => i.Repo).Distinct().ToListAsync(ct);
+        var merged = db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge && e.RecordedAt >= from)
+            .Select(e => e.WorkItemId).Distinct();
+        var own = await db.WorkItems.AsNoTracking().Where(i => merged.Contains(i.Id)).Select(i => i.Repo).Distinct().ToListAsync(ct);
+        var passes = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RunPipeline.Steps.MergeFiles && merged.Contains(e.WorkItemId)
+            && e.Detail != null && e.Detail.Contains("\"repo\":")).Select(e => e.Detail).Distinct().ToListAsync(ct);
+        return unresolved.Concat(own).Concat(passes.Select(d => MergeFiles.FromDetail(d)?.Repo).OfType<string>())
+            .Select(Key).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+    }
+
     /// <summary>Kick independent repo tasks without making intake wait for a model. Faults are observed and logged.</summary>
     public async Task ScheduleAsync(TextWriter log, CancellationToken ct)
     {
-        await using var db = await contexts.CreateDbContextAsync(ct);
-        var repos = (await db.WorkItems.AsNoTracking().Select(i => i.Repo).Distinct().ToListAsync(ct)).Select(Key).Distinct().ToArray();
+        string[] repos;
+        await using (var db = await contexts.CreateDbContextAsync(ct)) repos = await CandidateReposAsync(db, ct);
         foreach (var repo in repos)
         {
             if (await HeldAsync(repo, ct) is null) continue;

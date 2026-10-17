@@ -145,6 +145,9 @@ public sealed record RunView(bool? Live, string Phase, SlotUse Use, int? Slot = 
             WorkState.MergeGate => "merge gate",
             WorkState.Merge => "merged: closing out",
             WorkState.Watch => "merged",
+            // An automatic repository hold, not a human's Pause: it resumes by itself once the incident resolves.
+            WorkState.Paused when transitions.LastOrDefault()?.Detail == RunPipeline.RecoveryHeld =>
+                "held by repository recovery" + (transitions.Count > 1 ? $" in {transitions[^2].State}" : "") + ": resumes by itself",
             WorkState.Paused => "paused" + (transitions.Count > 1 ? $" in {transitions[^2].State}" : "")
                 + (transitions.LastOrDefault()?.Detail is { Length: > 0 } why ? $": {Cut(why)}" : ""),
             _ => state.ToString().ToLowerInvariant(),

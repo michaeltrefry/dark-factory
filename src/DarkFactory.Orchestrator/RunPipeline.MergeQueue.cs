@@ -310,7 +310,8 @@ public sealed partial class RunPipeline
             await ThrowIfFrozenAsync(item, ct);
             if (Naming == ItemNaming.Recovery)
             {
-                await workspaces.PushAsync(repo, workspace, ct, token => ValidateCorrectionPushAsync(run, token));
+                await workspaces.PushAsync(repo, workspace, ct, token => ThrowIfControlledAsync(item, token),
+                    token => ValidateCorrectionPushAsync(run, token));
                 await RecordCorrectionPushAsync(run, ct);
             }
             else await workspaces.PushAsync(repo, workspace, ct);

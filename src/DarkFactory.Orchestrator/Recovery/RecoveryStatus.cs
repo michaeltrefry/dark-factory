@@ -187,9 +187,9 @@ public sealed class RecoveryStatusReader(IDbContextFactory<LedgerDbContext> cont
             var hotFiles = trigger?.Merges.SelectMany(m => m.Files.Select(f => (m.Base, File: f))).Distinct()
                 .Select(pair => Text(pair.Base) + ": " + Text(pair.File)).ToArray();
             rows.Add(new(incident.Id, incident.Repo, incident.Generation, Text(incident.State), hold,
-                $"assessment {incident.Attempts}/{HotFileRecovery.AssessmentLimit}, correction {ownCorrections.Select(c => c.Attempt).DefaultIfEmpty().Max()}/2, refresh {incident.Refreshes}/{HotFileRecovery.RefreshLimit}",
+                $"assessment {incident.Attempts}/{HotFileRecovery.AssessmentLimit}, correction {RecoveryCorrections.UsedInGeneration(ownCorrections, incident)}/{RecoveryCorrections.CorrectionLimit}, refresh {incident.Refreshes}/{HotFileRecovery.RefreshLimit}",
                 evidence, assessment, incident.Error is null ? null : Text(incident.Error),
-                incident.State == "Escalated" ? $"Named human remedy: inspect the blocker and correction PR, fix the named evidence/gate/environment problem. Continue does not reset exhausted budgets or resolve an incident. To cancel affected work: factory stop --repo {incident.Repo}. No automatic retry after exhaustion."
+                incident.State == "Escalated" ? $"Named human remedy: inspect the blocker and correction PR and fix the named evidence/gate/environment problem, then re-arm a fresh assessment with fresh budgets: factory recovery reassess --repo {incident.Repo} (or the dashboard's Reassess on this incident). A Continue does not reset exhausted budgets or resolve an incident, and a re-arm clears no Pause or Stop. To cancel affected work instead: factory stop --repo {incident.Repo}. Nothing retries automatically after exhaustion."
                     : "Only a human Continue of the named manual scope clears its Pause; it does not resolve an automatic incident.",
                 hotFiles is null ? ["hot files unavailable"] : hotFiles.Take(MaxHotFiles).Concat(hotFiles.Length > MaxHotFiles ? [$"{hotFiles.Length - MaxHotFiles} hot file/base pairs omitted"] : []).ToArray(),
                 held.Take(RecoverySnapshot.MaxPending).Concat(held.Count > RecoverySnapshot.MaxPending ? [$"{held.Count - RecoverySnapshot.MaxPending} held items omitted"] : []).ToArray(),

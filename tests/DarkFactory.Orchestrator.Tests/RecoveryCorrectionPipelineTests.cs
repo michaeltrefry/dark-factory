@@ -56,6 +56,18 @@ public class RecoveryCorrectionPipelineTests
             GitHub.Diff = _ => string.Concat(Paths.Select(p => TestPolicies.Diff(p)));
         }
         internal IControls Controls => new LedgerControls(Recovery.Seed.Contexts, Recovery.Seed.Time);
+        internal IControls? ControlOverride;
+        /// <summary>Every full evidence capture the pipeline's recovery made, labelled with the item's last ledger row then.</summary>
+        internal readonly List<string> Captures = [];
+        private string Capture()
+        {
+            using var db = Recovery.Seed.Contexts.CreateDbContext();
+            var item = db.WorkItems.AsNoTracking().SingleOrDefault(i => i.ExternalId == $"rc-{Correction.Id}");
+            var last = item is null ? null : db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id)
+                .OrderByDescending(e => e.Id).FirstOrDefault();
+            Captures.Add(item is null ? "new" : $"{item.State}/{last?.Step ?? "-"}");
+            return Material;
+        }
         internal async Task<RunOutcome> Run(CancellationToken ct = default)
         {
             await using var db = Recovery.Seed.Contexts.CreateDbContext();
@@ -68,8 +80,8 @@ public class RecoveryCorrectionPipelineTests
                 return new WorkerResult("correction-session", 0, false, "success", "done", "");
             });
             return await new RunPipeline(Recovery.Source, new WorkLedger(db, Recovery.Seed.Time), Recovery.Seed.Locks,
-                Workspaces, worker, PrClient ?? Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: Controls,
-                recovery: Recovery.Recovery(() => Material),
+                Workspaces, worker, PrClient ?? Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: ControlOverride ?? Controls,
+                recovery: Recovery.Recovery(Capture),
                 gate: new GateStage(GateClient ?? GitHub, Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(2), Tests: Tests,
                     Risk: FakeCodeGraphRisk.Reader(new FakeCodeGraphRisk())))
                 .RunAsync(Correction.Id, ct);
@@ -226,6 +238,39 @@ public class RecoveryCorrectionPipelineTests
         Assert.Contains("held", (await f.Recovery.Seed.Run("owner/alpha", recovery: f.Recovery.Recovery())).Error);
     }
 
+    /// <summary>Counts every effective-control read, forwarding all to the ledger's controls.</summary>
+    internal sealed class CountingControls(IControls inner) : IControls
+    {
+        internal int Checks;
+        public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
+        { Interlocked.Increment(ref Checks); return inner.EffectiveAsync(externalId, epicId, ct); }
+        public Task<ControlState> EffectiveWithoutRepositoryAsync(string externalId, long? epicId, CancellationToken ct) =>
+            inner.EffectiveWithoutRepositoryAsync(externalId, epicId, ct);
+        public Task<ControlState> EffectiveInRepositoryAsync(string externalId, long? epicId, string repository, CancellationToken ct) =>
+            inner.EffectiveInRepositoryAsync(externalId, epicId, repository, ct);
+        public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+        public Task<Control?> UsagePauseAsync(CancellationToken ct) => inner.UsagePauseAsync(ct);
+        public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) => inner.PauseForUsageAsync(resumeAt, reason, ct);
+        public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct) => inner.FreezeAsync(trigger, detail, readChangedAt, ct);
+        public Task<Control?> GetAsync(string scope, CancellationToken ct) => inner.GetAsync(scope, ct);
+        public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => inner.SetAsync(scope, state, by, ct);
+        public Task ClearAsync(string scope, CancellationToken ct) => inner.ClearAsync(scope, ct);
+    }
+
+    [Fact]
+    public async Task A_correction_captures_evidence_once_at_each_authority_boundary_and_never_in_its_in_loop_checks()
+    {
+        var f = new Fixture(); await f.Initialize();
+        var counting = new CountingControls(f.Controls);
+        f.ControlOverride = counting;
+        Assert.Equal(WorkState.Watch, (await f.Run()).State);
+        // Dispatch (before the item has a run), worker entry (Implement, before its session), push (Implement, the
+        // worker done) and merge (MergeGate, after the write token): one capture each, and no other.
+        Assert.Equal(["new", "Implement/-", "Implement/" + RunPipeline.Steps.WorkerDone, "MergeGate/" + RunPipeline.Steps.GatePassed], f.Captures);
+        // Every step, slot/CI/overlay wait and gate read checked the composed controls structurally, capturing nothing.
+        Assert.True(counting.Checks >= 10, $"only {counting.Checks} in-loop control checks ran");
+    }
+
     [Fact]
     public async Task Delivered_bookkeeping_resumes_after_a_human_continue_without_fresh_execution_authority()
     {
@@ -238,7 +283,7 @@ public class RecoveryCorrectionPipelineTests
             db.LedgerEntries.Remove(await db.LedgerEntries.SingleAsync(e => e.WorkItemId == item.Id && e.Step == null && e.State == WorkState.Watch));
             item.State = WorkState.Merge; item.Version++;
             await db.SaveChangesAsync();
-            await new WorkLedger(db, f.Recovery.Seed.Time).RecordAsync(item, WorkState.Paused, null, RunPipeline.UserPaused, default);
+            await new WorkLedger(db, f.Recovery.Seed.Time).RecordAsync(item, WorkState.Paused, null, RunPipeline.RecoveryHeld, default);
         }
         await f.Controls.SetAsync("repo:owner/alpha", ControlState.Paused, "human", default);
         f.Material += " ";
@@ -328,7 +373,8 @@ public class RecoveryCorrectionPipelineTests
         var f = new Fixture(); await f.Initialize();
         await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
         {
-            db.HotFileIncidents.Add(new HotFileIncident { Repo = "owner/alpha", Generation = 2, State = "Held", Snapshot = "other", EvidenceHash = "other" });
+            db.HotFileIncidents.Add(new HotFileIncident { Repo = "owner/alpha", Generation = 2, State = "Held",
+                Snapshot = JsonSerializer.Serialize(new HotFileSnapshot("other", "owner/alpha", 2, [], "other")), EvidenceHash = "other" });
             await db.SaveChangesAsync();
         }
         Assert.False(await f.Recovery.Recovery().AuthorizeCorrectionAsync($"rc-{f.Correction.Id}", "owner/alpha", default));

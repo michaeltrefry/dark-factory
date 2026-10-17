@@ -39,7 +39,7 @@ public sealed class RecoveryRedirectTests
                 ReviewPanel.Decide(GatePipelineTests.Sha1, [], ReviewRoles.Required(false).Select(role =>
                     new RoleReview(role, GatePipelineTests.PanelModel, "high", "old-review", "old-prompt", [], "old safe verdict")).ToArray()).ToDetail(), default);
             await ledger.CheckpointAsync(item, RunPipeline.Steps.GatePassed, null, GatePipelineTests.Sha1, default);
-            await ledger.RecordAsync(item, WorkState.Paused, "old-session", RunPipeline.UserPaused, default);
+            await ledger.RecordAsync(item, WorkState.Paused, "old-session", RunPipeline.RecoveryHeld, default);
             return material with { Evidence = [.. material.Evidence,
                 new("pending:77", "pending", "ledger", "old-head", "hash", JsonSerializer.Serialize(new { item.ExternalId }))] };
         };

@@ -114,6 +114,19 @@ internal static class HotFileLive
         return problems;
     }
 
+    /// <summary>
+    /// The defect case's order: the defective story (d1) must merge first and the second story (d2) after it, so that the second
+    /// merge opens the incident over d1's merged defect. The factory does not order ready work by priority; the harness releases
+    /// d2 only after d1's Merge row, and this checks that it happened so.
+    /// </summary>
+    public static IReadOnlyList<string> OrderProblem(long? d1Merge, long? d2Merge) => (d1Merge, d2Merge) switch
+    {
+        (null, _) => ["the defective story (d1) has no Merge row"],
+        (_, null) => ["the second story (d2) has no Merge row"],
+        ({ } a, { } b) when b < a => [$"the second story (d2) merged (row {b}) before the defective story (d1, row {a})"],
+        _ => [],
+    };
+
     /// <summary>Reads the evidence from a (throwaway) ledger.</summary>
     public static async Task<Evidence> ReadAsync(LedgerDbContext db, CancellationToken ct)
     {

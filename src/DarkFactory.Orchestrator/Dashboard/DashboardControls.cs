@@ -16,7 +16,23 @@ public static class DashboardControls
 
     public const string By = "dashboard";
 
-    public static void MapDashboardControls(this IEndpointRouteBuilder endpoints) =>
+    /// <summary>The incident panel's Reassess: the human re-arm of an escalated repository incident (<see cref="Recovery.RecoveryReassessment"/>).</summary>
+    public const string ReassessPath = "/recovery/reassess";
+
+    public static void MapDashboardControls(this IEndpointRouteBuilder endpoints)
+    {
+        endpoints.MapPost(ReassessPath, async (Recovery.RecoveryReassessment reassessment, [FromForm] string? repo, CancellationToken ct) =>
+            {
+                if (repo is null || ControlScope.RepositoryOf("repo:" + repo.ToLowerInvariant()) is null) return Results.BadRequest();
+                var result = await reassessment.ReassessAsync(repo, By, ct);
+                Console.WriteLine($"[dashboard] reassess {repo}: {result.Message}");
+                return Results.Redirect("/");
+            })
+            .WithMetadata(new RequireAntiforgeryTokenAttribute());
+        MapControls(endpoints);
+    }
+
+    private static void MapControls(IEndpointRouteBuilder endpoints) =>
         endpoints.MapPost(Path, async (ControlActions controls, [FromForm] string? action, [FromForm] string? scope, CancellationToken ct) =>
             {
                 if (scope is null || !ControlScope.IsValid(scope) || action is null || !Actions.Contains(action))

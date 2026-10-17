@@ -190,7 +190,7 @@ public sealed class RecoveryWorkSourceTests
         Assert.False((await f.Source.ClaimAsync(first.Id, true, default)).Claimed);
         await using var db = f.Seed.Contexts.CreateDbContext();
         Assert.Equal("Escalated", Assert.Single(db.HotFileIncidents).State);
-        Assert.Equal(StepOutcome.Escalated, db.LedgerEntries.OrderBy(e => e.Id).Last().Outcome);
+        Assert.Equal(StepOutcome.Escalated, db.LedgerEntries.Where(e => e.Step != IncidentTransitions.Step).OrderBy(e => e.Id).Last().Outcome);
     }
 }
 

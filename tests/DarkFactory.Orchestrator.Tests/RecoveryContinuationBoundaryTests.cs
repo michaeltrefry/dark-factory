@@ -51,7 +51,7 @@ public sealed class RecoveryContinuationBoundaryTests
                 db.Add(new LedgerEntry { WorkItemId = item.Id, State = coding, Outcome = StepOutcome.Passed });
                 db.Add(new LedgerEntry { WorkItemId = item.Id, State = coding, Step = RunPipeline.Steps.WorkerStarted,
                     Detail = "123", ClaudeSessionId = "old-session", Outcome = StepOutcome.Passed });
-                db.Add(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Paused, Detail = RunPipeline.UserPaused,
+                db.Add(new LedgerEntry { WorkItemId = item.Id, State = WorkState.Paused, Detail = RunPipeline.RecoveryHeld,
                     Outcome = StepOutcome.Deferred });
             }
         }

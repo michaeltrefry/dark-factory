@@ -112,8 +112,12 @@ public interface IRepoWorkspace
     /// <summary>Pushes the worktree's HEAD to its <c>factory/*</c> branch as a fast-forward only (never forced): a branch that moved on origin refuses it.</summary>
     Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct);
 
-    /// <summary>A correction's owner-side base update: revalidate its exact authority at the remote-write boundary too.</summary>
-    Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task> authorize) =>
+    /// <summary>
+    /// A correction's owner-side base update: <paramref name="precheck"/> (structural) before the token is minted, and its exact
+    /// authority revalidated in full by <paramref name="authorize"/> at the remote-write boundary, after the clone's lock.
+    /// </summary>
+    Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task> precheck,
+        Func<CancellationToken, Task> authorize) =>
         throw new NotSupportedException("This workspace cannot authorize a correction base-update push.");
 
     /// <summary>Of <paramref name="paths"/>, those whose content at commit <paramref name="sha"/> (in the clone) still has a conflict marker line.</summary>
@@ -918,7 +922,8 @@ public sealed class GitWorkspace(
     {
         // No grant, no push token (E4): only the ledger's taint check issues one.
         ArgumentNullException.ThrowIfNull(grant);
-        await grant.ValidateAsync(ct);
+        // A correction's authority: structural before staging and before the token, in full after the lock right before the push.
+        await grant.PrecheckAsync(ct);
         EnsureFactoryBranch(workspace.Branch);
         var dir = workspace.Path;
         if (sandbox is not null && shareWithWorker)
@@ -939,7 +944,7 @@ public sealed class GitWorkspace(
         {
             return false;
         }
-        await grant.ValidateAsync(ct);
+        await grant.PrecheckAsync(ct);
         // Mint the token before the lock. A correction additionally refreshes its bounded authority after this lock's wait;
         // that callback reads evidence and this worktree only, and never takes the clone's lock again.
         var auth = await AuthEnvironment(repo, ct);
@@ -991,15 +996,16 @@ public sealed class GitWorkspace(
         return new Gate.BaseMerge(baseSha, await HeadAsync(workspace, ct), []);
     }
 
-    public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => PushCoreAsync(repo, workspace, ct, null);
+    public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct) => PushCoreAsync(repo, workspace, ct, null, null);
 
-    public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task> authorize) =>
-        PushCoreAsync(repo, workspace, ct, authorize);
+    public Task PushAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task> precheck,
+        Func<CancellationToken, Task> authorize) => PushCoreAsync(repo, workspace, ct, precheck, authorize);
 
-    private async Task PushCoreAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task>? authorize)
+    private async Task PushCoreAsync(RepoRef repo, Workspace workspace, CancellationToken ct, Func<CancellationToken, Task>? precheck,
+        Func<CancellationToken, Task>? authorize)
     {
         EnsureFactoryBranch(workspace.Branch);
-        if (authorize is not null) await authorize(ct);
+        if (precheck is not null) await precheck(ct);
         var auth = await AuthEnvironment(repo, ct);
         using var cloneLock = await LockAsync(ClonePath(repo), ct);
         if (authorize is not null) await authorize(ct);

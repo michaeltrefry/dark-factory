@@ -43,25 +43,40 @@ public class HotFileRecoveryAcceptanceTests
         ["Freeze:HotFileWindowHours"] = "24",
     };
 
-    private static async Task RequireToDoAsync(IEnumerable<int> stories, CancellationToken ct)
+    private static async Task RequireStateAsync(IEnumerable<int> stories, string wanted, CancellationToken ct)
     {
         foreach (var story in stories)
         {
             var (state, _) = await E2e.StoryAsync(story, ct);
-            if (state != "To Do")
+            if (state != wanted)
             {
-                Assert.Skip($"Story {StoryId.Format(story)} is {state}, not To Do: write fresh stories (docs/acceptance.md, \"Autonomous hot-file recovery\").");
+                Assert.Skip($"Story {StoryId.Format(story)} is {state}, not {wanted}: write fresh stories (docs/acceptance.md, \"Autonomous hot-file recovery\").");
             }
         }
     }
 
-    /// <summary>Runs the host until the repository's incident ends (Resolved or Escalated), then returns the ledger's evidence.</summary>
-    private static async Task<HotFileLive.Evidence> RunUntilIncidentEndsAsync(E2e e2e, RepoRef repo, TimeSpan timeout, CancellationToken ct)
+    /// <summary>
+    /// Runs the host until the repository's incident ends (Resolved or Escalated), then returns the ledger's evidence. With
+    /// <paramref name="releaseAfterFirstMerge"/>, that Backlog story is moved to To Do (the factory's own Shortcut source,
+    /// <see cref="IWorkSource.MakeReadyAsync"/>) only once <paramref name="first"/>'s Merge row is in the ledger: the factory
+    /// does not order ready work by priority, so this, not a story's Priority, makes the defect merge first (HotFileLive.OrderProblem).
+    /// </summary>
+    private static async Task<HotFileLive.Evidence> RunUntilIncidentEndsAsync(E2e e2e, RepoRef repo, TimeSpan timeout, CancellationToken ct,
+        int? first = null, int? releaseAfterFirstMerge = null)
     {
-        await using var app = FactoryHost.BuildWork(e2e.Options(Overrides(repo)));
+        var options = e2e.Options(Overrides(repo));
+        await using var app = FactoryHost.BuildWork(options);
         await app.StartAsync(ct);
         try
         {
+            if (first is { } d1 && releaseAfterFirstMerge is { } d2)
+            {
+                await E2e.WaitForAsync($"{StoryId.Format(d1)} to merge before {StoryId.Format(d2)} is released", timeout, async () =>
+                    (await e2e.TransitionsAsync(d1, ct)).Any(e => e.State == WorkState.Merge), ct);
+                using var sources = new WorkSourceRegistry(options);
+                var released = await sources.Of(ItemNaming.Shortcut).MakeReadyAsync(d2, ct);
+                Assert.True(released == ReadyResult.Moved, $"{StoryId.Format(d2)} could not be released to To Do: {released}");
+            }
             await E2e.WaitForAsync($"the hot-file incident in {repo.FullName} to end", timeout, async () =>
             {
                 await using var db = e2e.Db();
@@ -75,6 +90,14 @@ public class HotFileRecoveryAcceptanceTests
         }
         await using var read = e2e.Db();
         return await HotFileLive.ReadAsync(read, ct);
+    }
+
+    private static async Task<long?> MergeRowAsync(LedgerDbContext db, int story, CancellationToken ct)
+    {
+        var id = StoryId.Format(story);
+        return await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge
+                && db.WorkItems.Any(i => i.Id == e.WorkItemId && i.ExternalId == id))
+            .OrderBy(e => e.Id).Select(e => (long?)e.Id).FirstOrDefaultAsync(ct);
     }
 
     private static async Task AssertNoGlobalHotFileFreezeAsync(E2e e2e, CancellationToken ct)
@@ -98,7 +121,7 @@ public class HotFileRecoveryAcceptanceTests
             "two To Do stories in the watch scope, each appending one line to docs/hotfile-e2e.md in the sandbox repository");
         await using var e2e = await E2e.StartAsync("df_e2e_hotfile_safe");
         var ct = TestContext.Current.CancellationToken;
-        await RequireToDoAsync(stories, ct);
+        await RequireStateAsync(stories, "To Do", ct);
 
         var evidence = await RunUntilIncidentEndsAsync(e2e, repo, SafeTimeout, ct);
         var problems = HotFileLive.SafeProblems(evidence, repo);
@@ -126,13 +149,17 @@ public class HotFileRecoveryAcceptanceTests
         Harness.RequireOptIn();
         var repo = SandboxRepo();
         var stories = Stories("FACTORY_E2E_HOTFILE_DEFECT_STORIES",
-            "two To Do stories in the watch scope's seeded defect epic (docs/acceptance.md): the defective Count.Words story, then Count.Lines");
+            "two stories of the watch scope's seeded defect epic (docs/acceptance.md), in this order: the defective HotFileCount story "
+            + "(d1, To Do), then the second HotFileCount story (d2, Backlog: the harness releases it after d1 merges)");
         await using var e2e = await E2e.StartAsync("df_e2e_hotfile_defect");
         var ct = TestContext.Current.CancellationToken;
-        await RequireToDoAsync(stories, ct);
+        await RequireStateAsync([stories[0]], "To Do", ct);
+        await RequireStateAsync([stories[1]], "Backlog", ct);
 
-        var evidence = await RunUntilIncidentEndsAsync(e2e, repo, DefectTimeout, ct);
+        var evidence = await RunUntilIncidentEndsAsync(e2e, repo, DefectTimeout, ct, first: stories[0], releaseAfterFirstMerge: stories[1]);
         var problems = HotFileLive.DefectProblems(evidence, repo);
+        await using (var order = e2e.Db())
+            problems.AddRange(HotFileLive.OrderProblem(await MergeRowAsync(order, stories[0], ct), await MergeRowAsync(order, stories[1], ct)));
         Assert.True(problems.Count == 0, string.Join("\n", problems));
         await AssertNoGlobalHotFileFreezeAsync(e2e, ct);
         await using var db = e2e.Db();
