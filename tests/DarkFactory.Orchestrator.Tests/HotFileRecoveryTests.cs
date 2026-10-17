@@ -13,7 +13,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class HotFileRecoveryTests
 {
     private const string Repo = "owner/alpha";
-    private sealed class Assessor : IHotFileAssessor
+    internal sealed class Assessor : IHotFileAssessor
     {
         public int Calls;
         public TaskCompletionSource? Wait;
@@ -26,7 +26,7 @@ public class HotFileRecoveryTests
         }
     }
 
-    private sealed class Fixture
+    internal sealed class Fixture
     {
         public readonly FakeTimeProvider Time = new(new DateTimeOffset(2026, 10, 16, 12, 0, 0, TimeSpan.Zero));
         public readonly LedgerDbContextFactory Contexts;
@@ -201,8 +201,10 @@ public class HotFileRecoveryTests
             MergeCommitSha = new string('9', 40), Diff = _ => TestPolicies.Diff("docs/next.md") };
         var evidence = new HotFileEvidence(f.Contexts, github, _ => new FakeWorkSource(
             new WorkStory(1, "next item", $"Repo: {Repo}\nDo the work", "feature", "", ItemNaming.Shortcut)));
+        var captured = RecoverySnapshot.FromDetail(await evidence.CaptureAsync(snapshot, CancellationToken.None))!;
         var answer = System.Text.Json.JsonSerializer.Serialize(new { version = 1, snapshot = snapshot.Id, generation = snapshot.Generation,
-            repo = snapshot.Repo, decision = "safe", evidenceHash = snapshot.EvidenceHash });
+            repo = snapshot.Repo, decision = "safe", evidenceHash = snapshot.EvidenceHash, materialSnapshot = captured.Id,
+            citations = new[] { captured.Evidence[0].Id }, findings = Array.Empty<object>() });
         var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(answer)));
         using var http = api.Client("http://router.test/");
         await using var recovery = new HotFileRecovery(f.Contexts, f.Locks, f.Options, f.Time,
@@ -217,16 +219,16 @@ public class HotFileRecoveryTests
     }
 
     [Fact]
-    public async Task Production_router_assessor_uses_fresh_high_sessions_and_no_tools_and_checks_material_freshness()
+    public async Task Production_router_assessor_uses_fresh_high_sessions_and_checks_material_freshness()
     {
-        var snapshot = new HotFileSnapshot("snapshot", Repo, 1, [], "evidence");
-        var response = System.Text.Json.JsonSerializer.Serialize(new { version = 1, snapshot = "snapshot", generation = 1,
-            repo = Repo, decision = "safe", evidenceHash = "evidence" });
+        var snapshot = RecoveryAssessmentTests.Trigger;
+        var material = System.Text.Json.JsonSerializer.Serialize(RecoveryAssessmentTests.Snapshot);
+        var response = RecoveryAssessmentTests.Answer();
         var api = new FakeApi().On("POST /v1/messages", _ => SseAnswers.Response(SseAnswers.Answer(response)));
         using var http = api.Client("http://router.test/");
         var captures = 0;
         var assessor = new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "router-test-key"),
-            (_, _) => Task.FromResult(++captures <= 2 ? "pinned evidence" : "changed evidence"));
+            (_, _) => Task.FromResult(++captures <= 2 ? material : material + " "));
         var session1 = Guid.NewGuid().ToString();
         var session2 = Guid.NewGuid().ToString();
         Assert.Equal("safe", (await assessor.AssessAsync(snapshot, session1, CancellationToken.None)).Decision);
@@ -237,7 +239,7 @@ public class HotFileRecoveryTests
         {
             Assert.Equal("high", request.Headers["x-weave-model-class"]);
             using var body = System.Text.Json.JsonDocument.Parse(request.Body!);
-            Assert.False(body.RootElement.TryGetProperty("tools", out _));
+            Assert.Equal("read_evidence", Assert.Single(body.RootElement.GetProperty("tools").EnumerateArray()).GetProperty("name").GetString());
             Assert.Contains("independently assess", body.RootElement.GetProperty("system").GetString());
         });
     }
@@ -248,7 +250,7 @@ public class HotFileRecoveryTests
     [InlineData("{}")]
     public void Assessment_parser_refuses_duplicate_unknown_or_missing_fields(string text)
     {
-        Assert.ThrowsAny<Exception>(() => RouterHotFileAssessor.Parse(new DarkFactory.Orchestrator.Gate.StreamedAnswer("model", "end_turn", text), "high"));
+        Assert.ThrowsAny<Exception>(() => RecoveryDecision.Parse(text, RecoveryAssessmentTests.Trigger, RecoveryAssessmentTests.Snapshot));
     }
 
     [Fact]
@@ -334,8 +336,7 @@ public class HotFileRecoveryTests
         var evidence = new HotFileEvidence(f.Contexts, github, _ => new FakeWorkSource(
             new WorkStory(77, "pending", $"Repo: {Repo}", "feature", "", ItemNaming.Shortcut)));
         var snapshot = new HotFileSnapshot("snapshot", Repo, 1, [], "evidence");
-        var response = System.Text.Json.JsonSerializer.Serialize(new { version = 1, snapshot = "snapshot", generation = 1,
-            repo = Repo, decision = "safe", evidenceHash = "evidence" });
+        var response = "";
         var api = new FakeApi().On("POST /v1/messages", _ =>
         {
             // Only GitHub changes, not the ledger or the board specification.
@@ -343,7 +344,15 @@ public class HotFileRecoveryTests
             return SseAnswers.Response(SseAnswers.Answer(response));
         });
         using var http = api.Client("http://router.test/");
-        var assessor = new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "test-key"), evidence.CaptureAsync);
+        var assessor = new RouterHotFileAssessor(new DarkFactory.Orchestrator.Gate.RouterReviewer(http, "test-key"), async (trigger, ct) =>
+        {
+            var material = await evidence.CaptureAsync(trigger, ct);
+            var captured = RecoverySnapshot.FromDetail(material)!;
+            response = System.Text.Json.JsonSerializer.Serialize(new { version = 1, snapshot = trigger.Id, generation = trigger.Generation,
+                repo = Repo, decision = "safe", evidenceHash = trigger.EvidenceHash, materialSnapshot = captured.Id,
+                citations = new[] { captured.Evidence[0].Id }, findings = Array.Empty<object>() });
+            return material;
+        });
         string actual;
         try { actual = (await assessor.AssessAsync(snapshot, Guid.NewGuid().ToString(), CancellationToken.None)).Decision; }
         catch (InvalidOperationException) { actual = "incomplete"; }

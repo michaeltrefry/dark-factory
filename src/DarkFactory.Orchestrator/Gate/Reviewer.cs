@@ -88,7 +88,7 @@ public interface IReviewer
 /// calls included, and a stream silent for the idle gap fails.
 /// </summary>
 public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? idleTimeout = null, ReviewTools? tools = null,
-    TimeSpan? transientRetryDelay = null) : IReviewer
+    TimeSpan? transientRetryDelay = null, TimeProvider? time = null) : IReviewer
 {
     /// <summary>
     /// A turn whose stream fails with a transient upstream error (<see cref="RouterTransientStreamException"/>) is sent again — the
@@ -172,14 +172,14 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         return confirmation with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns };
     }
 
-    /// <summary>A fresh read-only assessment of supplied pinned evidence; no execution or external tools are offered.</summary>
-    internal async Task<(StreamedAnswer Answer, string? Class)> AssessAsync(string session, string system, string evidence, CancellationToken ct)
+    /// <summary>The ordinary bounded high-class conversation, with recovery-only snapshot tools.</summary>
+    internal async Task<AssessmentConversation> AssessAsync(string session, string system, string evidence,
+        AssessmentToolBindings bindings, CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(http.Timeout == Timeout.InfiniteTimeSpan ? TimeSpan.FromMinutes(10) : http.Timeout);
-        var (answer, servedClass, _) = await TurnWithRetriesAsync(session, system,
-            [new { role = "user", content = PromptFence.Block("recovery-evidence", evidence) }], [], true, deadline.Token);
-        return (answer, servedClass);
+        var result = await ConverseAsync(session, system, PromptFence.Block("recovery-evidence", evidence),
+            bindings.Repo, new PullFacts(0, "", true, false, false, "", "", "", null), null, false, ct, bindings);
+        return new(result.ServedClass, result.Stop, result.Text, result.Problem,
+            result.Tools ?? [], result.Turns ?? []);
     }
 
     private const string AfterCap = "No usable final answer after the turn cap";
@@ -210,16 +210,13 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// answer (sc-25706); asking for tools again there is unusable. The client's timeout bounds the whole session.
     /// </summary>
     private async Task<SessionEnd> ConverseAsync(string session, string system, string user, string repo, PullFacts pull, CodeGraphOverlay? overlay,
-        bool confirm, CancellationToken ct)
+        bool confirm, CancellationToken ct, AssessmentToolBindings? assessment = null)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        if (http.Timeout != Timeout.InfiniteTimeSpan)
-        {
-            deadline.CancelAfter(http.Timeout);
-        }
+        using var timer = new CancellationTokenSource(http.Timeout, time ?? TimeProvider.System);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timer.Token);
         var calls = new List<ToolCall>();
         var toolSession = ReviewTools.Session(RepoRef.Parse(repo), pull.HeadSha, pull.BaseSha, system.Length + user.Length, overlay);
-        var definitions = await _tools.DefinitionsAsync(toolSession, deadline.Token);
+        var definitions = assessment?.Definitions ?? await _tools.DefinitionsAsync(toolSession, deadline.Token);
         if (toolSession.KanbanTools.Count > 0)
         {
             user += $"\n\nAlso offered: {string.Join(", ", toolSession.KanbanTools)} read the owner's Kanban board (read-only; it is not "
@@ -257,7 +254,8 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 served.Add(new ServedTurn(turn, answer.Served, servedClass, retried));
                 if (ReviewModels.CallProblem(servedClass) is not null || answer.StopReason != "tool_use")
                 {
-                    return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text, null, Calls(), final, Turns());
+                    return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text,
+                        assessment is not null && answer.ToolUses.Any() ? "Tools in a non-tool-use final answer." : null, Calls(), final, Turns());
                 }
                 SessionEnd Unusable(string why) => new(answer.Served, servedClass, answer.StopReason, answer.Text, why, Calls(), final, Turns());
                 if (final)
@@ -274,7 +272,9 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 foreach (var use in uses)
                 {
                     var outcome = turn == MaxTurns ? ReviewTools.AtTurnCap(use, MaxTurns)
-                        : calls.Count < MaxToolCalls ? await _tools.RunAsync(use, toolSession, deadline.Token)
+                        : calls.Count < MaxToolCalls ? assessment is null
+                            ? await _tools.RunAsync(use, toolSession, deadline.Token)
+                            : await assessment.Run(use, deadline.Token)
                         : ReviewTools.OverBudget(use, MaxToolCalls);
                     calls.Add(outcome.Record);
                     results.Add(new { type = "tool_result", tool_use_id = use.Id, content = PromptFence.Block(ToolResultTag, outcome.Content), is_error = outcome.IsError });
@@ -282,14 +282,24 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 if (turn == MaxTurns)
                 {
                     // The turn cap: the next turn is the last, and only for the final answer.
-                    results.Add(new { type = AnswerBlock.TextType, text = FinalAnswerRequest(confirm) });
+                    results.Add(new { type = AnswerBlock.TextType, text = assessment is null ? FinalAnswerRequest(confirm) : "No more tools. Return only the assessment JSON now." });
                 }
                 messages.Add(new { role = "user", content = results });
             }
         }
+        catch (InvalidOperationException ex) when (assessment is not null)
+        {
+            return new SessionEnd(null, null, null, "", ex.Message, Calls(), Turns: Turns());
+        }
+        catch (HttpRequestException ex) when (assessment is not null && !ct.IsCancellationRequested)
+        {
+            return new SessionEnd(null, null, null, "", $"Assessment transport failed: {ex.Message}", Calls(), Turns: Turns());
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            throw new InvalidOperationException($"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.");
+            var problem = $"The review call through the router did not finish within {http.Timeout.TotalMinutes:0.##} min.";
+            if (assessment is not null) return new SessionEnd(null, null, null, "", problem, Calls(), Turns: Turns());
+            throw new InvalidOperationException(problem);
         }
     }
 
@@ -580,3 +590,8 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             """;
     }
 }
+
+internal sealed record AssessmentToolBindings(string Repo, IReadOnlyList<object> Definitions,
+    Func<AnswerBlock, CancellationToken, Task<ToolOutcome>> Run);
+internal sealed record AssessmentConversation(string? Class, string? Stop, string Text, string? Problem,
+    IReadOnlyList<ToolCall> Tools, IReadOnlyList<ServedTurn> Turns);

@@ -24,6 +24,34 @@ public class GitWorkspaceTests
         Git(seed, "push", _remote, "main");
     }
 
+    [Fact]
+    public async Task Recovery_first_read_closes_clone_locks_owner_side_without_a_worker_or_slot()
+    {
+        var root = Directory.CreateDirectory(Path.Combine(_root, "recovery-first")).FullName;
+        if (OperatingSystem.IsMacOS())
+        {
+            var chmod = new ProcessStartInfo("/bin/chmod") { UseShellExecute = false };
+            foreach (var arg in new[] { "+a", "user:nobody allow list,search,read,file_inherit,directory_inherit", root }) chmod.ArgumentList.Add(arg);
+            using var process = Process.Start(chmod)!;
+            await process.WaitForExitAsync();
+            Assert.Equal(0, process.ExitCode);
+        }
+        var head = Git(Path.Combine(_root, "seed"), "rev-parse", "HEAD").Trim();
+        var workspace = new GitWorkspace(root, _ => _remote, (_, _) => Task.FromResult<string?>(null),
+            git: async (cwd, env, args, ct) =>
+            {
+                if (OperatingSystem.IsMacOS()) Assert.True(DarkFactory.Orchestrator.Worker.WorkerSandbox.IsClosed(
+                    await DarkFactory.Orchestrator.Worker.WorkerSandbox.ListAclAsync(Path.Combine(root, CloneLock.DirectoryName), ct)));
+                return await GitWorkspace.RunGitAsync(cwd, env, args, ct);
+            }, protectCloneLocks: true);
+        Assert.Equal("hello\n", await ((Gate.IReviewFiles)workspace).ReadAsync(Repo, head, "README.md", CancellationToken.None));
+        var locks = Path.Combine(root, CloneLock.DirectoryName);
+        if (OperatingSystem.IsMacOS())
+            Assert.True(DarkFactory.Orchestrator.Worker.WorkerSandbox.IsClosed(
+                await DarkFactory.Orchestrator.Worker.WorkerSandbox.ListAclAsync(locks, CancellationToken.None)));
+        else Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(locks));
+    }
+
     private const string Token = "ghs_FakeInstallationToken123";
     private static readonly string BasicAuth = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"x-access-token:{Token}"));
 
