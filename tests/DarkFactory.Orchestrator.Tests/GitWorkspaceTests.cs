@@ -246,8 +246,9 @@ public class GitWorkspaceTests
         var ws = await git.PrepareAsync(Repo, "factory/rc-3", default);
         _gitCalls.Clear();
         var reads = 0;
-        await Assert.ThrowsAsync<InvalidOperationException>(() => git.PushAsync(Repo, ws, default, _ => ++reads == refusal
-            ? Task.FromException(new InvalidOperationException("stale incident grant")) : Task.CompletedTask));
+        Task Check(CancellationToken _) => ++reads == refusal
+            ? Task.FromException(new InvalidOperationException("stale incident grant")) : Task.CompletedTask;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => git.PushAsync(Repo, ws, default, Check, Check));
         Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
         Assert.Equal(refusal, reads);
     }

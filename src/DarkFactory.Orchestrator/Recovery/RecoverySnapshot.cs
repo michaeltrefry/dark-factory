@@ -28,6 +28,18 @@ public sealed record RecoverySnapshot(string Id, string IncidentSnapshot, string
     IReadOnlyList<MissingRecoveryEvidence> Missing)
 {
     public const string Step = "recovery-snapshot";
+
+    /// <summary>
+    /// Every ledger step recovery writes starts with this (assessment, snapshot, incident state, re-arm, correction, refusal,
+    /// redirect, restart, delivery…): recovery's own acquisition, authorization and bookkeeping, never evidence. Such rows are
+    /// anchored on items that may be pending evidence (an incident's first contributing merge may be a Planned plan coordinator),
+    /// so evidence capture must never see them, or recording a decision would revoke the authority it grants.
+    /// </summary>
+    public const string BookkeepingPrefix = "recovery-";
+
+    /// <summary>The one "not evidence" rule: recovery's own rows (<see cref="BookkeepingPrefix"/>) and the worker-slot rows.</summary>
+    public static bool IsBookkeeping(string? step) =>
+        step is not null && (step.StartsWith(BookkeepingPrefix, StringComparison.Ordinal) || SlotUse.IsBookkeeping(step));
     public const int MaxBytes = 2 * 1024 * 1024;
     public const int MaxMerges = 50;
     public const int MaxPending = 100;
@@ -321,8 +333,9 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
             });
         }
         async Task<List<LedgerEntry>> Rows(long item, long? through = null) => await db.LedgerEntries.AsNoTracking()
-            // Acquisition/authorization bookkeeping is not a change to requirements or executed delivery evidence.
-            .Where(e => e.WorkItemId == item && (e.Step == null || !e.Step.StartsWith("recovery-")) && (through == null || e.Id <= through))
+            // Acquisition/authorization bookkeeping is not a change to requirements or executed delivery evidence: the SQL form
+            // of IsBookkeeping's recovery half (the slot half is left out by Results and the evidence readers).
+            .Where(e => e.WorkItemId == item && (e.Step == null || !e.Step.StartsWith(RecoverySnapshot.BookkeepingPrefix)) && (through == null || e.Id <= through))
             .OrderBy(e => e.Id).ToListAsync(token);
     }
 
@@ -347,7 +360,7 @@ public sealed class HotFileEvidence(IDbContextFactory<LedgerDbContext> contexts,
         return rows.Skip(start).ToList();
     }
 
-    private static object Results(IEnumerable<LedgerEntry> rows) => rows.Where(r => !SlotUse.IsBookkeeping(r.Step) && r.Step != RecoveryRedirect.Step && r.Step != HotFileAssessment.Step && r.Step != RecoverySnapshot.Step)
+    private static object Results(IEnumerable<LedgerEntry> rows) => rows.Where(r => !RecoverySnapshot.IsBookkeeping(r.Step))
         .Select(r => new { r.Id, r.State, r.Step, r.Detail, r.Outcome }).ToArray();
     private static ItemRef Reference(WorkItem item) => ItemNaming.ParseAny(item.ExternalId)
         ?? throw new InvalidOperationException("Unknown evidence work source.");

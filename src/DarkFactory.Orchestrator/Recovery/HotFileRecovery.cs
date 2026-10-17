@@ -96,12 +96,17 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
 
     internal static long LockKey(string repo) => BitConverter.ToInt64(SHA256.HashData(Encoding.UTF8.GetBytes("hot-file:" + repo)), 0) | long.MinValue;
     private static string Key(string repo) => RepoRef.Parse(repo).Key;
-    private static string Hash(object value) => Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value)));
+    internal static string Hash(object value) => Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value)));
 
     private async Task<List<HotFileMerge>> EvidenceAsync(LedgerDbContext db, string repo, CancellationToken ct)
     {
         var from = time.GetUtcNow() - options.HotFileWindow;
-        var merges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge && e.RecordedAt >= from)
+        // Only this repository's merges in the window are read: its items' own, or a plan item's changeset pass into it (its
+        // merge-files row names the repository). The exact repository check below still decides; this only bounds the read.
+        var mention = "\"repo\":\"" + repo + "\"";
+        var merges = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge && e.RecordedAt >= from
+                && db.WorkItems.Any(i => i.Id == e.WorkItemId && (i.Repo.ToLower() == repo || db.LedgerEntries.Any(f => f.WorkItemId == i.Id
+                    && f.Step == RunPipeline.Steps.MergeFiles && f.Detail != null && f.Detail.ToLower().Contains(mention)))))
             .OrderBy(e => e.Id).ToListAsync(ct);
         var ids = merges.Select(e => e.WorkItemId).Distinct().ToArray();
         var items = await db.WorkItems.AsNoTracking().Where(i => ids.Contains(i.Id)).ToDictionaryAsync(i => i.Id, ct);
@@ -330,15 +335,60 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         return RecoverySnapshot.FromDetail(HotFileAssessment.FromDetail(incident.Answer)?.Material)?.BaseTips.GetValueOrDefault(correction.Base);
     }
 
+    /// <summary>
+    /// The structural grant predicate alone (no evidence capture): true only for a correction whose current grant belongs to
+    /// <paramref name="incident"/> in <paramref name="repository"/>. Used by repeated hold checks; the four authority
+    /// boundaries revalidate in full with <see cref="AuthorizeCorrectionAsync"/>.
+    /// </summary>
+    public async Task<bool> GrantedAsync(string externalId, string repository, HotFileIncident incident, CancellationToken ct)
+    {
+        if (incident.Id == 0 || !ItemNaming.Recovery.TryParse(externalId, out _)) return false;
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        return await RecoveryCorrections.Grants(db, externalId, Key(repository)).AnyAsync(c => c.IncidentId == incident.Id, ct);
+    }
+
+    /// <summary>
+    /// Read-only (no detection, no lock): the unresolved incident that holds <paramref name="externalId"/> in
+    /// <paramref name="repository"/> now, or null — a correction is not held by its own incident while its grant is current.
+    /// </summary>
+    public async Task<HotFileIncident?> HoldingAsync(string externalId, string repository, CancellationToken ct)
+    {
+        var repo = Key(repository);
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var granted = RecoveryCorrections.Grants(db, externalId, repo).Select(c => c.IncidentId);
+        return await db.HotFileIncidents.AsNoTracking().Where(i => i.Repo == repo && i.State != "Resolved" && !granted.Contains(i.Id))
+            .OrderByDescending(i => i.Generation).FirstOrDefaultAsync(ct);
+    }
+
     public async Task<bool> AuthorizeCorrectionAsync(string externalId, string repository, CancellationToken ct,
         string? deliveryBase = null, string? baseSha = null, IReadOnlyList<string>? paths = null)
     {
         if (!ItemNaming.Recovery.TryParse(externalId, out var id) || capture is null || policy is null) return false;
-        await using var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
-        if (held is null) return false;
         await using var db = await contexts.CreateDbContextAsync(ct);
         var correction = await RecoveryWorkSource.ValidAsync(db, id, ct);
         if (correction is null || correction.Repo != Key(repository)) return false;
+        // Backoff (E11): after a boundary that could not verify, nothing is captured again before RetryAt — not every poll.
+        if (correction.RetryAt > time.GetUtcNow()) return false;
+        // Other holders of the repository's lock are brief while it is Correcting (a hold check, a reconciliation, another
+        // boundary): wait for it a little before calling the boundary unverifiable.
+        // The deadline is the injected clock's; the tries are also bounded (a clock that does not move — a test's — cannot
+        // make the wait endless), and paced by a short real pause between them.
+        var lockUntil = time.GetUtcNow() + LockWait;
+        var tries = (int)(LockWait / LockRetry);
+        var held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
+        while (held is null && time.GetUtcNow() < lockUntil && tries-- > 0)
+        {
+            await Task.Delay(LockRetry, ct);
+            held = await locks.TryAcquireAsync(LockKey(Key(repository)), ct);
+        }
+        await using var _ = held;
+        if (held is null)
+        {
+            // Another process is deciding the repository. Counted like any unverifiable boundary, under the rows' CAS tokens.
+            try { await DeferAsync(db, correction, null, "the repository's recovery lock is held by another process", externalId, ct); }
+            catch (DbUpdateConcurrencyException) { } // a writer under the lock decided meanwhile; the next boundary reads it
+            return false;
+        }
         var incident = await db.HotFileIncidents.SingleAsync(i => i.Id == correction.IncidentId, ct);
         var trigger = HotFileSnapshot.Parse(incident.Snapshot);
         var provenStale = false;
@@ -364,28 +414,93 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                 throw new InvalidOperationException("Correction delivery base no longer matches its pinned grant.");
             if (paths is not null && paths.Any(p => !envelope.Contains(p, StringComparer.Ordinal)))
                 throw new InvalidOperationException("Correction diff leaves its authorized repair envelope.");
+            // A verified boundary alone does not end a run of deferrals (dispatch verifying and worker entry deferring would
+            // never escalate): only real progress past the boundaries does (ProgressedAsync, after the push and the merge).
             return true;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            var reason = "Correction authorization deferred (could not verify): " + ex.Message;
-            if (provenStale)
+            if (!provenStale)
             {
-                correction.State = "Revoked"; correction.Version++;
-                incident.State = "Refreshing"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
-                reason = incident.Error;
+                await DeferAsync(db, correction, incident, ex.Message, externalId, ct);
+                return false;
             }
-            await RecoveryCorrections.RecordRefusalAsync(db, incident, reason, time.GetUtcNow(), ct, externalId);
+            correction.State = "Revoked"; correction.Version++;
+            incident.State = "Refreshing"; incident.Error = "Correction authority revoked: " + ex.Message; incident.Version++;
+            await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct, externalId);
             await db.SaveChangesAsync(ct);
             return false;
         }
     }
 
+    /// <summary>
+    /// The correction made real progress past its boundaries (its push, its authorized merge): a run of deferrals ends. A
+    /// verified boundary alone does not count, so a correction that always verifies at dispatch and defers at worker entry
+    /// still escalates after <see cref="DeferralLimit"/>.
+    /// </summary>
+    public async Task ProgressedAsync(string externalId, CancellationToken ct)
+    {
+        if (!ItemNaming.Recovery.TryParse(externalId, out var id)) return;
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var correction = await db.RecoveryCorrections.SingleOrDefaultAsync(c => c.Id == id, ct);
+        if (correction is null || correction.Deferrals == 0 && correction.RetryAt is null) return;
+        correction.Deferrals = 0; correction.RetryAt = null; correction.Version++;
+        await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>Boundary authorizations in a row that may not verify before the incident escalates (E11).</summary>
+    internal const int DeferralLimit = 3;
+
+    /// <summary>How long a boundary waits for the repository's recovery lock before it counts as unverifiable.</summary>
+    internal static readonly TimeSpan LockWait = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan LockRetry = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// A boundary that could not verify the correction's authority (no proof it is stale): counted durably on the correction,
+    /// retried after 30 s then 120 s (the assessment retry backoff), and after <see cref="DeferralLimit"/> in a row the incident
+    /// escalates with the reason and the human remedy — never a capture and a pair of pause rows every poll, forever.
+    /// </summary>
+    private async Task DeferAsync(LedgerDbContext db, RecoveryCorrection correction, HotFileIncident? incident, string why,
+        string externalId, CancellationToken ct)
+    {
+        incident ??= await db.HotFileIncidents.SingleAsync(i => i.Id == correction.IncidentId, ct);
+        var now = time.GetUtcNow();
+        correction.Deferrals++;
+        correction.RetryAt = now + RetryDelay(correction.Deferrals);
+        correction.Version++;
+        // Each deferral is its own row (count and time in it), so the ledger shows every one, never one deduplicated line.
+        var reason = $"Correction authorization deferred (could not verify, {correction.Deferrals} of {DeferralLimit} in a row, "
+            + $"at {now:O}; next try not before {correction.RetryAt:O}): {why}";
+        if (correction.Deferrals >= DeferralLimit)
+            Escalate(incident, $"Correction authority could not be verified {DeferralLimit} times in a row ({why}); fix the named "
+                + $"evidence or environment problem, then `factory recovery reassess --repo {incident.Repo}`");
+        await RecoveryCorrections.RecordRefusalAsync(db, incident, reason, now, ct, externalId);
+        await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>
+    /// The repositories a poll must look at, in a fixed number of queries however many repositories the ledger has ever seen:
+    /// those with an unresolved incident, and those a factory merge inside the window went into (an item's own repository, or the
+    /// repository a changeset pass's merge-files row names). Any other repository can neither be held nor become hot this poll.
+    /// </summary>
+    internal async Task<string[]> CandidateReposAsync(LedgerDbContext db, CancellationToken ct)
+    {
+        var from = time.GetUtcNow() - options.HotFileWindow;
+        var unresolved = await db.HotFileIncidents.AsNoTracking().Where(i => i.State != "Resolved").Select(i => i.Repo).Distinct().ToListAsync(ct);
+        var merged = db.LedgerEntries.AsNoTracking().Where(e => e.Step == null && e.State == WorkState.Merge && e.RecordedAt >= from)
+            .Select(e => e.WorkItemId).Distinct();
+        var own = await db.WorkItems.AsNoTracking().Where(i => merged.Contains(i.Id)).Select(i => i.Repo).Distinct().ToListAsync(ct);
+        var passes = await db.LedgerEntries.AsNoTracking().Where(e => e.Step == RunPipeline.Steps.MergeFiles && merged.Contains(e.WorkItemId)
+            && e.Detail != null && e.Detail.Contains("\"repo\":")).Select(e => e.Detail).Distinct().ToListAsync(ct);
+        return unresolved.Concat(own).Concat(passes.Select(d => MergeFiles.FromDetail(d)?.Repo).OfType<string>())
+            .Select(Key).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+    }
+
     /// <summary>Kick independent repo tasks without making intake wait for a model. Faults are observed and logged.</summary>
     public async Task ScheduleAsync(TextWriter log, CancellationToken ct)
     {
-        await using var db = await contexts.CreateDbContextAsync(ct);
-        var repos = (await db.WorkItems.AsNoTracking().Select(i => i.Repo).Distinct().ToListAsync(ct)).Select(Key).Distinct().ToArray();
+        string[] repos;
+        await using (var db = await contexts.CreateDbContextAsync(ct)) repos = await CandidateReposAsync(db, ct);
         foreach (var repo in repos)
         {
             if (await HeldAsync(repo, ct) is null) continue;

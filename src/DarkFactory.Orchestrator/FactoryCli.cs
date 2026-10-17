@@ -16,7 +16,8 @@ public static class FactoryCli
         Func<string, string, CancellationToken, Task<int>> control,
         Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null,
         Func<CancellationToken, Task<int>>? recoveryStatus = null,
-        Func<int, CancellationToken, Task<int>>? recoveryPageStatus = null)
+        Func<int, CancellationToken, Task<int>>? recoveryPageStatus = null,
+        Func<string, CancellationToken, Task<int>>? recoveryReassess = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
@@ -156,10 +157,30 @@ public static class FactoryCli
         recoveryStatusCommand.Options.Add(recoveryPage);
         recoveryStatusCommand.SetAction((parse, ct) => recoveryPageStatus is not null ? recoveryPageStatus(parse.GetValue(recoveryPage), ct)
             : recoveryStatus?.Invoke(ct) ?? Task.FromResult(1));
+        var reassessRepo = new Option<string>("--repo")
+        {
+            Description = "The repository (owner/name) whose escalated hot-file incident gets a fresh assessment",
+            Required = true,
+            CustomParser = result =>
+            {
+                var name = result.Tokens.Single().Value;
+                if (Controls.ControlScope.RepositoryOf("repo:" + name.ToLowerInvariant()) is not null) return name;
+                result.AddError("Expected --repo owner/name.");
+                return null;
+            },
+        };
+        var recoveryReassessCommand = new Command("reassess",
+            "Re-arm an ESCALATED repository incident (human-only): a new generation of the same incident is assessed afresh with fresh "
+            + "budgets (3 assessments, 2 corrections, 3 refreshes), audited in the ledger. Clears no Pause or Stop, leaves the freeze and "
+            + "other repositories' incidents alone, and is refused for an incident that is not escalated.")
+        { reassessRepo };
+        recoveryReassessCommand.SetAction((parse, ct) => recoveryReassess is null ? Task.FromResult(1)
+            : recoveryReassess(parse.GetValue(reassessRepo)!, ct));
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
-            new Command("recovery", "Read-only repository recovery observations") { recoveryStatusCommand },
+            new Command("recovery", "Repository hot-file recovery: read-only status, and the human re-arm of an escalated incident")
+                { recoveryStatusCommand, recoveryReassessCommand },
             new Command("kanban", "KanbanBoard work items") { kanbanKeyCommand },
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),

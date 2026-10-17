@@ -51,7 +51,10 @@ public sealed partial class HotFileRecovery
         if (correction.State == "Merged" && (merge is null || !rows.Any(e => e.Step == "recovery-delivered"))) return;
         if (merge is not null && old.Merges.Any(m => m.Row == merge.Id)) return;
         if (correction.State == "Failed" && (incident.State is not ("Escalated" or "CorrectionFailed") || rows.Any(e => e.Step == "recovery-reassessment"))) return;
-        if (correction.State == "Failed" && correction.Attempt >= 2)
+        // A failure of an earlier generation was decided before a human re-armed the incident; it spends nothing now.
+        if (correction.State == "Failed" && correction.Generation != incident.Generation) return;
+        if (correction.State == "Failed"
+            && correction.Attempt - await RecoveryCorrections.BaselineAsync(db, incident, ct) >= RecoveryCorrections.CorrectionLimit)
         {
             Escalate(incident, "Correction budget exhausted");
             await db.SaveChangesAsync(ct);

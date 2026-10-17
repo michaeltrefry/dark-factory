@@ -178,7 +178,7 @@ public static class MergeQueue
 
     private static bool ResumablePause(LedgerEntry row) =>
         row.State == WorkState.Paused && row.Detail is RunPipeline.Interrupted or RunPipeline.UserPaused or RunPipeline.UsagePaused
-            or RunPipeline.FreezePaused or RunPipeline.ControlsUnreadablePaused;
+            or RunPipeline.FreezePaused or RunPipeline.ControlsUnreadablePaused or RunPipeline.RecoveryHeld;
 
     private static bool IsInterruption(LedgerEntry row) => row.State == WorkState.Paused && row.Detail == RunPipeline.Interrupted;
 

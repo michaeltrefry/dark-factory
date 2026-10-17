@@ -114,6 +114,9 @@ public static class FactoryHost
         services.AddSingleton(sp => new Controls.ControlActions(
             sp.GetRequiredService<Controls.IControls>(), sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(), sp.GetService<Controls.IItemStops>(),
             sp.GetService<WorkSourceRegistry>() is { } sources ? sources.Find : null, new PostgresRunLocks(options.LedgerConnectionString)));
+        // ... and the human re-arm of an escalated repository incident (the incident panel's Reassess).
+        services.AddSingleton(sp => new Recovery.RecoveryReassessment(sp.GetRequiredService<IDbContextFactory<LedgerDbContext>>(),
+            new PostgresRunLocks(options.LedgerConnectionString), sp.GetRequiredService<TimeProvider>()));
         services.AddSingleton<ISessionViewers>(sp => sp.GetRequiredService<SessionBroadcaster>());
         return services;
     }

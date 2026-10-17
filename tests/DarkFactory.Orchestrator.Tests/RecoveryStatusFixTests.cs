@@ -78,6 +78,48 @@ public sealed partial class RecoveryDashboardTests
         cut.WaitForAssertion(() => Assert.Equal(3, data.Reads));
     }
 
+    [Fact]
+    public void An_idle_tick_polls_only_the_recovery_panel_and_a_live_run_reloads_the_page()
+    {
+        var data = new CountingData();
+        Services.AddSingleton<IDashboardData>(data);
+        Services.AddSingleton<TimeProvider>(_time);
+        Services.AddSingleton<PipelineChanges>();
+        Services.AddSingleton(new IntakeStatus(_time));
+        var cut = Render<Pipeline>();
+        Assert.Equal((1, 1), (data.Items, data.Reads));
+        _time.Advance(TimeSpan.FromSeconds(15));
+        cut.WaitForAssertion(() => Assert.Equal(2, data.Reads));
+        _time.Advance(TimeSpan.FromSeconds(15));
+        cut.WaitForAssertion(() => Assert.Equal(3, data.Reads));
+        Assert.Equal(1, data.Items); // idle: the rows and metrics are not reloaded every tick
+        data.Live = true;
+        Services.GetRequiredService<PipelineChanges>().Notify(1);
+        cut.WaitForAssertion(() => Assert.Equal(2, data.Items));
+        _time.Advance(TimeSpan.FromSeconds(15));
+        cut.WaitForAssertion(() => Assert.Equal(3, data.Items)); // a live run is asked about on every tick
+    }
+
+    private sealed class CountingData : IDashboardData
+    {
+        public int Items, Reads;
+        public bool Live;
+        public Task<IReadOnlyList<PipelineRow>> ActiveItemsAsync(CancellationToken ct)
+        {
+            Items++;
+            return Task.FromResult<IReadOnlyList<PipelineRow>>(Live
+                ? [new PipelineRow(1, "sc-1", "live", "owner/alpha", WorkState.Implement, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, null, [],
+                    Run: new RunView(true, "implementing", SlotUse.None))]
+                : []);
+        }
+        public Task<SessionHeader?> SessionAsync(string id, CancellationToken ct) => Task.FromResult<SessionHeader?>(null);
+        public Task<RecoveryStatusReport> RecoveryAsync(CancellationToken ct)
+        {
+            Reads++;
+            return Task.FromResult(new RecoveryStatusReport(DateTimeOffset.UtcNow, []));
+        }
+    }
+
     private sealed class RecoveryRetryData : IDashboardData
     {
         public int Reads;

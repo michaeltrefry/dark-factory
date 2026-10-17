@@ -12,6 +12,9 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Include="../DarkFactory.AcceptanceTests/SystemOneEvaluation.cs" Link="SystemOneEvaluation.cs" />
+    <Compile Include="../DarkFactory.AcceptanceTests/SystemOneEvaluationIntake.cs" Link="SystemOneEvaluationIntake.cs" />
+    <None Include="../DarkFactory.AcceptanceTests/Fixtures/systemone/**" Link="Fixtures/systemone/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

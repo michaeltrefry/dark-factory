@@ -8,6 +8,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Recovery;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 using static DarkFactory.Orchestrator.Tests.RunPipelineTests;
 
@@ -31,9 +32,11 @@ public class RecoveryCorrectionPipelineTests
         internal bool Tainted;
         internal string Material = "";
         internal string[] Paths = ["src/a.cs", FakeTestRunner.NewTestFile];
+        /// <summary>When set, the correction is materialized by the production scheduler's unsafe assessment, not directly.</summary>
+        internal bool Assessed;
         internal async Task Initialize()
         {
-            await Recovery.Initialize();
+            await Recovery.Initialize(recordUnsafe: !Assessed);
             var material = RecoverySnapshot.FromDetail(Recovery.Answer.Material)! with
             { BaseTips = new Dictionary<string, string> { ["main"] = GatePipelineTests.FakeGateGitHub.BaseSha } };
             if (BeforeMaterialize is not null) material = await BeforeMaterialize(material);
@@ -41,12 +44,34 @@ public class RecoveryCorrectionPipelineTests
             Material = JsonSerializer.Serialize(material);
             Recovery.Answer = Recovery.Answer with { Material = Material, MaterialHash = RecoverySnapshot.Hash(Material),
                 Findings = [finding], CorrectionFindings = [finding] };
-            Correction = await Recovery.Materialize();
+            if (Assessed)
+            {
+                await using var recovery = Recovery.Recovery(() => Material);
+                await recovery.AdvanceAsync("owner/alpha", default);
+                await using var db = Recovery.Seed.Contexts.CreateDbContext();
+                Correction = await db.RecoveryCorrections.SingleAsync();
+            }
+            else Correction = await Recovery.Materialize();
             Workspaces.CorrectionPaths = () => Paths;
             Workspaces.Head = () => GitHub.Head;
             GitHub.Diff = _ => string.Concat(Paths.Select(p => TestPolicies.Diff(p)));
         }
         internal IControls Controls => new LedgerControls(Recovery.Seed.Contexts, Recovery.Seed.Time);
+        internal IControls? ControlOverride;
+        /// <summary>Every full evidence capture the pipeline's recovery made, labelled with the item's last ledger row then.</summary>
+        internal readonly List<string> Captures = [];
+        /// <summary>Makes the n-th capture of the pipeline's recovery throw (a transient read that cannot verify).</summary>
+        internal Func<int, Exception?>? CaptureFault;
+        private string Capture()
+        {
+            if (CaptureFault?.Invoke(Captures.Count + 1) is { } fault) { Captures.Add("fault"); throw fault; }
+            using var db = Recovery.Seed.Contexts.CreateDbContext();
+            var item = db.WorkItems.AsNoTracking().SingleOrDefault(i => i.ExternalId == $"rc-{Correction.Id}");
+            var last = item is null ? null : db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id)
+                .OrderByDescending(e => e.Id).FirstOrDefault();
+            Captures.Add(item is null ? "new" : $"{item.State}/{last?.Step ?? "-"}");
+            return Material;
+        }
         internal async Task<RunOutcome> Run(CancellationToken ct = default)
         {
             await using var db = Recovery.Seed.Contexts.CreateDbContext();
@@ -59,8 +84,8 @@ public class RecoveryCorrectionPipelineTests
                 return new WorkerResult("correction-session", 0, false, "success", "done", "");
             });
             return await new RunPipeline(Recovery.Source, new WorkLedger(db, Recovery.Seed.Time), Recovery.Seed.Locks,
-                Workspaces, worker, PrClient ?? Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: Controls,
-                recovery: Recovery.Recovery(() => Material),
+                Workspaces, worker, PrClient ?? Prs, RepoRef.Parse("owner/alpha"), TextWriter.Null, controls: ControlOverride ?? Controls,
+                recovery: Recovery.Recovery(Capture),
                 gate: new GateStage(GateClient ?? GitHub, Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(2), Tests: Tests,
                     Risk: FakeCodeGraphRisk.Reader(new FakeCodeGraphRisk())))
                 .RunAsync(Correction.Id, ct);
@@ -217,6 +242,191 @@ public class RecoveryCorrectionPipelineTests
         Assert.Contains("held", (await f.Recovery.Seed.Run("owner/alpha", recovery: f.Recovery.Recovery())).Error);
     }
 
+    /// <summary>Counts every effective-control read, forwarding all to the ledger's controls.</summary>
+    internal sealed class CountingControls(IControls inner) : IControls
+    {
+        internal int Checks;
+        public Task<ControlState> EffectiveAsync(string externalId, long? epicId, CancellationToken ct)
+        { Interlocked.Increment(ref Checks); return inner.EffectiveAsync(externalId, epicId, ct); }
+        public Task<ControlState> EffectiveWithoutRepositoryAsync(string externalId, long? epicId, CancellationToken ct) =>
+            inner.EffectiveWithoutRepositoryAsync(externalId, epicId, ct);
+        public Task<ControlState> EffectiveInRepositoryAsync(string externalId, long? epicId, string repository, CancellationToken ct) =>
+            inner.EffectiveInRepositoryAsync(externalId, epicId, repository, ct);
+        public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+        public Task<Control?> UsagePauseAsync(CancellationToken ct) => inner.UsagePauseAsync(ct);
+        public Task<Control> PauseForUsageAsync(DateTimeOffset? resumeAt, string reason, CancellationToken ct) => inner.PauseForUsageAsync(resumeAt, reason, ct);
+        public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? readChangedAt, CancellationToken ct) => inner.FreezeAsync(trigger, detail, readChangedAt, ct);
+        public Task<Control?> GetAsync(string scope, CancellationToken ct) => inner.GetAsync(scope, ct);
+        public Task SetAsync(string scope, ControlState state, string by, CancellationToken ct) => inner.SetAsync(scope, state, by, ct);
+        public Task ClearAsync(string scope, CancellationToken ct) => inner.ClearAsync(scope, ct);
+    }
+
+    [Fact]
+    public async Task A_correction_captures_evidence_once_at_each_authority_boundary_and_never_in_its_in_loop_checks()
+    {
+        var f = new Fixture(); await f.Initialize();
+        var counting = new CountingControls(f.Controls);
+        f.ControlOverride = counting;
+        Assert.Equal(WorkState.Watch, (await f.Run()).State);
+        // Dispatch (before the item has a run), worker entry (Implement, before its session), push (Implement, the
+        // worker done) and merge (MergeGate, after the write token): one capture each, and no other.
+        Assert.Equal(["new", "Implement/-", "Implement/" + RunPipeline.Steps.WorkerDone, "MergeGate/" + RunPipeline.Steps.GatePassed], f.Captures);
+        // Every step, slot/CI/overlay wait and gate read checked the composed controls structurally, capturing nothing.
+        Assert.True(counting.Checks >= 10, $"only {counting.Checks} in-loop control checks ran");
+    }
+
+    /// <summary>Refuses the incident repository's advisory lock while <see cref="Busy"/> is set (another process deciding it).</summary>
+    internal sealed class BusyRepositoryLocks(IRunLocks inner) : IRunLocks
+    {
+        internal volatile bool Busy;
+        /// <summary>Refused tries left before the lock frees by itself (while <see cref="Busy"/>); null: never.</summary>
+        internal int? FreesAfter;
+        internal int Refused;
+        /// <summary>The fake clock the boundary's lock wait reads: each refusal lets a second of it pass, as a real wait would.</summary>
+        internal Microsoft.Extensions.Time.Testing.FakeTimeProvider? Time;
+        public Task<IAsyncDisposable?> TryAcquireAsync(long key, CancellationToken ct)
+        {
+            if (!Busy || key != HotFileRecovery.LockKey("owner/alpha") || FreesAfter is { } n && Refused >= n) return inner.TryAcquireAsync(key, ct);
+            Refused++;
+            if (Time is { } time) _ = Task.Run(async () => { await Task.Delay(5); time.Advance(TimeSpan.FromSeconds(1)); });
+            return Task.FromResult<IAsyncDisposable?>(null);
+        }
+    }
+
+    [Theory]
+    [InlineData(2, true)]     // frees within the 5 s wait: authorized, nothing counted
+    [InlineData(null, false)] // still held after the wait: one deferral counted
+    public async Task A_boundary_waits_on_the_injected_clock_for_a_briefly_held_repository_lock(int? freesAfter, bool authorized)
+    {
+        var locks = new BusyRepositoryLocks(new InProcessRunLocks());
+        var f = new Fixture(locks: locks); await f.Initialize();
+        locks.Time = f.Recovery.Seed.Time;
+        locks.FreesAfter = freesAfter;
+        locks.Busy = true;
+        await using var recovery = f.Recovery.Recovery(() => f.Material);
+        Assert.Equal(authorized, await recovery.AuthorizeCorrectionAsync($"rc-{f.Correction.Id}", "owner/alpha", default)
+            .WaitAsync(TimeSpan.FromSeconds(10)));
+        await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+        Assert.Equal(authorized ? 0 : 1, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
+        if (!authorized) Assert.InRange(locks.Refused, 5, 50); // ended by five fake seconds of one-second tries, not the try bound (100)
+    }
+
+    /// <summary>
+    /// Review round 2: a structurally valid correction whose full boundary authorization cannot be confirmed — a capture that
+    /// cannot verify at worker entry, the repository lock busy at the push — is recovery's own deferral: recorded recovery-held
+    /// (resumes by itself, no human Continue owed), never user-paused; once it verifies again the next run finishes it.
+    /// </summary>
+    [Theory]
+    [InlineData("worker-entry")]
+    [InlineData("push")]
+    public async Task A_correction_boundary_that_cannot_confirm_its_authority_is_recovery_held_not_user_paused(string boundary)
+    {
+        var locks = new BusyRepositoryLocks(new InProcessRunLocks());
+        var f = new Fixture(locks: locks); await f.Initialize();
+        locks.Time = f.Recovery.Seed.Time; // the push's 5 s lock wait passes on the fake clock
+        if (boundary == "worker-entry") f.CaptureFault = n => n == 2 ? new HttpRequestException("evidence read timed out") : null;
+        else f.AfterWorker = () => { locks.Busy = true; return Task.CompletedTask; };
+        var held = await f.Run();
+        Assert.Equal(WorkState.Paused, held.State);
+        Assert.Contains("held by hot-file recovery", held.Error);
+        var paused = (await f.Rows()).Last(r => r.Step == null);
+        Assert.Equal((WorkState.Paused, RunPipeline.RecoveryHeld), (paused.State, paused.Detail));
+        Assert.Empty(f.Prs.Opened);
+        Assert.False(f.GitHub.Merged);
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.Equal("Claimed", (await db.RecoveryCorrections.SingleAsync()).State); // deferred, not revoked
+        // It resumes by itself: the poll lists it with nothing pausing it, and the next run delivers it.
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.NotEmpty(await RunPipeline.InFlightAsync(new WorkLedger(db, f.Recovery.Seed.Time), ItemNaming.Recovery, default, f.Controls));
+        f.CaptureFault = null;
+        f.AfterWorker = null;
+        locks.Busy = false;
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(30)); // the deferral's backoff
+        Assert.Equal(WorkState.Watch, (await f.Run()).State);
+    }
+
+    /// <summary>
+    /// Review round 3 (E11): authority that can never be verified (a capture that never reads) is retried after 30 s, then 120 s,
+    /// never every poll, and after three deferrals in a row the incident escalates with the reason and the re-arm remedy.
+    /// Polls in between capture nothing and write nothing (no paired unpaused/paused rows). "worker-entry" is the paused-item
+    /// path a reviewer reproduced (round 4): dispatch verifies every time and worker entry defers every time — a verified
+    /// dispatch is no progress, so the count still reaches three.
+    /// </summary>
+    [Theory]
+    [InlineData("dispatch")]
+    [InlineData("worker-entry")]
+    public async Task Unverifiable_correction_authority_backs_off_and_escalates_after_three_deferrals(string boundary)
+    {
+        var f = new Fixture(); await f.Initialize();
+        f.CaptureFault = n => boundary == "dispatch" || n % 2 == 0 ? new HttpRequestException("evidence store unreachable") : null;
+        var time = f.Recovery.Seed.Time;
+        async Task<(int Faults, int Rows)> Poll()
+        {
+            await f.Run();
+            await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+            return (f.Captures.Count(c => c == "fault"), (await f.Rows()).Count);
+        }
+        Assert.Equal(1, (await Poll()).Faults);
+        var quiet = await Poll(); // inside the 30 s backoff: nothing captured, nothing written
+        Assert.Equal(1, quiet.Faults);
+        Assert.Equal(quiet, await Poll());
+        if (boundary == "worker-entry")
+        {
+            // Not vacuous: the item exists, paused recovery-held, and the polls inside the backoff added none of its rows.
+            Assert.True(quiet.Rows > 0);
+            Assert.Equal((WorkState.Paused, RunPipeline.RecoveryHeld), (await f.Rows()).Last(r => r.Step == null) is var p ? (p.State, p.Detail) : default);
+            Assert.Equal(1, f.Captures.Count(c => c != "fault")); // the verified dispatch capture, once
+        }
+        time.Advance(TimeSpan.FromSeconds(30));
+        Assert.Equal(2, (await Poll()).Faults);
+        time.Advance(TimeSpan.FromSeconds(119));
+        Assert.Equal(2, (await Poll()).Faults); // the second backoff is 120 s
+        time.Advance(TimeSpan.FromSeconds(1));
+        var escalated = await Poll();
+        Assert.Equal(3, escalated.Faults);
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+        {
+            var incident = await db.HotFileIncidents.SingleAsync();
+            Assert.Equal("Escalated", incident.State);
+            Assert.Contains("could not be verified 3 times in a row (evidence store unreachable)", incident.Error);
+            Assert.Contains("factory recovery reassess --repo owner/alpha", incident.Error);
+            Assert.Equal(3, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
+            // Each deferral is its own row (1, 2 and 3 of 3), none folded into another.
+            var deferrals = await db.LedgerEntries.Where(e => e.Step == RecoveryCorrections.RefusalStep && e.Detail!.Contains("in a row"))
+                .Select(e => e.Detail!).ToListAsync();
+            Assert.Equal(3, deferrals.Distinct().Count());
+            Assert.All(new[] { 1, 2, 3 }, n => Assert.Contains(deferrals, d => d.Contains($"{n} of 3 in a row")));
+        }
+        // Escalated: the grant is void, so later polls capture nothing and write nothing either.
+        // A started item is parked once (outside the scope its grant gave it); then nothing more, and no poll lists it.
+        time.Advance(TimeSpan.FromHours(1));
+        var settled = await Poll();
+        Assert.Equal(escalated.Faults, settled.Faults);
+        time.Advance(TimeSpan.FromHours(1));
+        Assert.Equal(settled, await Poll());
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.Empty(await RunPipeline.InFlightAsync(new WorkLedger(db, time), ItemNaming.Recovery, default, f.Controls));
+        Assert.Empty(f.Prs.Opened);
+    }
+
+    [Fact]
+    public async Task Progress_past_the_boundaries_after_a_deferral_resets_the_count_and_delivers()
+    {
+        var f = new Fixture(); await f.Initialize();
+        f.CaptureFault = n => n == 1 ? new HttpRequestException("evidence read timed out") : null;
+        await f.Run();
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.Equal(1, (await db.RecoveryCorrections.SingleAsync()).Deferrals);
+        f.Recovery.Seed.Time.Advance(TimeSpan.FromSeconds(30));
+        Assert.Equal(WorkState.Watch, (await f.Run()).State);
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+        {
+            var correction = await db.RecoveryCorrections.SingleAsync();
+            Assert.Equal((0, (DateTimeOffset?)null), (correction.Deferrals, correction.RetryAt));
+            Assert.NotEqual("Escalated", (await db.HotFileIncidents.SingleAsync()).State);
+        }
+    }
+
     [Fact]
     public async Task Delivered_bookkeeping_resumes_after_a_human_continue_without_fresh_execution_authority()
     {
@@ -229,7 +439,7 @@ public class RecoveryCorrectionPipelineTests
             db.LedgerEntries.Remove(await db.LedgerEntries.SingleAsync(e => e.WorkItemId == item.Id && e.Step == null && e.State == WorkState.Watch));
             item.State = WorkState.Merge; item.Version++;
             await db.SaveChangesAsync();
-            await new WorkLedger(db, f.Recovery.Seed.Time).RecordAsync(item, WorkState.Paused, null, RunPipeline.UserPaused, default);
+            await new WorkLedger(db, f.Recovery.Seed.Time).RecordAsync(item, WorkState.Paused, null, RunPipeline.RecoveryHeld, default);
         }
         await f.Controls.SetAsync("repo:owner/alpha", ControlState.Paused, "human", default);
         f.Material += " ";
@@ -319,7 +529,8 @@ public class RecoveryCorrectionPipelineTests
         var f = new Fixture(); await f.Initialize();
         await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
         {
-            db.HotFileIncidents.Add(new HotFileIncident { Repo = "owner/alpha", Generation = 2, State = "Held", Snapshot = "other", EvidenceHash = "other" });
+            db.HotFileIncidents.Add(new HotFileIncident { Repo = "owner/alpha", Generation = 2, State = "Held",
+                Snapshot = JsonSerializer.Serialize(new HotFileSnapshot("other", "owner/alpha", 2, [], "other")), EvidenceHash = "other" });
             await db.SaveChangesAsync();
         }
         Assert.False(await f.Recovery.Recovery().AuthorizeCorrectionAsync($"rc-{f.Correction.Id}", "owner/alpha", default));

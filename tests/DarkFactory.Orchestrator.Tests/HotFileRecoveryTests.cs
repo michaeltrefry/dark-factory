@@ -92,6 +92,79 @@ public class HotFileRecoveryTests
         Assert.Equal(2, f.Assessor.Calls);
     }
 
+    private sealed class QueryCounter : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        public int Reads;
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData data,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result, CancellationToken ct = default)
+        { Interlocked.Increment(ref Reads); return ValueTask.FromResult(result); }
+    }
+
+    /// <summary>A poll reads a fixed number of queries however many repositories the ledger has ever seen (E12).</summary>
+    [Fact]
+    public async Task Postgres_a_poll_looks_only_at_repositories_with_an_unresolved_incident_or_a_merge_in_the_window()
+    {
+        await using var database = await TempPostgresDatabase.CreateAsync("df_hotfile_poll");
+        await LedgerMigrations.MigrateAsync(database.ConnectionString, CancellationToken.None);
+        var counter = new QueryCounter();
+        var f = new Fixture(new DbContextOptionsBuilder<LedgerDbContext>().UseNpgsql(database.ConnectionString).AddInterceptors(counter).Options,
+            new PostgresRunLocks(database.ConnectionString));
+        await using var recovery = f.Recovery;
+        async Task<int> PollReads()
+        {
+            counter.Reads = 0;
+            await recovery.ScheduleAsync(TextWriter.Null, CancellationToken.None);
+            return counter.Reads;
+        }
+        var empty = await PollReads();
+        // Twenty repositories whose merges are all older than the window: none can be held or become hot.
+        for (var n = 0; n < 20; n++) await f.Merge($"owner/idle{n}");
+        f.Time.Advance(TimeSpan.FromHours(25));
+        Assert.Equal(empty, await PollReads());
+        Assert.InRange(empty, 1, 6);
+
+        await f.Merge("owner/fresh");
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            // A plan item's changeset pass into another repository names it in its merge-files row.
+            var plan = await db.WorkItems.FirstAsync(i => i.Repo == "owner/fresh");
+            var files = await db.LedgerEntries.FirstAsync(e => e.WorkItemId == plan.Id && e.Step == RunPipeline.Steps.MergeFiles);
+            files.Detail = new MergeFiles("main", ["src/a.cs"], "Owner/Pass").ToDetail();
+            db.HotFileIncidents.Add(new HotFileIncident { Repo = "owner/held", Generation = 1, State = "Escalated", Snapshot = "{}", EvidenceHash = "x" });
+            await db.SaveChangesAsync();
+        }
+        await using (var db = f.Contexts.CreateDbContext())
+            Assert.Equal(["owner/fresh", "owner/held", "owner/pass"], await recovery.CandidateReposAsync(db, CancellationToken.None));
+    }
+
+    /// <summary>E3: each incident state change is a durable ledger row saved with it; a stale writer's change leaves none.</summary>
+    [Fact]
+    public async Task Postgres_every_incident_state_change_is_an_append_only_ledger_row_in_its_own_transaction()
+    {
+        await using var database = await TempPostgresDatabase.CreateAsync("df_hotfile_states");
+        await LedgerMigrations.MigrateAsync(database.ConnectionString, CancellationToken.None);
+        var f = new Fixture(LedgerDbContext.PostgresOptions(database.ConnectionString), new PostgresRunLocks(database.ConnectionString));
+        for (var i = 0; i < 8; i++) await f.Merge();
+        await f.Recovery.HeldAsync(Repo, CancellationToken.None);
+        await using var staleDb = f.Contexts.CreateDbContext();
+        var stale = await staleDb.HotFileIncidents.SingleAsync();
+        await f.Recovery.AdvanceAsync(Repo, CancellationToken.None);
+        stale.State = "Escalated";
+        stale.Version++;
+        await Assert.ThrowsAsync<DbUpdateConcurrencyException>(() => staleDb.SaveChangesAsync());
+        await using var db = f.Contexts.CreateDbContext();
+        var incident = await db.HotFileIncidents.SingleAsync();
+        var rows = await db.LedgerEntries.Where(e => e.Step == IncidentTransitions.Step).OrderBy(e => e.Id).ToListAsync();
+        Assert.Equal([$"incident new {Repo} generation 1: (new) → Held",
+            $"incident {incident.Id} {Repo} generation 1: Held → Assessing",
+            $"incident {incident.Id} {Repo} generation 1: Assessing → Resolved"], rows.Select(r => r.Detail));
+        // Anchored on the first contributing merge's item, typed like any hold (a resolution passes).
+        var first = HotFileSnapshot.Parse(incident.Snapshot).Merges[0].Item;
+        Assert.All(rows, r => Assert.Equal(first, r.WorkItemId));
+        Assert.Equal([StepOutcome.Deferred, StepOutcome.Deferred, StepOutcome.Passed], rows.Select(r => r.Outcome));
+    }
+
     [Fact]
     public async Task Eighth_merge_holds_then_a_fresh_safe_assessment_releases_the_next_item()
     {

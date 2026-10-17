@@ -18,7 +18,7 @@ public sealed class RecoveryWorkSourceTests
         internal HotFileIncident Incident = null!;
         internal HotFileAssessment Answer = null!;
         internal readonly GatePolicy Policy = GatePolicy.Parse(TestPolicies.Standard());
-        internal async Task Initialize()
+        internal async Task Initialize(bool recordUnsafe = true)
         {
             for (var i = 0; i < 8; i++) await Seed.Merge();
             Incident = (await Seed.Recovery.HeldAsync("owner/alpha", default))!;
@@ -34,6 +34,8 @@ public sealed class RecoveryWorkSourceTests
                 MaterialHash = RecoverySnapshot.Hash(JsonSerializer.Serialize(material)), Session = "assessment", Prompt = "prompt",
                 Citations = ["merge:1"], Findings = [finding], CorrectionFindings = [finding]
             };
+            // AT2's integrated path leaves the incident Held so the production scheduler assesses and materializes it.
+            if (!recordUnsafe) return;
             await using var db = Seed.Contexts.CreateDbContext();
             var incident = await db.HotFileIncidents.SingleAsync();
             incident.Answer = JsonSerializer.Serialize(Answer);
@@ -188,7 +190,7 @@ public sealed class RecoveryWorkSourceTests
         Assert.False((await f.Source.ClaimAsync(first.Id, true, default)).Claimed);
         await using var db = f.Seed.Contexts.CreateDbContext();
         Assert.Equal("Escalated", Assert.Single(db.HotFileIncidents).State);
-        Assert.Equal(StepOutcome.Escalated, db.LedgerEntries.OrderBy(e => e.Id).Last().Outcome);
+        Assert.Equal(StepOutcome.Escalated, db.LedgerEntries.Where(e => e.Step != IncidentTransitions.Step).OrderBy(e => e.Id).Last().Outcome);
     }
 }
 
@@ -253,6 +255,9 @@ public sealed class RecoveryGrantTests
             Assert.Equal("Correcting", Assert.Single(db.HotFileIncidents).State);
         }
         unavailable = false;
+        // Within the deferral's 30 s backoff nothing is tried again; after it the verified grant passes.
+        Assert.False(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
+        f.Seed.Time.Advance(TimeSpan.FromSeconds(30));
         Assert.True(await recovery.AuthorizeCorrectionAsync($"rc-{c.Id}", "owner/alpha", default));
         Assert.Equal(c.Id, (await f.Materialize()).Id);
         Assert.Equal(new[] { c.Id }, await f.Source.ListReadyAsync(default));

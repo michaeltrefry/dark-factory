@@ -36,6 +36,16 @@
                 }
                 @if (row.Blocker is { } blocker) { <p class="error">Blocker: @blocker</p> }
                 <p>@row.Remedy</p>
+                @if (row.Stage == "Escalated")
+                {
+                    @* The human re-arm (login + antiforgery, like every control post): a fresh assessment with fresh budgets; no control is cleared. *@
+                    <form method="post" action="recovery/reassess" class="recovery-reassess" data-repo="@row.Repo"
+                          onsubmit="@($"return confirm('Re-arm a fresh assessment of {row.Repo}\\'s escalated incident? Pauses and Stops stay as they are.')")">
+                        <AntiforgeryToken />
+                        <input type="hidden" name="repo" value="@row.Repo" />
+                        <button type="submit">Reassess</button>
+                    </form>
+                }
             </article>
         }
         <nav aria-label="Recovery pages">

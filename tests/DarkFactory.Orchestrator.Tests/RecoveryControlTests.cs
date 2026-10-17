@@ -185,6 +185,48 @@ public class RecoveryControlTests
         Assert.Equal(ControlState.Running, await f.Controls.EffectiveAsync("sc-78", 42, Ct));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task An_incident_alone_records_recovery_held_and_resumes_by_itself_but_a_manual_pause_beside_it_waits_for_Continue(bool manual)
+    {
+        var f = new Fixture();
+        var worker = new PausableWorker();
+        await using var recovery = new HotFileRecovery(f.Contexts, f.Locks, new FreezeOptions(), f.Time, new SafeAssessor());
+        var running = f.Run(f.Source(), worker, recovery);
+        await worker.Working.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        if (manual) Assert.True((await f.Actions.PauseAsync(ControlScope.Repository(RepoRef.Parse(A)), "human", Ct)).Ok);
+        await f.Hold();
+        var outcome = await running.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(WorkState.Paused, outcome.State);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var paused = await db.LedgerEntries.Where(e => e.Step == null).OrderBy(e => e.Id).LastAsync();
+            Assert.Equal(manual ? RunPipeline.UserPaused : RunPipeline.RecoveryHeld, paused.Detail);
+            Assert.Equal(StepOutcome.Deferred, paused.Outcome);
+            var rows = await db.LedgerEntries.Where(e => e.WorkItemId == paused.WorkItemId).OrderBy(e => e.Id).ToListAsync();
+            Assert.StartsWith(manual ? "paused in Implement: user-paused" : "held by repository recovery in Implement: resumes by itself",
+                DarkFactory.Orchestrator.Dashboard.RunView.PhaseOf(WorkState.Paused, rows));
+        }
+        if (!manual) Assert.Contains("resumes by itself", outcome.Error);
+        async Task<IReadOnlyList<int>> InFlight()
+        {
+            await using var db = f.Contexts.CreateDbContext();
+            return await RunPipeline.InFlightAsync(new WorkLedger(db, f.Time), ItemNaming.Shortcut, Ct, f.Controls);
+        }
+        Assert.Empty(await InFlight());
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            (await db.HotFileIncidents.SingleAsync()).State = "Resolved";
+            await db.SaveChangesAsync();
+        }
+        // The incident's resolution alone resumes the automatic hold; a human Pause beside it still needs its Continue.
+        Assert.Equal(manual ? [] : [77], await InFlight());
+        if (!manual) return;
+        Assert.True((await f.Actions.ContinueAsync(ControlScope.Repository(RepoRef.Parse(A)), "human", Ct)).Ok);
+        Assert.Equal([77], await InFlight());
+    }
+
     [Fact]
     public async Task A_held_queued_PR_is_not_dispatched_but_its_claim_remains_renewable()
     {

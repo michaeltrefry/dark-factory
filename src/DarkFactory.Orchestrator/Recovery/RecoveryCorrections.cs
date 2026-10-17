@@ -23,6 +23,10 @@ public sealed class RecoveryCorrection
     public required string Spec { get; set; }
     public required string State { get; set; }
     public long Version { get; set; }
+    /// <summary>Boundary authorizations in a row that could not verify the grant (an unreadable capture, a busy repository lock).</summary>
+    public int Deferrals { get; set; }
+    /// <summary>No boundary authorization is tried before this (30 s after the first deferral, then 120 s): no capture every poll.</summary>
+    public DateTimeOffset? RetryAt { get; set; }
 }
 
 /// <summary>Captured contributing item/plan ancestry, not a new manual control. Human controls are only read.</summary>
@@ -37,6 +41,8 @@ public sealed class RecoveryAncestor
 public static class RecoveryCorrections
 {
     public const string Step = "recovery-correction";
+    /// <summary>Correction PR attempts per incident generation (E11); a human re-arm starts a new generation.</summary>
+    public const int CorrectionLimit = 2;
     internal const string PrUncertainStep = "recovery-pr-unresolved";
     public const string StateStep = "recovery-correction-state";
     public const string RefusalStep = "recovery-correction-refused";
@@ -64,6 +70,19 @@ public static class RecoveryCorrections
             RecordedAt = now, Outcome = StepOutcomes.Of(anchor.State, anchor.State, RefusalStep, detail) });
     }
 
+    /// <summary>The last attempt number spent before the incident's current generation: a generation's attempts count from it.</summary>
+    internal static async Task<int> BaselineAsync(LedgerDbContext db, HotFileIncident incident, CancellationToken ct) =>
+        await db.RecoveryCorrections.Where(c => c.IncidentId == incident.Id && c.Generation < incident.Generation)
+            .MaxAsync(c => (int?)c.Attempt, ct) ?? 0;
+
+    /// <summary>The correction attempts the incident's current generation has spent (of <see cref="CorrectionLimit"/>).</summary>
+    internal static int UsedInGeneration(IEnumerable<RecoveryCorrection> corrections, HotFileIncident incident)
+    {
+        var all = corrections.Where(c => c.IncidentId == incident.Id).ToList();
+        var current = all.Where(c => c.Generation == incident.Generation).Select(c => c.Attempt).DefaultIfEmpty().Max();
+        return current == 0 ? 0 : current - all.Where(c => c.Generation < incident.Generation).Select(c => c.Attempt).DefaultIfEmpty().Max();
+    }
+
     /// <summary>Called under the incident's repository lock; grant, ancestry and incident state save atomically.</summary>
     public static async Task<RecoveryCorrection> MaterializeAsync(LedgerDbContext db, HotFileIncident incident,
         HotFileAssessment answer, GatePolicy policy, DateTimeOffset now, CancellationToken ct, int attempt = 1)
@@ -71,8 +90,12 @@ public static class RecoveryCorrections
         var existing = await db.RecoveryCorrections.SingleOrDefaultAsync(c => c.IncidentId == incident.Id && c.Attempt == attempt, ct);
         // Replays never revive a stopped/failed item or mint a second authority for the same attempt.
         if (existing is not null) return existing;
-        if (attempt is < 1 or > 2 || attempt == 2 && !await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id
-                && c.Attempt == 1 && (c.State == "Failed" || c.State == "Merged" || c.State == "Revoked"), ct))
+        // Attempt numbers are monotone per incident; the budget is two per generation (a human re-arm opens a new one,
+        // `factory recovery reassess`). A generation's second attempt needs its first to have ended.
+        var within = attempt - await BaselineAsync(db, incident, ct);
+        if (within is < 1 or > CorrectionLimit || within == 2 && !await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id
+                && c.Attempt == attempt - 1 && c.Generation == incident.Generation
+                && (c.State == "Failed" || c.State == "Merged" || c.State == "Revoked"), ct))
             throw new InvalidOperationException("Correction attempt is not authorized by a failed prior repair or exceeds two attempts.");
         if (await db.RecoveryCorrections.AnyAsync(c => c.IncidentId == incident.Id && (c.State == "Stopped"
             || db.WorkItems.Any(w => w.ExternalId == "rc-" + c.Id && w.State == WorkState.Cancelled)), ct))

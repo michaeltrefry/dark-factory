@@ -235,6 +235,7 @@ public sealed class GitHubIssueCursor
 
 public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) : DbContext(options)
 {
+    public DbSet<IssueClassification> IssueClassifications => Set<IssueClassification>();
     public DbSet<GitHubIssue> GitHubIssues => Set<GitHubIssue>();
     public DbSet<GitHubIssueCursor> GitHubIssueCursors => Set<GitHubIssueCursor>();
     public DbSet<KanbanItem> KanbanItems => Set<KanbanItem>();
@@ -250,6 +251,19 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<Recovery.RecoveryCorrection> RecoveryCorrections => Set<Recovery.RecoveryCorrection>();
     public DbSet<Recovery.RecoveryAncestor> RecoveryAncestors => Set<Recovery.RecoveryAncestor>();
     public DbSet<Recovery.RecoveryAssessmentAttempt> RecoveryAssessmentAttempts => Set<Recovery.RecoveryAssessmentAttempt>();
+
+    // E3: an incident's state change is saved with its append-only ledger row (Recovery.IncidentTransitions).
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        Recovery.IncidentTransitions.Append(this);
+        return base.SaveChanges(acceptAllChangesOnSuccess);
+    }
+
+    public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+    {
+        await Recovery.IncidentTransitions.AppendAsync(this, cancellationToken);
+        return await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+    }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -338,6 +352,20 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
             e.Property(x => x.ChangedBy).HasMaxLength(128);
             e.Property(x => x.Reason).HasMaxLength(64);
             e.Property(x => x.Version).IsRowVersion();
+        });
+        modelBuilder.Entity<IssueClassification>(e =>
+        {
+            e.ToTable("issue_classifications");
+            e.Property(x => x.IssueVersion).HasMaxLength(64);
+            e.Property(x => x.Mode).HasMaxLength(16);
+            e.Property(x => x.Status).HasMaxLength(32);
+            e.Property(x => x.ClassifierVersion).HasMaxLength(64);
+            e.Property(x => x.PromptVersion).HasMaxLength(80);
+            e.Property(x => x.RequestedModel).HasMaxLength(128);
+            e.Property(x => x.Model).HasMaxLength(128);
+            e.Property(x => x.Label).HasMaxLength(32);
+            e.HasIndex(x => new { x.WorkItemId, x.IssueVersion });
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId);
         });
         modelBuilder.Entity<GitHubIssue>(e =>
         {
