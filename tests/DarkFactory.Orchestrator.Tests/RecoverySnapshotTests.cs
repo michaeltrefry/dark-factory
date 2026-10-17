@@ -144,6 +144,77 @@ public sealed class RecoverySnapshotTests
         Assert.Equal(corrected, await f.Evidence.CaptureAsync(f.Trigger, default));
     }
 
+    /// <summary>
+    /// Review round 2: the incident's own bookkeeping rows (state changes, refusals, a re-arm) are anchored on the first
+    /// contributing merge's item, which can itself be pending evidence — a Planned plan coordinator back from a changeset
+    /// delivery. They are never evidence, so acceptance and materialization (→ Unsafe, → Correcting rows on it) cannot make
+    /// the dispatch boundary's fresh capture differ from the grant's and revoke it.
+    /// </summary>
+    [Fact]
+    public async Task A_pending_planned_anchor_of_incident_bookkeeping_does_not_revoke_the_correction_at_dispatch()
+    {
+        var f = new Fixture(); await f.Seed();
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var coordinator = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-1");
+            coordinator.PlanItemId = null;
+            coordinator.State = WorkState.Planned; // Merge → Planned: another repository's changeset is still to come
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-10")).State = WorkState.Done;
+            (await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-2")).PlanItemId = coordinator.Id;
+            db.Add(new LedgerEntry { WorkItemId = coordinator.Id, State = coordinator.State, Step = "plan",
+                Detail = "coordinator requirements", Outcome = StepOutcome.Passed, RecordedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        var material = await f.Evidence.CaptureAsync(f.Trigger, default);
+        var snapshot = RecoverySnapshot.FromDetail(material)!;
+        Assert.True(snapshot.Complete, string.Join("; ", snapshot.Missing.Select(m => m.Category + ": " + m.Reason)));
+        Assert.Contains(snapshot.Evidence, e => e.Content.Contains("coordinator requirements"));
+        var citation = snapshot.Evidence.First(e => e.Category == "merged").Id;
+        var finding = new RecoveryFinding("merged", true, "Fix defect", "Count once", ["Counts once"],
+            ["src/a.cs", "tests/CountTests.cs"], [citation], []);
+        var answer = new HotFileAssessment(f.Trigger.Id, 1, Repo, "high", "unsafe", f.Trigger.EvidenceHash)
+        {
+            Material = material, MaterialSnapshot = snapshot.Id, MaterialHash = RecoverySnapshot.Hash(material), Session = "fresh-assessment",
+            Citations = [citation], Findings = [finding], CorrectionFindings = [finding]
+        };
+        RecoveryCorrection correction;
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var incident = new HotFileIncident { Repo = Repo, Generation = 1, State = "Unsafe", Snapshot = JsonSerializer.Serialize(f.Trigger),
+                EvidenceHash = f.Trigger.EvidenceHash, Answer = JsonSerializer.Serialize(answer), Session = answer.Session };
+            db.Add(incident); await db.SaveChangesAsync();
+            correction = await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(TestPolicies.Standard()), DateTimeOffset.UtcNow, default);
+            await RecoveryCorrections.RecordRefusalAsync(db, incident, "a refusal recorded on the anchor", DateTimeOffset.UtcNow, default);
+            db.LedgerEntries.Add(new LedgerEntry { WorkItemId = f.Trigger.Merges[0].Item, State = WorkState.Planned, Step = RecoveryReassessment.Step,
+                Detail = "an audited re-arm row on the anchor", Outcome = StepOutcome.Passed, RecordedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+            // The bookkeeping really is on the pending anchor.
+            Assert.Contains(await db.LedgerEntries.Where(e => e.WorkItemId == f.Trigger.Merges[0].Item).Select(e => e.Step).ToListAsync(),
+                s => s == IncidentTransitions.Step);
+        }
+        Assert.Equal(material, await f.Evidence.CaptureAsync(f.Trigger, default));
+        await using var recovery = new HotFileRecovery(f.Contexts, new InProcessRunLocks(), new(), TimeProvider.System,
+            new HotFileRecoveryTests.Assessor(), capture: f.Evidence.CaptureAsync,
+            policy: (_, _, _) => Task.FromResult<string?>(TestPolicies.Standard()));
+        Assert.True(await recovery.AuthorizeCorrectionAsync($"rc-{correction.Id}", Repo, default));
+        await using var read = f.Contexts.CreateDbContext();
+        Assert.Equal("Pending", Assert.Single(read.RecoveryCorrections).State);
+        Assert.Equal("Correcting", (await read.HotFileIncidents.SingleAsync()).State);
+    }
+
+    /// <summary>Every row recovery writes is recovery bookkeeping by one rule, which evidence capture leaves out.</summary>
+    [Fact]
+    public void Every_recovery_ledger_step_is_bookkeeping_by_the_one_predicate()
+    {
+        foreach (var step in new[] { IncidentTransitions.Step, RecoveryReassessment.Step, RecoveryCorrections.RefusalStep,
+                     RecoveryCorrections.Step, RecoveryCorrections.StateStep, HotFileAssessment.Step, RecoverySnapshot.Step,
+                     RecoveryRedirect.Step, RecoveryRedirect.Started })
+            Assert.True(RecoverySnapshot.IsBookkeeping(step), step);
+        Assert.True(RecoverySnapshot.IsBookkeeping(RunPipeline.Steps.SlotHeld));
+        foreach (var step in new[] { RunPipeline.Steps.Verdict, RunPipeline.Steps.Linked, "plan", null })
+            Assert.False(RecoverySnapshot.IsBookkeeping(step), step);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

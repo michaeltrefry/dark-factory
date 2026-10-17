@@ -8,6 +8,7 @@ using DarkFactory.Orchestrator.Ledger;
 using DarkFactory.Orchestrator.Recovery;
 using DarkFactory.Orchestrator.Tests.Support;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 using static DarkFactory.Orchestrator.Tests.RunPipelineTests;
 
@@ -59,8 +60,11 @@ public class RecoveryCorrectionPipelineTests
         internal IControls? ControlOverride;
         /// <summary>Every full evidence capture the pipeline's recovery made, labelled with the item's last ledger row then.</summary>
         internal readonly List<string> Captures = [];
+        /// <summary>Makes the n-th capture of the pipeline's recovery throw (a transient read that cannot verify).</summary>
+        internal Func<int, Exception?>? CaptureFault;
         private string Capture()
         {
+            if (CaptureFault?.Invoke(Captures.Count + 1) is { } fault) { Captures.Add("fault"); throw fault; }
             using var db = Recovery.Seed.Contexts.CreateDbContext();
             var item = db.WorkItems.AsNoTracking().SingleOrDefault(i => i.ExternalId == $"rc-{Correction.Id}");
             var last = item is null ? null : db.LedgerEntries.AsNoTracking().Where(e => e.WorkItemId == item.Id)
@@ -269,6 +273,46 @@ public class RecoveryCorrectionPipelineTests
         Assert.Equal(["new", "Implement/-", "Implement/" + RunPipeline.Steps.WorkerDone, "MergeGate/" + RunPipeline.Steps.GatePassed], f.Captures);
         // Every step, slot/CI/overlay wait and gate read checked the composed controls structurally, capturing nothing.
         Assert.True(counting.Checks >= 10, $"only {counting.Checks} in-loop control checks ran");
+    }
+
+    /// <summary>Refuses the incident repository's advisory lock while <see cref="Busy"/> is set (another process deciding it).</summary>
+    private sealed class BusyRepositoryLocks(IRunLocks inner) : IRunLocks
+    {
+        internal volatile bool Busy;
+        public Task<IAsyncDisposable?> TryAcquireAsync(long key, CancellationToken ct) =>
+            Busy && key == HotFileRecovery.LockKey("owner/alpha") ? Task.FromResult<IAsyncDisposable?>(null) : inner.TryAcquireAsync(key, ct);
+    }
+
+    /// <summary>
+    /// Review round 2: a structurally valid correction whose full boundary authorization cannot be confirmed — a capture that
+    /// cannot verify at worker entry, the repository lock busy at the push — is recovery's own deferral: recorded recovery-held
+    /// (resumes by itself, no human Continue owed), never user-paused; once it verifies again the next run finishes it.
+    /// </summary>
+    [Theory]
+    [InlineData("worker-entry")]
+    [InlineData("push")]
+    public async Task A_correction_boundary_that_cannot_confirm_its_authority_is_recovery_held_not_user_paused(string boundary)
+    {
+        var locks = new BusyRepositoryLocks(new InProcessRunLocks());
+        var f = new Fixture(locks: locks); await f.Initialize();
+        if (boundary == "worker-entry") f.CaptureFault = n => n == 2 ? new HttpRequestException("evidence read timed out") : null;
+        else f.AfterWorker = () => { locks.Busy = true; return Task.CompletedTask; };
+        var held = await f.Run();
+        Assert.Equal(WorkState.Paused, held.State);
+        Assert.Contains("held by hot-file recovery", held.Error);
+        var paused = (await f.Rows()).Last(r => r.Step == null);
+        Assert.Equal((WorkState.Paused, RunPipeline.RecoveryHeld), (paused.State, paused.Detail));
+        Assert.Empty(f.Prs.Opened);
+        Assert.False(f.GitHub.Merged);
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.Equal("Claimed", (await db.RecoveryCorrections.SingleAsync()).State); // deferred, not revoked
+        // It resumes by itself: the poll lists it with nothing pausing it, and the next run delivers it.
+        await using (var db = f.Recovery.Seed.Contexts.CreateDbContext())
+            Assert.NotEmpty(await RunPipeline.InFlightAsync(new WorkLedger(db, f.Recovery.Seed.Time), ItemNaming.Recovery, default, f.Controls));
+        f.CaptureFault = null;
+        f.AfterWorker = null;
+        locks.Busy = false;
+        Assert.Equal(WorkState.Watch, (await f.Run()).State);
     }
 
     [Fact]

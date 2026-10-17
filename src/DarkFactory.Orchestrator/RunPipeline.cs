@@ -736,6 +736,13 @@ public sealed partial class RunPipeline(
         public FreezeStatus? Frozen { get; init; }
         /// <summary>Set when the controls could not be read (<see cref="ControlsUnreadablePaused"/>): the last read's error.</summary>
         public string? ControlsUnreadable { get; init; }
+        /// <summary>
+        /// Set when a correction's full authorization at a boundary (worker entry, push, merge) refused or could not verify it — an
+        /// automatic recovery deferral, not a human's Pause: recorded <see cref="RecoveryHeld"/> unless a human Pause holds too.
+        /// </summary>
+        public bool CorrectionDeferred { get; init; }
+
+        public static ControlRequestedException Deferred() => new(ControlState.Paused) { CorrectionDeferred = true };
     }
 
     /// <summary>
@@ -1231,6 +1238,16 @@ public sealed partial class RunPipeline(
                 return await OutcomeAsync(item, $"{item.ExternalId} is held by hot-file recovery of {incident.Repo} (generation "
                     + $"{incident.Generation}, {incident.State}); it resumes by itself once the incident resolves "
                     + "(`factory recovery status`).", CancellationToken.None);
+            }
+            if (!userPaused && request.CorrectionDeferred)
+            {
+                // A correction's boundary authorization refused or could not verify it (a busy repository lock, an unreadable
+                // capture): recovery's own deferral, which resumes by itself, never a human Pause owed a Continue.
+                await ledger.RecordAsync(item, WorkState.Paused, null, RecoveryHeld, CancellationToken.None);
+                log.WriteLine($"[paused] {item.ExternalId}: its correction authority could not be confirmed at a boundary; held by recovery, "
+                    + "its worktree and session kept, and it resumes by itself once the authority verifies again");
+                return await OutcomeAsync(item, $"{item.ExternalId} is held by hot-file recovery: its correction authority could not be "
+                    + "confirmed at a boundary; it resumes by itself once it verifies again (`factory recovery status`).", CancellationToken.None);
             }
             await ledger.RecordAsync(item, WorkState.Paused, null, UserPaused, CancellationToken.None);
             log.WriteLine($"[paused] {item.ExternalId} paused by a control; its worktree and session are kept for Continue");
@@ -1982,7 +1999,8 @@ public sealed partial class RunPipeline(
         if (await _controls.EffectiveAsync(item.ExternalId, item.EpicId, ct) is not ControlState.Running and var state)
         {
             throw new ControlRequestedException(state);
-        }    }
+        }
+    }
 
     /// <summary>
     /// A correction's full revalidation (fresh evidence capture, current policy, its envelope) at the worker-entry boundary;
@@ -1995,7 +2013,7 @@ public sealed partial class RunPipeline(
         if (Naming != ItemNaming.Recovery || item.State is WorkState.Merge or WorkState.Watch) return;
         var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(item.ExternalId, item.Repo, ct);
         await ThrowIfControlledAsync(item, ct);
-        if (!authorized) throw new ControlRequestedException(ControlState.Paused);
+        if (!authorized) throw ControlRequestedException.Deferred();
     }
 
     /// <summary>

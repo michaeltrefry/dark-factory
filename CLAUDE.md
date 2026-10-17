@@ -941,8 +941,11 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   The correction then runs the ordinary panel, CI, new-tests, taint, gate and merge queue unweakened; a gate merge is not a safe
   verdict: the delivered commit is reassessed afresh (E10), and affected pending work restarts fresh from the corrected base
   (`RecoveryRedirect`). Held work: an item a hold stops mid-run is recorded `recovery-held` when only the incident holds it
-  (resumes by itself once it resolves; dashboard phase "held by repository recovery"), `user-paused` when a human Pause holds it
-  too (then both must lift). Human supremacy (E2): no recovery stage writes a control; a safe answer never synthesizes Running;
+  (resumes by itself once it resolves; dashboard phase "held by repository recovery"), and so is a correction whose boundary
+  authorization refused or could not verify it (a busy repository lock, a capture that cannot be read:
+  `ControlRequestedException.CorrectionDeferred`); `user-paused` only when a human Pause holds it too (then both must lift).
+  Recovery's own ledger rows are never evidence: one rule, `RecoverySnapshot.IsBookkeeping` (every `recovery-` step, and the
+  slot rows), so rows anchored on a pending item (a Planned coordinator) cannot revoke the grant they record. Human supremacy (E2): no recovery stage writes a control; a safe answer never synthesizes Running;
   a Stop is never undone; `continue --repo` lifts only that Pause, not an incident. Re-arm (E11): an Escalated incident holds
   its repository until a human runs `factory recovery reassess --repo owner/name` (owner CLI) or the dashboard incident panel's
   Reassess (login + antiforgery, `DashboardControls.ReassessPath`): the SAME incident moves to a new generation over its

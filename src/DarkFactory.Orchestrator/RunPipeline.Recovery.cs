@@ -55,13 +55,13 @@ public sealed partial class RunPipeline
         await ThrowIfControlledAsync(run.Item, ct);
         var workspace = run.Workspace ?? throw new InvalidOperationException("Correction has no worktree to verify.");
         var pinned = recovery is null ? null : await recovery.CorrectionBaseShaAsync(run.Item.ExternalId, ct);
-        if (pinned is null) throw new ControlRequestedException(ControlState.Paused);
+        if (pinned is null) throw ControlRequestedException.Deferred();
         var paths = await workspaces.CorrectionPathsAsync(workspace, pinned, ct);
         var authorized = await recovery!.AuthorizeCorrectionAsync(run.Item.ExternalId, run.Repo.FullName, ct,
             workspace.BaseBranch, pinned, paths);
         // Reads above may await network evidence. A human control arriving meanwhile still wins.
         await ThrowIfControlledAsync(run.Item, ct);
-        if (!authorized) throw new ControlRequestedException(ControlState.Paused);
+        if (!authorized) throw ControlRequestedException.Deferred();
     }
 
     private async Task ValidateCorrectionMergeAsync(Run run, PullFacts pull, IReadOnlyList<string> paths, CancellationToken ct)
@@ -75,7 +75,7 @@ public sealed partial class RunPipeline
         var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(run.Item.ExternalId, run.Repo.FullName, ct,
             current.BaseRef, current.BaseSha, paths);
         await ThrowIfControlledAsync(run.Item, ct);
-        if (!authorized) throw new ControlRequestedException(ControlState.Paused);
+        if (!authorized) throw ControlRequestedException.Deferred();
         await ledger.CheckpointAsync(run.Item, RecoveryMergeAuthorized, null,
             JsonSerializer.Serialize(new CorrectionMerge(pull.Number, pull.BaseRef, pull.BaseSha, pull.HeadSha)), ct);
         await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
