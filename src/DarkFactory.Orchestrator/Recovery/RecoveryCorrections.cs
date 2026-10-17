@@ -37,8 +37,20 @@ public sealed class RecoveryAncestor
 public static class RecoveryCorrections
 {
     public const string Step = "recovery-correction";
+    internal const string PrUncertainStep = "recovery-pr-unresolved";
     public const string StateStep = "recovery-correction-state";
     public const string RefusalStep = "recovery-correction-refused";
+
+    internal static Task<bool> HasUncertainPrAsync(LedgerDbContext db, long item, CancellationToken ct) =>
+        db.LedgerEntries.AnyAsync(e => e.WorkItemId == item && e.Step == PrUncertainStep, ct);
+
+    internal static void HoldUncertainPr(HotFileIncident incident, RecoveryCorrection correction)
+    {
+        correction.State = "Uncertain"; correction.Version++;
+        incident.State = "Escalated";
+        incident.Error = "Correction PR creation could not be reconciled; repository remains held. No replacement correction is authorized.";
+        incident.Version++;
+    }
 
     internal static async Task RecordRefusalAsync(LedgerDbContext db, HotFileIncident incident, string reason, DateTimeOffset now,
         CancellationToken ct, string? externalId = null)

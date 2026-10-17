@@ -127,11 +127,7 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
         var evidence = await EvidenceAsync(db, repo, ct);
         var acknowledged = incidents.Where(i => i.State == "Resolved").SelectMany(i => HotFileSnapshot.Parse(i.Snapshot).Merges)
             .SelectMany(m => m.Files.Select(f => (m.Row, m.Base, File: f))).ToHashSet();
-        var hot = evidence.SelectMany(m => m.Files.Select(f => (Merge: m, File: f)))
-            .GroupBy(x => (x.Merge.Base, x.File))
-            .Where(g => g.Select(x => x.Merge.Row).Distinct().Count() >= options.HotFileMerges
-                && g.Any(x => !acknowledged.Contains((x.Merge.Row, x.Merge.Base, x.File))))
-            .Select(g => g.Key).ToHashSet();
+        var hot = QualifyingPaths(evidence, acknowledged);
         if (hot.Count == 0) return null;
         var contributing = evidence.Select(m => m with { Files = m.Files.Where(f => hot.Contains((m.Base, f))).ToArray() })
             .Where(m => m.Files.Count > 0).ToArray();
@@ -206,7 +202,7 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
             db.RecoveryAssessmentAttempts.Add(reservation);
             // Claim, retry time and semantic attempt commit together BEFORE dispatch. A crash spends the uncertain call.
             await db.SaveChangesAsync(ct);
-            using var deadline = new CancellationTokenSource(StageTimeout);
+            using var deadline = new CancellationTokenSource(StageTimeout, time);
             using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
             var snapshot = HotFileSnapshot.Parse(incident.Snapshot);
             try
@@ -230,10 +226,11 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                     if (await capture(snapshot, bounded.Token).WaitAsync(bounded.Token) != answer.Material)
                         throw new RecoveryEvidenceChangedException("Snapshot evidence changed before accepting assessment authority.");
                 }
-                var current = await EvidenceAsync(db, repo, ct);
-                // Any new merge touching a reviewed file invalidates the assessment, including overlapping evidence.
-                var paths = snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Base, File: f))).ToHashSet();
-                var changed = current.Any(m => m.Files.Any(f => paths.Contains((m.Base, f))) && !snapshot.Merges.Any(old => old.Row == m.Row));
+                var current = await RefreshEvidenceAsync(db, snapshot, ct);
+                // New overlaps and newly qualifying hot files both need review. Compare tuples, not just rows:
+                // an existing contributing row may now contribute another file that was not in the snapshot.
+                var reviewed = snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Row, m.Base, File: f))).ToHashSet();
+                var changed = current.Any(m => m.Files.Any(f => !reviewed.Contains((m.Row, m.Base, f))));
                 if (answer.Snapshot == snapshot.Id && answer.Generation == incident.Generation && answer.Repo == repo
                     && answer.ServedClass == "high" && answer.Decision == "safe" && answer.EvidenceHash == incident.EvidenceHash && !changed)
                 {
@@ -252,13 +249,17 @@ public sealed partial class HotFileRecovery(IDbContextFactory<LedgerDbContext> c
                             throw new RecoveryEvidenceChangedException("Snapshot evidence changed before correction authorization.");
                         var bases = snapshot.Merges.Select(m => m.Base).Distinct().ToArray();
                         if (bases.Length != 1) throw new InvalidOperationException("Correction spans more than one delivery base.");
-                        var yaml = await policy(RepoRef.Parse(repo), material.BaseTips[bases[0]], ct)
+                        var yaml = await policy(RepoRef.Parse(repo), material.BaseTips[bases[0]], bounded.Token).WaitAsync(bounded.Token)
                             ?? throw new InvalidOperationException("Correction base has no gate policy.");
                         var next = (await db.RecoveryCorrections.Where(c => c.IncidentId == incident.Id).MaxAsync(c => (int?)c.Attempt, ct) ?? 0) + 1;
+                        bounded.Token.ThrowIfCancellationRequested();
                         await RecoveryCorrections.MaterializeAsync(db, incident, answer, GatePolicy.Parse(yaml), time.GetUtcNow(), ct, next);
                     }
-                    catch (Exception ex) when (!ct.IsCancellationRequested)
+                    catch (Exception ex) when (!ct.IsCancellationRequested
+                        && ex is not (OperationCanceledException or HttpRequestException or TimeoutException or GitHub.GitHubGatewayException))
                     {
+                        // Invalid scope/policy is definitive. Unavailable verification and the shared stage deadline
+                        // instead reach the bounded assessment retry path; a transient read spends no correction.
                         incident.State = ex is RecoveryEvidenceChangedException ? "Refreshing" : "Escalated";
                         incident.Error = "Correction refused; repository remains held: " + ex.Message;
                         await RecoveryCorrections.RecordRefusalAsync(db, incident, incident.Error, time.GetUtcNow(), ct);

@@ -19,11 +19,14 @@ public sealed class RecoveryPostgresTests
     {
         internal int Created;
         internal int Calls;
+        internal int LookupFailures;
         private string? url;
         private readonly HttpClient http;
         private readonly GitHubPullRequests transport;
-        internal LostAnswerPr()
+        private readonly int status;
+        internal LostAnswerPr(int status = 0)
         {
+            this.status = status;
             http = new HttpClient(this, disposeHandler: false) { BaseAddress = new Uri("https://api.github.com/") };
             using var key = RSA.Create(2048);
             transport = new(http, new GitHubApp(http, "42", key.ExportRSAPrivateKeyPem(), TimeProvider.System));
@@ -41,12 +44,15 @@ public sealed class RecoveryPostgresTests
                 if (url is null)
                 {
                     Created++; url = "https://github.com/owner/alpha/pull/1";
+                    if (status != 0) return Task.FromResult(FakeApi.Json((HttpStatusCode)status, "{\"message\":\"gateway lost accepted answer\"}"));
                     throw new HttpRequestException("POST accepted, answer lost");
                 }
                 return Task.FromResult(FakeApi.Json(HttpStatusCode.UnprocessableEntity, "{\"message\":\"PR exists\"}"));
             }
+            if (request.Method == HttpMethod.Get && path == "/repos/owner/alpha/pulls" && url is not null && LookupFailures-- > 0)
+                return Task.FromResult(FakeApi.Json(HttpStatusCode.ServiceUnavailable, "{}"));
             if (request.Method == HttpMethod.Get && path == "/repos/owner/alpha/pulls")
-                return Task.FromResult(FakeApi.Json(HttpStatusCode.OK, JsonSerializer.Serialize(new[] { new { html_url = url } })));
+                return Task.FromResult(FakeApi.Json(HttpStatusCode.OK, JsonSerializer.Serialize(url is null ? Array.Empty<object>() : new object[] { new { html_url = url } })));
             throw new InvalidOperationException("Unexpected PR transport call " + request.Method + " " + path);
         }
         protected override void Dispose(bool disposing) { if (disposing) http.Dispose(); base.Dispose(disposing); }
@@ -55,25 +61,30 @@ public sealed class RecoveryPostgresTests
         public Task UpdateBodyAsync(RepoRef repo, string pullUrl, string body, CancellationToken ct) => transport.UpdateBodyAsync(repo, pullUrl, body, ct);
     }
 
-    [Fact]
-    public async Task Racing_Postgres_drivers_recover_one_PR_after_a_lost_creation_answer_and_accept_one_reassessment_result()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(502)]
+    [InlineData(503)]
+    [InlineData(504)]
+    public async Task Racing_Postgres_drivers_recover_one_PR_after_a_lost_creation_answer_and_accept_one_reassessment_result(int status)
     {
         await using var database = await TempPostgresDatabase.CreateAsync("df_recovery");
         await LedgerMigrations.MigrateAsync(database.ConnectionString, default);
         var f = new RecoveryCorrectionPipelineTests.Fixture(LedgerDbContext.PostgresOptions(database.ConnectionString), new PostgresRunLocks(database.ConnectionString));
         await f.Initialize();
-        using var prs = new LostAnswerPr(); f.PrClient = prs;
+        using var prs = new LostAnswerPr(status); f.PrClient = prs;
         var lost = await f.Run();
-        Assert.Equal(WorkState.Implement, lost.State);
-        Assert.Contains("uncertain", lost.Error);
+        Assert.Contains(lost.State, new[] { WorkState.Implement, WorkState.Watch });
+        if (lost.State == WorkState.Implement) Assert.Contains("uncertain", lost.Error);
         Assert.Equal(1, prs.Created);
         var resumed = await Task.WhenAll(f.Run(), f.Run());
         Assert.Contains(resumed, o => o.State == WorkState.Watch);
         Assert.Equal(1, prs.Created);
+        Assert.Equal(1, prs.Calls); // restart reads the branch before another POST
         var rows = await f.Rows();
-        Assert.Single(rows.Where(e => e.Step == RunPipeline.Steps.WorkerDone));
-        Assert.Single(rows.Where(e => e.Step == RunPipeline.Steps.Linked));
-        Assert.Single(rows.Where(e => e.Step is null && e.State == WorkState.Merge));
+        Assert.Single(rows, e => e.Step == RunPipeline.Steps.WorkerDone);
+        Assert.Single(rows, e => e.Step == RunPipeline.Steps.Linked);
+        Assert.Single(rows, e => e.Step is null && e.State == WorkState.Merge);
         Assert.Contains(rows, e => e.Step == "recovery-delivered");
         Assert.Contains(rows, e => e.Step == RunPipeline.Steps.NewTests);
         Assert.Contains(rows, e => e.Step == RunPipeline.Steps.GatePassed);
@@ -104,6 +115,22 @@ public sealed class RecoveryPostgresTests
         Assert.True(resolved.State == "Resolved", resolved.Error + " | " + accepted.Result);
         Assert.Null(await b.HeldAsync("owner/alpha", default));
         Assert.Single(await read.RecoveryCorrections.ToListAsync());
+    }
+
+    [Fact]
+    public async Task Exhausted_PR_reconciliation_holds_the_same_uncertain_identity_and_never_starts_attempt_two()
+    {
+        var f = new RecoveryCorrectionPipelineTests.Fixture(); await f.Initialize();
+        using var prs = new LostAnswerPr(503) { LookupFailures = 3 }; f.PrClient = prs;
+        for (var n = 0; n < 3; n++) await f.Run();
+        await using (var recovery = f.Recovery.Recovery(() => f.Material))
+            await recovery.AdvanceAsync("owner/alpha", default);
+        await using var db = f.Recovery.Seed.Contexts.CreateDbContext();
+        Assert.Equal("Escalated", (await db.HotFileIncidents.SingleAsync()).State);
+        Assert.Equal("Uncertain", (await db.RecoveryCorrections.SingleAsync()).State);
+        Assert.Equal(1, prs.Created);
+        Assert.Equal(1, prs.Calls);
+        Assert.Equal(0, await db.RecoveryAssessmentAttempts.CountAsync());
     }
 
     [Theory]

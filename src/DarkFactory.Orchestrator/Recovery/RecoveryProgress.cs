@@ -60,12 +60,37 @@ public sealed partial class HotFileRecovery
         return true;
     }
 
+    private HashSet<(string Base, string File)> QualifyingPaths(IReadOnlyList<HotFileMerge> evidence,
+        HashSet<(long Row, string Base, string File)> acknowledged) => evidence
+        .SelectMany(m => m.Files.Select(f => (Merge: m, File: f)))
+        .GroupBy(x => (x.Merge.Base, x.File))
+        .Where(g => g.Select(x => x.Merge.Row).Distinct().Count() >= options.HotFileMerges
+            && g.Any(x => !acknowledged.Contains((x.Merge.Row, x.Merge.Base, x.File))))
+        .Select(g => g.Key).ToHashSet();
+
+    // Trigger membership is narrower than semantic freshness: a changed base tip may require a new material
+    // capture without making every merge on that base a contributor. Keep exact original tuples, overlapping
+    // (base,file) tuples, and newly qualifying hot paths, using detection's acknowledgement rule.
+    private async Task<HotFileMerge[]> RefreshEvidenceAsync(LedgerDbContext db, HotFileSnapshot snapshot, CancellationToken ct)
+    {
+        var current = await EvidenceAsync(db, snapshot.Repo, ct);
+        var resolved = await db.HotFileIncidents.AsNoTracking()
+            .Where(i => i.Repo == snapshot.Repo && i.State == "Resolved").Select(i => i.Snapshot).ToListAsync(ct);
+        var acknowledged = resolved.SelectMany(s => HotFileSnapshot.Parse(s).Merges)
+            .SelectMany(m => m.Files.Select(f => (m.Row, m.Base, File: f))).ToHashSet();
+        var paths = QualifyingPaths(current, acknowledged);
+        paths.UnionWith(snapshot.Merges.SelectMany(m => m.Files.Select(f => (m.Base, File: f))));
+        var additions = current.Select(m => m with { Files = m.Files.Where(f => paths.Contains((m.Base, f))).ToArray() })
+            .Where(m => m.Files.Count > 0);
+        return snapshot.Merges.Concat(additions).GroupBy(m => m.Row)
+            .Select(g => g.First() with { Files = g.SelectMany(m => m.Files).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray() })
+            .OrderBy(m => m.Row).ToArray();
+    }
+
     private async Task RefreshStaleAsync(LedgerDbContext db, HotFileIncident incident, CancellationToken ct)
     {
         var old = HotFileSnapshot.Parse(incident.Snapshot);
-        var current = await EvidenceAsync(db, incident.Repo, ct);
-        // Preserve old contributing evidence after the rolling window expires, and coalesce new merges/hot files.
-        var merges = old.Merges.Concat(current).GroupBy(m => m.Row).Select(g => g.Last()).OrderBy(m => m.Row).ToArray();
+        var merges = await RefreshEvidenceAsync(db, old, ct);
         await RefreshAsync(db, incident, merges, incident.Error ?? "Evidence authority changed", ct);
         await db.SaveChangesAsync(ct);
     }
@@ -85,8 +110,13 @@ public sealed partial class HotFileRecovery
         else if (item?.State == WorkState.Escalated && c.State is "Pending" or "Claimed")
         {
             // A crash between pipeline escalation and its source comment must not strand Correcting forever.
-            c.State = "Failed"; c.Version++;
-            incident.State = "CorrectionFailed"; incident.Version++;
+            if (await RecoveryCorrections.HasUncertainPrAsync(db, item.Id, ct))
+                RecoveryCorrections.HoldUncertainPr(incident, c);
+            else
+            {
+                c.State = "Failed"; c.Version++;
+                incident.State = "CorrectionFailed"; incident.Version++;
+            }
             await db.SaveChangesAsync(ct);
         }
     }
