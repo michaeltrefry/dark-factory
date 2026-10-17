@@ -526,7 +526,14 @@ public class SafeHelperTests
             // sc-25871 (PlanRunnerLockTests): the same nonexistent helper, for a run that must reach neither the lock nor the helper.
             ["PlanReleaseTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
             ["Harness.cs"] =["if (Options.Worker" + "Sandbox is { } sandbox)", "foreach (var slot in Options.Worker" + "Slots!.All.Skip(1))"],
-            ["E2e.cs"] = ["if (Harness.Options.Worker" + "Sandbox is not null)", "foreach (var slot in Harness.Options.Worker" + "Slots!.All)"],
+            ["E2e.cs"] =
+            [
+                "if (Harness.Options.Worker" + "Sandbox is not null)", "foreach (var slot in Harness.Options.Worker" + "Slots!.All)",
+                // sc-26353: opt-in evaluation probes the isolated root under the held real-root locks, never in a self-test.
+                "foreach (var slot in options.Worker" + "Slots!.All)",
+            ],
+            // A presence check only; evaluation self-tests inject probe/ledger/lock delegates and run no installed helper.
+            ["SystemOneEvaluation.cs"] = ["if (options.Worker" + "Sandbox is null)"],
             ["WalkingSkeletonTests.cs"] = ["var sandbox = Harness.Options.Worker" + "Sandbox;"],
             ["SetupScriptTests.cs"] =
             [

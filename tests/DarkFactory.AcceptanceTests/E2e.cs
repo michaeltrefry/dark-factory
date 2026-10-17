@@ -83,7 +83,30 @@ internal sealed class E2e : IAsyncDisposable
         var configured = FactoryOptions.LoadConfiguration();
         RequireDefaultsWhenAsked(configured, new FactoryOptions(configured, new OverlaySecrets(new NoSecrets(), new Dictionary<string, string>())));
 
-        var realRoot = Harness.Options.WorkRoot;
+        return await CreateIsolatedAsync(prefix, AcquireRealLocks());
+    }
+
+    /// <summary>Synthetic local evaluation: router, real sandbox and isolated ledger only; no board or gate Apps.</summary>
+    public static async Task<E2e> StartEvaluationAsync(string prefix)
+    {
+        Harness.RequireOptIn();
+        Harness.RequireSecret(o => o.RouterKey);
+        await Harness.RequireRouterAsync();
+        return await EvaluationSetup.StartAsync(Harness.Options, AcquireRealLocks, async isolated =>
+        {
+            // Unlike the full-pipeline harness, take every sandbox lock BEFORE probing a helper (which sweeps its user).
+            // Probe through the isolated root's sandbox locks, not the already exclusively held real-root files.
+            // The real-root locks stay held too, excluding every real worker for the entire arm.
+            var options = isolated.Options();
+            foreach (var slot in options.WorkerSlots!.All)
+            {
+                await slot.Sandbox.EnsureReadyAsync(options.WorkerAuth, options.ClaudePath, CancellationToken.None);
+            }
+        }, held => CreateIsolatedAsync(prefix, held));
+    }
+
+    private static IDisposable AcquireRealLocks()
+    {
         RealLocks? realLock = null;
         if (Harness.Options.WorkerSandbox is not null)
         {
@@ -92,7 +115,7 @@ internal sealed class E2e : IAsyncDisposable
             {
                 foreach (var slot in Harness.Options.WorkerSlots!.All)
                 {
-                    realLock.Add(WorkerLock.Acquire(realRoot, slot.Number));
+                    realLock.Add(WorkerLock.Acquire(Harness.Options.WorkRoot, slot.Number));
                 }
             }
             catch (InvalidOperationException ex)
@@ -101,6 +124,12 @@ internal sealed class E2e : IAsyncDisposable
                 Assert.Skip($"A real factory run's worker phase holds the work root: stop `factory work`/`factory run` first. {ex.Message}");
             }
         }
+        return realLock ?? (IDisposable)new RealLocks();
+    }
+
+    private static async Task<E2e> CreateIsolatedAsync(string prefix, IDisposable realLock)
+    {
+        var realRoot = Harness.Options.WorkRoot;
         var admin = new NpgsqlConnectionStringBuilder(Harness.Options.LedgerConnectionString);
         var database = $"{prefix}_{Guid.NewGuid():N}";
         try
@@ -117,13 +146,21 @@ internal sealed class E2e : IAsyncDisposable
         }
         var workRoot = Path.Combine(realRoot, "e2e", database);
         var e2e = new E2e(admin, database, realLock, workRoot);
-        await LedgerMigrations.MigrateAsync(e2e.Ledger, CancellationToken.None);
-        await using (var ledger = new NpgsqlConnection(e2e.Ledger))
+        try
         {
-            await ledger.OpenAsync();
-            await using var restart = new NpgsqlCommand(
-                $"ALTER TABLE kanban_items ALTER COLUMN \"Id\" RESTART WITH {KanbanKeyStart(DateTimeOffset.UtcNow)}", ledger);
-            await restart.ExecuteNonQueryAsync();
+            await LedgerMigrations.MigrateAsync(e2e.Ledger, CancellationToken.None);
+            await using (var ledger = new NpgsqlConnection(e2e.Ledger))
+            {
+                await ledger.OpenAsync();
+                await using var restart = new NpgsqlCommand(
+                    $"ALTER TABLE kanban_items ALTER COLUMN \"Id\" RESTART WITH {KanbanKeyStart(DateTimeOffset.UtcNow)}", ledger);
+                await restart.ExecuteNonQueryAsync();
+            }
+        }
+        catch
+        {
+            await e2e.DisposeAsync();
+            throw;
         }
         return e2e;
     }

@@ -1,4 +1,3 @@
-using System.Text.Json;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Controls;
 using DarkFactory.Orchestrator.Git;
@@ -26,28 +25,25 @@ public class SystemOneEvaluationLiveTests
         var root = Path.Combine(AppContext.BaseDirectory, "Fixtures", "systemone");
         // Validate before E2e, router prerequisite reads, sandbox probes or inference-client construction.
         EvaluationCorpus.Load(root);
-        var output = Path.GetFullPath(Harness.RequireEnv("FACTORY_E2E_SYSTEMONE_REPORT", "a NEW JSON output file outside the frozen corpus"));
+        var output = Path.GetFullPath(Harness.RequireEnv("FACTORY_E2E_SYSTEMONE_REPORT", "a NEW JSON evidence file in the session folder, outside the frozen corpus"));
         Assert.False(output.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal));
-        // Reserve without overwriting earlier evidence. Nothing writes raw transcripts to this export.
-        using var reportFile = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         var model = Harness.RequireEnv("Issues__Classification__Model", "the SystemOne catalog identifier; workers retain production low-class routing");
         // SandboxTriageRunner itself refuses an unsandboxed triage (covered by a non-live self-test).
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(TimeSpan.FromMinutes(100));
-        var result = await SystemOneEvaluation.RunAsync(root, corpus => new LiveEvaluationArm(corpus, model), timeout.Token);
-        await JsonSerializer.SerializeAsync(reportFile, result, new JsonSerializerOptions { WriteIndented = true }, timeout.Token);
+        var result = await SystemOneEvaluation.RunToFileAsync(root, output, corpus => new LiveEvaluationArm(corpus, model), timeout.Token);
         Assert.Equal(15, result.Pairs.Count);
         // Failed performance/quality goals remain measured evidence, not a reason to relabel or rerun the corpus.
-        Console.WriteLine($"SystemOne paired report: corpus {result.CorpusIdentity}; {result.Pairs.Count} pairs; optimization not established.");
+        Console.WriteLine($"SystemOne paired report: {output}; corpus {result.CorpusIdentity}; {result.Pairs.Count} pairs; optimization not established.");
     }
 }
 
 internal sealed class LiveEvaluationArm(EvaluationCorpus corpus, string model) : IEvaluationArm
 {
-    public async Task<EvaluationObservation> RunAsync(EvaluationInput input, string mode, CancellationToken ct)
+    public async Task RunAsync(EvaluationInput input, string mode, Func<EvaluationObservation, Task> completed, CancellationToken ct)
     {
         // Every arm gets its own migrated database, controls, work root, checkout and fresh Claude session.
-        await using var e2e = await E2e.StartAsync("df_systemone_eval", ItemNaming.GitHubIssue);
+        await using var e2e = await E2e.StartEvaluationAsync("df_systemone_eval");
         var options = e2e.Options(new Dictionary<string, string?>
         {
             ["GitHub:Watch:Repos"] = input.PermissionContext.IssueRepository,
@@ -65,11 +61,12 @@ internal sealed class LiveEvaluationArm(EvaluationCorpus corpus, string model) :
         using var http = mode == "disabled" ? null : OutboundHttp.RouterApi(options.RouterBaseUrl);
         var classifierSession = mode == "disabled" ? null : Guid.NewGuid().ToString();
         if (http is not null) { http.DefaultRequestHeaders.Add(RouterReviewer.SessionHeader, classifierSession); }
-        return await EvaluationIntake.RunAsync(input, mode, sha,
+        var observation = await EvaluationIntake.RunAsync(input, mode, sha,
             await File.ReadAllTextAsync(Path.Combine(snapshot, "factory", "gate.yaml"), ct), contexts,
             new PostgresRunLocks(e2e.Ledger), new LedgerControls(contexts, TimeProvider.System), triage,
             () => mode == "disabled" ? null : IssueClassifier.Create(options, http!, () => options.RouterKey), ct,
             classifierSession, http is null ? null : new RouterClient(http, options.RouterKey));
+        await completed(observation); // Durable sanitized checkpoint before e2e.DisposeAsync drops this arm's ledger.
     }
 
 }

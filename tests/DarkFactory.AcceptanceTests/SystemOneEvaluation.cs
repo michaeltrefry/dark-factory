@@ -122,36 +122,102 @@ public sealed record EvaluationLabel(string CaseId, string ExpectedCategory, IRe
 // No raw prompt, issue body, rationale, model answer or exception message may enter an observation/report.
 public sealed record EvaluationObservation(string CaseId, string Mode, double DurationMs, long ClassifierElapsedMs,
     string? Route, bool Failed, string? ClassifierStatus, string? Category, long? ClassifierInputTokens,
-    long? ClassifierOutputTokens, decimal? TriageCostUsd, IReadOnlyList<string> ServedModelHashes,
+    long? ClassifierOutputTokens, decimal? TriageCostUsd, IReadOnlyDictionary<string, int> ServedModelMessageCounts,
     string PromptSha, string RepositorySha, string? FailureCode, decimal? ClassifierCostUsd = null,
     long? TriageRequestCount = null, string? ClassifierModelSha = null,
     string? ClassifierPromptSha = null, string? ClassifierVersion = null,
-    long? ClassifierRequestCount = null, string? ClassifierSessionId = null);
+    long? ClassifierRequestCount = null, string? ClassifierSessionId = null, string? ClassifierRequestedModelSha = null);
 public interface IEvaluationArm
 {
-    Task<EvaluationObservation> RunAsync(EvaluationInput report, string mode, CancellationToken ct);
+    // Checkpoint BEFORE destroying the arm's isolated ledger, including when cleanup later fails.
+    Task RunAsync(EvaluationInput report, string mode, Func<EvaluationObservation, Task> completed, CancellationToken ct);
 }
 public sealed class DelegateEvaluationArm(Func<EvaluationInput, string, CancellationToken, Task<EvaluationObservation>> run) : IEvaluationArm
 {
-    public Task<EvaluationObservation> RunAsync(EvaluationInput report, string mode, CancellationToken ct) => run(report, mode, ct);
+    public async Task RunAsync(EvaluationInput report, string mode, Func<EvaluationObservation, Task> completed, CancellationToken ct) =>
+        await completed(await run(report, mode, ct));
 }
+
+public sealed record EvaluationCampaign(string Status, string CorpusIdentity, string AuthorCommit, int ExpectedArms,
+    IReadOnlyList<EvaluationObservation> Observations, EvaluationReport? Summary);
 
 public static class SystemOneEvaluation
 {
-    public static async Task<EvaluationReport> RunAsync(string root, Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct)
+    public static async Task<EvaluationReport> RunAsync(string root, Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct,
+        Func<IReadOnlyList<EvaluationObservation>, EvaluationReport?, Task>? checkpoint = null)
     {
         var corpus = EvaluationCorpus.Load(root); // MUST precede client construction or any classifier/worker output.
-        var runner = createRunner(corpus);
         var observations = new List<EvaluationObservation>();
+        // Even a setup failure or skip leaves a nonempty, explicitly incomplete evidence file.
+        if (checkpoint is not null) { await checkpoint(observations, null); }
+        var runner = createRunner(corpus);
         for (var i = 0; i < corpus.Reports.Count; i++)
         {
             foreach (var mode in i % 2 == 0 ? new[] { "disabled", "advisory" } : new[] { "advisory", "disabled" })
             {
                 ct.ThrowIfCancellationRequested();
-                observations.Add(await runner.RunAsync(corpus.Reports[i], mode, ct));
+                await runner.RunAsync(corpus.Reports[i], mode, async observation =>
+                {
+                    observations.Add(observation);
+                    // Not the campaign token: an interrupt must not cancel evidence persistence.
+                    if (checkpoint is not null) { await checkpoint(observations, null); }
+                }, ct);
             }
         }
-        return EvaluationReport.Create(corpus, observations);
+        var report = EvaluationReport.Create(corpus, observations);
+        if (checkpoint is not null) { await checkpoint(observations, report); }
+        return report;
+    }
+
+    public static async Task<EvaluationReport> RunToFileAsync(string root, string output,
+        Func<EvaluationCorpus, IEvaluationArm> createRunner, CancellationToken ct)
+    {
+        var corpus = EvaluationCorpus.Load(root);
+        output = Path.GetFullPath(output);
+        if (output == Path.GetFullPath(root) || output.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        { throw new InvalidDataException("Evidence must be outside the frozen corpus."); }
+        // Reserve once, never overwrite an earlier campaign. Checkpoints replace it atomically in the same directory.
+        using (new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+        return await RunAsync(root, createRunner, ct, (observations, summary) =>
+        {
+            var evidence = new EvaluationCampaign(summary is null ? "incomplete" : "complete", corpus.Identity,
+                EvaluationCorpus.AuthorCommit, corpus.Reports.Count * 2, observations, summary);
+            var temporary = output + "." + Guid.NewGuid().ToString("N") + ".pending";
+            try
+            {
+                using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    JsonSerializer.Serialize(file, evidence, new JsonSerializerOptions { WriteIndented = true });
+                    file.Flush(flushToDisk: true);
+                }
+                File.Move(temporary, output, overwrite: true);
+            }
+            finally { if (File.Exists(temporary)) { File.Delete(temporary); } }
+            return Task.CompletedTask;
+        });
+    }
+}
+
+// Evaluation-only prerequisites. No board, GitHub App, gate or review credentials are read.
+// The caller transfers the held machine sandbox locks to the isolated ledger on success.
+public static class EvaluationSetup
+{
+    public static async Task<T> StartAsync<T>(FactoryOptions options, Func<IDisposable> acquireLocks,
+        Func<T, Task> sandboxProbe, Func<IDisposable, Task<T>> createIsolatedLedger) where T : IAsyncDisposable
+    {
+        if (options.WorkerSandbox is null)
+        { throw new InvalidOperationException("The evaluation requires the actual worker sandbox."); }
+        _ = options.RouterKey;
+        var held = acquireLocks();
+        T ledger;
+        try { ledger = await createIsolatedLedger(held); }
+        catch { held.Dispose(); throw; }
+        try
+        {
+            await sandboxProbe(ledger);
+            return ledger;
+        }
+        catch { await ledger.DisposeAsync(); throw; }
     }
 }
 
@@ -179,8 +245,9 @@ public sealed record EvaluationReport(string CorpusIdentity, string AuthorCommit
             var accepted = corpus.Labels.Single(l => l.CaseId == input.CaseId).AcceptableAuthoritativeRoutes;
             return new EvaluationPair(input.CaseId, baseline, advisory, advisory.DurationMs - baseline.DurationMs,
                 baseline.Failed || !accepted.Contains(baseline.Route!), advisory.Failed || !accepted.Contains(advisory.Route!),
-                baseline.ServedModelHashes.Count == 0 || advisory.ServedModelHashes.Count == 0 ? null
-                    : !baseline.ServedModelHashes.SequenceEqual(advisory.ServedModelHashes));
+                baseline.ServedModelMessageCounts.Count == 0 || advisory.ServedModelMessageCounts.Count == 0 ? null
+                    : !baseline.ServedModelMessageCounts.OrderBy(m => m.Key, StringComparer.Ordinal)
+                        .SequenceEqual(advisory.ServedModelMessageCounts.OrderBy(m => m.Key, StringComparer.Ordinal)));
         }).ToList();
         var quality = IssueClassifier.Labels.Select(category =>
         {
@@ -206,7 +273,7 @@ public sealed record EvaluationReport(string CorpusIdentity, string AuthorCommit
             pairs.Count(p => p.Advisory.ClassifierStatus == "skipped_oversize"), addedCost, false,
             "Synthetic mechanism coverage, three/category, one counterbalanced pair/case; not population accuracy or a statistically established speedup. " +
             "Category accuracy is correct/all labeled cases (unavailable/skipped included); Answered reports coverage. Classifier failure rate is unavailable/all cases; oversize skips are separate. " +
-            "Class-based serving may differ: model hashes identify this confound. CodeGraph disabled in both arms; only the pinned synthetic repository is available. " +
+            "Class-based serving may differ: hashed model identities with deduplicated assistant-message counts identify this confound. CodeGraph disabled in both arms; only the pinned synthetic repository is available. " +
             "Duration includes classifier, sandbox setup/checkout, triage, worker session accounting and deterministic routing; classifier cost-report reads occur afterwards. " +
             "Cost is router-reported USD via separately correlated classifier/worker sessions, not a hardware-energy estimate. Missing telemetry is null, and zero requires a recorded request. " +
             "One attempt per arm, no immediate triage retry, two-minute/12-turn triage cap in BOTH arms (a cap failure remains a failure). " +

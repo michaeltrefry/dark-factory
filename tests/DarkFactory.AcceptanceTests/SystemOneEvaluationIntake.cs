@@ -48,29 +48,44 @@ public static class EvaluationIntake
         var classification = await resultDb.IssueClassifications.AsNoTracking().SingleOrDefaultAsync(ct);
         var sessions = await resultDb.WorkerSessions.AsNoTracking().ToListAsync(ct);
         var events = await resultDb.SessionEvents.AsNoTracking().OrderBy(e => e.Sequence).Select(e => e.Payload).ToListAsync(ct);
-        var models = new SortedSet<string>(StringComparer.Ordinal);
-        foreach (var line in events)
-        {
-            try
-            {
-                using var json = JsonDocument.Parse(line);
-                if (json.RootElement.TryGetProperty("message", out var message) && message.TryGetProperty("model", out var model) && model.ValueKind == JsonValueKind.String)
-                { models.Add(EvaluationCorpus.Hash(model.GetString()!)); }
-            }
-            catch (JsonException) { }
-        }
+        var models = ReadModelAllocation(events);
         var failed = failure is not null || record is null || record.Error is not null || sessions.Any(s => s.ExitStatus != "succeeded");
         var classifierCost = mode == "advisory" && classification?.Status != "skipped_oversize" && classifierCosts is not null && classifierSessionId is not null
             ? await ReadClassifierCostAsync(classifierCosts, classifierSessionId, ct) : null;
         return new(input.CaseId, mode, duration, classification?.ElapsedMs ?? 0, record?.Route.ToString(), failed,
             classification?.Status, classification?.Label, classification?.InputTokens, classification?.OutputTokens,
             sessions.Count > 0 && sessions.All(s => s.CostUsd.HasValue) ? sessions.Sum(s => s.CostUsd!.Value) : null,
-            models.ToArray(), capture.PromptSha ?? EvaluationCorpus.Hash("no-triage-prompt"), repositorySha,
+            models, capture.PromptSha ?? EvaluationCorpus.Hash("no-triage-prompt"), repositorySha,
             failure ?? (failed ? "triage_failed" : null), classification?.Status == "skipped_oversize" || mode == "disabled" ? 0m
                 : classifierCost?.ActualCostUsdMicros / 1_000_000m,
             sessions.Count > 0 && sessions.All(s => s.RouterRequestCount.HasValue) ? sessions.Sum(s => s.RouterRequestCount!.Value) : null,
             classification?.Model is { } classifierModel ? EvaluationCorpus.Hash(classifierModel) : null, classification?.PromptVersion, classification?.ClassifierVersion,
-            classifierCost?.RequestCount, classifierSessionId);
+            classifierCost?.RequestCount, classifierSessionId,
+            classification is not null ? EvaluationCorpus.Hash(classification.RequestedModel) : null);
+    }
+
+    public static IReadOnlyDictionary<string, int> ReadModelAllocation(IEnumerable<string> events)
+    {
+        var counts = new SortedDictionary<string, int>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var line in events)
+        {
+            try
+            {
+                using var json = JsonDocument.Parse(line);
+                var root = json.RootElement;
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("message", out var message)
+                    || message.ValueKind != JsonValueKind.Object) { continue; }
+                if (!root.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String || type.GetString() != "assistant") { continue; }
+                if (!message.TryGetProperty("model", out var model) || model.ValueKind != JsonValueKind.String
+                    || !message.TryGetProperty("id", out var id) || id.ValueKind != JsonValueKind.String) { return new Dictionary<string, int>(); }
+                if (!seen.Add(id.GetString()!)) { continue; }
+                var hash = EvaluationCorpus.Hash(model.GetString()!);
+                counts[hash] = counts.GetValueOrDefault(hash) + 1;
+            }
+            catch (JsonException) { } // Non-JSON stdout is retained in the ledger, never copied to the report.
+        }
+        return counts;
     }
 
     internal static async Task<SessionCost?> ReadClassifierCostAsync(ISessionCostSource source, string sessionId, CancellationToken ct,

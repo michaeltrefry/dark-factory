@@ -79,7 +79,7 @@ public class SystemOneEvaluationTests
             return Task.FromResult(new EvaluationObservation(report.CaseId, mode, 100 + (mode == "advisory" ? 20 : 0),
                 mode == "advisory" ? 20 : 0, expected.AcceptableAuthoritativeRoutes[0], false,
                 mode == "disabled" ? null : "completed", mode == "disabled" ? null : expected.ExpectedCategory,
-                mode == "disabled" ? null : 30, null, 0m, ["sha256:model"], "sha256:prompt", "sha256:repo", null));
+                mode == "disabled" ? null : 30, null, 0m, new Dictionary<string, int> { ["sha256:model"] = 1 }, "sha256:prompt", "sha256:repo", null));
         }), CancellationToken.None);
         Assert.Equal(30, calls.Count);
         Assert.Equal("disabled", calls[0].Item2);
@@ -224,8 +224,8 @@ public class SystemOneEvaluationTests
         var corpus = EvaluationCorpus.Load(CorpusPath);
         var observations = corpus.Reports.SelectMany(r => new[]
         {
-            new EvaluationObservation(r.CaseId, "disabled", 100, 0, corpus.Labels.Single(l => l.CaseId == r.CaseId).AcceptableAuthoritativeRoutes[0], false, null, null, null, null, 0m, [], "p", "r", null),
-            new EvaluationObservation(r.CaseId, "advisory", 50, 5, "Build", true, "timeout", null, null, null, null, [], "p", "r", null)
+            new EvaluationObservation(r.CaseId, "disabled", 100, 0, corpus.Labels.Single(l => l.CaseId == r.CaseId).AcceptableAuthoritativeRoutes[0], false, null, null, null, null, 0m, new Dictionary<string, int>(), "p", "r", null),
+            new EvaluationObservation(r.CaseId, "advisory", 50, 5, "Build", true, "timeout", null, null, null, null, new Dictionary<string, int>(), "p", "r", null)
         }).ToList();
         var result = EvaluationReport.Create(corpus, observations);
         Assert.Equal(1, result.Advisory.FailureRate);
@@ -239,4 +239,212 @@ public class SystemOneEvaluationTests
         measured[0] = measured[0] with { RepositorySha = "different-snapshot" };
         Assert.Throws<InvalidDataException>(() => EvaluationReport.Create(corpus, measured));
     }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("17")]
+    [InlineData("\"PRIVATE_MODEL_STDOUT\"")]
+    [InlineData("[]")]
+    public void Nonobject_stdout_roots_are_ignored_without_aborting_evidence(string line) =>
+        Assert.Empty(EvaluationIntake.ReadModelAllocation([line]));
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("17")]
+    [InlineData("\"PRIVATE_MODEL_STDOUT\"")]
+    [InlineData("[]")]
+    public void Nonobject_nested_messages_are_ignored_without_aborting_evidence(string message) =>
+        Assert.Empty(EvaluationIntake.ReadModelAllocation(["{\"type\":\"assistant\",\"message\":" + message + "}"]));
+
+    private static string Assistant(string id, string model) =>
+        JsonSerializer.Serialize(new { type = "assistant", message = new { id, model, content = "PRIVATE_MODEL_STDOUT" } });
+
+    [Fact]
+    public void Assistant_message_chunks_are_deduplicated_and_only_hashed_counts_are_exported()
+    {
+        var counts = EvaluationIntake.ReadModelAllocation([Assistant("a", "PRIVATE_MODEL_A"), Assistant("a", "PRIVATE_MODEL_A"), Assistant("b", "PRIVATE_MODEL_A")]);
+        Assert.Equal(new Dictionary<string, int> { [EvaluationCorpus.Hash("PRIVATE_MODEL_A")] = 2 }, counts);
+    }
+
+    [Fact]
+    public void Changed_model_allocation_is_a_confound_even_when_model_sets_are_identical()
+    {
+        var corpus = EvaluationCorpus.Load(CorpusPath);
+        var observations = corpus.Reports.SelectMany(r => new[]
+        {
+            Sample(r, "disabled") with { ServedModelMessageCounts = new Dictionary<string, int> { [EvaluationCorpus.Hash("A")] = 1, [EvaluationCorpus.Hash("B")] = 10 } },
+            Sample(r, "advisory") with { ServedModelMessageCounts = new Dictionary<string, int> { [EvaluationCorpus.Hash("A")] = 10, [EvaluationCorpus.Hash("B")] = 1 } },
+        }).ToList();
+        Assert.All(EvaluationReport.Create(corpus, observations).Pairs, pair => Assert.True(pair.ServedModelsDiffer));
+    }
+
+    [Fact]
+    public void Missing_model_identity_is_an_explicit_unknown_confound()
+    {
+        var corpus = EvaluationCorpus.Load(CorpusPath);
+        var observations = corpus.Reports.SelectMany(r => new[] { Sample(r, "disabled"), Sample(r, "advisory") }).ToList();
+        Assert.All(EvaluationReport.Create(corpus, observations).Pairs, pair => Assert.Null(pair.ServedModelsDiffer));
+    }
+
+    [Theory]
+    [InlineData("{\"id\":\"a\"}")]
+    [InlineData("{\"model\":\"PRIVATE_MODEL_A\"}")]
+    public void An_assistant_identity_gap_makes_the_allocation_unknown_instead_of_partial(string message) =>
+        Assert.Empty(EvaluationIntake.ReadModelAllocation([Assistant("first", "PRIVATE_MODEL_A"), "{\"type\":\"assistant\",\"message\":" + message + "}"]));
+
+    private sealed class TeardownFailureArm : IEvaluationArm
+    {
+        public async Task RunAsync(EvaluationInput report, string mode, Func<EvaluationObservation, Task> completed, CancellationToken ct)
+        {
+            await completed(Sample(report, mode));
+            throw new InvalidOperationException("Simulated database teardown failure after an arm completed");
+        }
+    }
+
+    [Fact]
+    public async Task Completed_arm_is_durable_even_when_its_ledger_teardown_fails()
+    {
+        var directory = Directory.CreateTempSubdirectory("df-evaluation-teardown-").FullName;
+        var output = Path.Combine(directory, "evidence.json");
+        try
+        {
+            try { await SystemOneEvaluation.RunToFileAsync(CorpusPath, output, _ => new TeardownFailureArm(), CancellationToken.None); }
+            catch (InvalidOperationException) { }
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(await File.ReadAllTextAsync(output))!;
+            Assert.Equal(("incomplete", 1, (EvaluationReport?)null), (evidence.Status, evidence.Observations.Count, evidence.Summary));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    private static EvaluationObservation Sample(EvaluationInput input, string mode) =>
+        new(input.CaseId, mode, 1, 0, "Question", false, null, null, null, null, null,
+            new Dictionary<string, int>(), "prompt-sha", "repository-sha", null);
+
+    [Theory]
+    [InlineData(0, "setup")]
+    [InlineData(1, "cancel")]
+    [InlineData(3, "skip")]
+    [InlineData(4, "database")]
+    public async Task Every_completed_arm_survives_campaign_interruption_with_an_explicit_incomplete_report(int completed, string failure)
+    {
+        var directory = Directory.CreateTempSubdirectory("df-evaluation-interrupt-").FullName;
+        var output = Path.Combine(directory, "evidence.json");
+        using var cancel = new CancellationTokenSource();
+        var count = 0;
+        try
+        {
+            try
+            {
+                await SystemOneEvaluation.RunToFileAsync(CorpusPath, output, _ => new DelegateEvaluationArm((input, mode, ct) =>
+                {
+                    if (count++ == completed)
+                    {
+                        if (failure == "cancel") { cancel.Cancel(); ct.ThrowIfCancellationRequested(); }
+                        if (failure == "skip") { throw Xunit.Sdk.SkipException.ForSkip("PRIVATE_SETUP_DETAIL"); }
+                        throw new InvalidOperationException("PRIVATE_SETUP_DETAIL");
+                    }
+                    return Task.FromResult(Sample(input, mode));
+                }), cancel.Token);
+            }
+            catch (Exception) { } // The evidence, not exception text, is the assertion's observable.
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(await File.ReadAllTextAsync(output))!;
+            Assert.Equal(("incomplete", completed, 30, (EvaluationReport?)null),
+                (evidence.Status, evidence.Observations.Count, evidence.ExpectedArms, evidence.Summary));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public async Task Final_checkpoint_contains_complete_paired_summary_and_cannot_overwrite_earlier_evidence()
+    {
+        var directory = Directory.CreateTempSubdirectory("df-evaluation-complete-").FullName;
+        var output = Path.Combine(directory, "evidence.json");
+        try
+        {
+            await SystemOneEvaluation.RunToFileAsync(CorpusPath, output, _ => new DelegateEvaluationArm((input, mode, _) => Task.FromResult(Sample(input, mode))), CancellationToken.None);
+            var evidence = JsonSerializer.Deserialize<EvaluationCampaign>(await File.ReadAllTextAsync(output))!;
+            Assert.Equal(("complete", 30, 15), (evidence.Status, evidence.Observations.Count, evidence.Summary?.Pairs.Count));
+            await Assert.ThrowsAsync<IOException>(() => SystemOneEvaluation.RunToFileAsync(CorpusPath, output, _ => throw new Exception("must not construct a client"), CancellationToken.None));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Theory]
+    [InlineData("timeout")]
+    [InlineData("invalid_response")]
+    [InlineData("http_error")]
+    [InlineData("skipped_oversize")]
+    public async Task Failed_and_skipped_classification_preserves_the_persisted_requested_identity_separately_from_served_model(string status)
+    {
+        var corpus = EvaluationCorpus.Load(CorpusPath);
+        var input = status == "skipped_oversize" ? corpus.Reports.Single(r => r.Title.Length + r.Body.Length > 4096) : corpus.Reports[0];
+        var contexts = new LedgerDbContextFactory(new DbContextOptionsBuilder<LedgerDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
+        var triage = new IssueIntakeTests.FakeTriage();
+        triage.Answers.Add(() => IssueIntakeTests.FakeTriage.Says("{\"type\":\"question\",\"title\":\"Synthetic\",\"summary\":\"Synthetic\",\"confidence\":0.9}"));
+        using var router = new IssueClassificationTests.Router
+        {
+            Answer = "null",
+            Respond = status == "http_error" ? _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable))
+                : status == "timeout" ? _ => throw new TaskCanceledException() : null,
+        };
+        using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
+        var observation = await EvaluationIntake.RunAsync(input, "advisory", corpus.RepositorySha,
+            File.ReadAllText(Path.Combine(CorpusPath, "repository/factory/gate.yaml")), contexts, new InProcessRunLocks(),
+            new LedgerControls(contexts, TimeProvider.System), triage,
+            () => new IssueClassifier(http, "router-secret", "PRIVATE_REQUESTED_MODEL", mode: "advisory"), CancellationToken.None);
+        Assert.Equal((status, EvaluationCorpus.Hash("PRIVATE_REQUESTED_MODEL"), (string?)null),
+            (observation.ClassifierStatus, observation.ClassifierRequestedModelSha, observation.ClassifierModelSha));
+    }
+
+    private sealed class RouterOnlySecrets : ISecretStore
+    {
+        public string? Get(string account) => account == SecretAccounts.RouterKey ? "synthetic-key" : throw new InvalidOperationException("Unrelated credential read: " + account);
+        public void Set(string account, string value) => throw new NotSupportedException();
+    }
+    private sealed class FakeHeldLock(List<string> trace) : IDisposable
+    {
+        public void Dispose() => trace.Add("released");
+    }
+    private sealed class FakeIsolated(IDisposable held) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync() { held.Dispose(); return ValueTask.CompletedTask; }
+    }
+    private static FactoryOptions EvaluationOptions(string runAs = "_factory") =>
+        new(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Worker:RunAs"] = runAs }).Build(), new RouterOnlySecrets(), _ => null);
+
+    [Fact]
+    public async Task Evaluation_setup_needs_no_App_credentials_and_holds_locks_for_isolated_ledger_and_sandbox_probe()
+    {
+        var trace = new List<string>();
+        await using var held = await EvaluationSetup.StartAsync(EvaluationOptions(),
+            () => { trace.Add("locked"); return new FakeHeldLock(trace); },
+            _ => { trace.Add("probed"); return Task.CompletedTask; },
+            ownership => { trace.Add("isolated"); return Task.FromResult(new FakeIsolated(ownership)); });
+        Assert.Equal(new[] { "locked", "isolated", "probed" }, trace);
+    }
+
+    [Fact]
+    public async Task Evaluation_setup_refuses_unsandboxed_even_with_fake_probe_and_ledger() =>
+        await Assert.ThrowsAsync<InvalidOperationException>(() => EvaluationSetup.StartAsync(EvaluationOptions("none"),
+            () => new FakeHeldLock([]), _ => Task.CompletedTask, ownership => Task.FromResult(new FakeIsolated(ownership))));
+
+    [Theory]
+    [InlineData("lock")]
+    [InlineData("probe")]
+    [InlineData("ledger")]
+    public async Task Evaluation_setup_cannot_continue_past_failed_safety_prerequisites_and_releases_its_locks(string failure)
+    {
+        var trace = new List<string>();
+        try
+        {
+            await EvaluationSetup.StartAsync<FakeIsolated>(EvaluationOptions(),
+                () => { trace.Add("locked"); return failure == "lock" ? throw new InvalidOperationException() : new FakeHeldLock(trace); },
+                _ => { trace.Add("probed"); return failure == "probe" ? throw new InvalidOperationException() : Task.CompletedTask; },
+                ownership => { trace.Add("isolated"); return failure == "ledger" ? throw new InvalidOperationException() : Task.FromResult(new FakeIsolated(ownership)); });
+        }
+        catch (InvalidOperationException) { }
+        Assert.Equal(failure == "lock" ? new[] { "locked" } : failure == "probe" ? new[] { "locked", "isolated", "probed", "released" }
+            : new[] { "locked", "isolated", "released" }, trace);
+    }
+
 }
