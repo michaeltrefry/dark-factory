@@ -158,6 +158,45 @@ escalates it and comments on the story; re-running an escalated item first posts
 if it failed, then starts it again from Intake. Only one `factory run` drives an item at a
 time (a Postgres advisory lock); a second exits non-zero with "already running".
 
+### Recover an externally repaired escalated PR
+
+Ordinary `factory run <item>` on **Escalated** restarts implementation from the base and can
+replace the story branch. Do not use it to adopt an external repair. Instead, as the owner:
+
+```sh
+dotnet run --project src/DarkFactory.Orchestrator -- recover sc-1234 --head <full-repaired-commit-sha> --base <expected-base-branch>
+```
+
+`recover` accepts only the item's **existing recorded open, non-draft PR**, not an arbitrary
+PR URL or branch. It checks the exact head, same-repository head branch, expected base,
+recorded claim/link/push (or pushed changeset) and untainted worker provenance under the
+item's normal run lock. `--base` is an operator assertion, not fabricated historical evidence:
+legacy ordinary-story rows did not store the original base name, so the assertion must match
+GitHub's actual default branch and the live PR. A plan's durable changeset base takes precedence;
+the assertion cannot override it.
+A missing record, unchanged rejected head, concurrent run, moved/closed/merged PR or held
+Pause/Stop/usage/freeze refuses admission without moving the item. Watch scope still applies.
+
+Recovery currently supports Shortcut ownership, verified against the authenticated member's
+current ownership and `factory-claimed` label. GitHub issue labels and Kanban markers cannot
+prove the current token's ownership read-only, so those sources explicitly refuse recovery
+rather than take/renew a claim or pretend a marker is identity proof. Other source behavior
+(`run`, polling and controls) is unchanged.
+
+Before using recovery, restart **all factory and dashboard processes** with this upgraded
+build. Older binaries cannot decode the new `Recovering` state. Do not mix old and new hosts
+against a ledger containing recovery rows.
+
+The owner, repository, branch, base assertion/evidence, PR, rejected head and adopted head are committed together
+in a `Recovering` transition. That starts a fresh attempt: prior verdicts, fix rounds, test
+results and merge approvals cannot authorize it. Adoption runs no implementer and pushes
+nothing. The command then runs the normal full Review → CI → new-tests → merge gate path;
+normal fixers may run if that fresh review/CI requires them, with an exact remote-SHA lease
+so they cannot force-overwrite a concurrent owner repair. Any unexpected external head
+change fails closed. If interrupted after adoption, `factory run <item>` or `factory work`
+resumes the durable recovery, without returning to implementation. Existing controls and
+sandbox/taint rules still hold; recovery is not a gate bypass.
+
 Workers run as a dedicated hidden macOS user (`_factory`), not as you — see
 [Worker sandbox](#worker-sandbox).
 

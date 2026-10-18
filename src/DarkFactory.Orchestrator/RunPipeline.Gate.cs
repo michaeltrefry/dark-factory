@@ -50,7 +50,7 @@ public sealed partial class RunPipeline
 
     /// <summary>Every review verdict in the item's ledger, oldest first.</summary>
     internal static List<ReviewVerdict> Verdicts(List<LedgerEntry> history) =>
-        history.Where(e => e.Step == Steps.Verdict).Select(e => ReviewVerdict.FromDetail(e.Detail)).OfType<ReviewVerdict>().ToList();
+        Plans.Changeset.CurrentPass(history).Where(e => e.Step == Steps.Verdict).Select(e => ReviewVerdict.FromDetail(e.Detail)).OfType<ReviewVerdict>().ToList();
 
     /// <summary>The PR Implement opened and linked (its <see cref="Steps.Linked"/> checkpoint), else the Review row's PR.</summary>
     internal static string? LinkedPullRequestUrl(List<LedgerEntry> history) =>
@@ -80,6 +80,7 @@ public sealed partial class RunPipeline
                 + $"nothing was read or merged in {run.Repo}. An item's pull request must be in the item's repository. {RenamedRemedy}");
         }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
+        EnsureRecoveryPull(history, run, pull);
         return (history, pull);
     }
 
@@ -782,6 +783,24 @@ public sealed partial class RunPipeline
         }
 
         var pushed = attempt.LastOrDefault(e => e.Step == Steps.Pushed)?.Detail;
+        var recovery = Recovery.Of(history);
+        if (recovery is not null && pushed is null)
+        {
+            var (_, current) = await ReadPullAsync(run, ct);
+            await EnsureOpenAsync(run, current, ct);
+            var intent = attempt.LastOrDefault(e => e.Step == Steps.RecoveryPushIntent) is { } row ? BaseUpdate.FromDetail(row.Detail) : null;
+            if (intent is { To: { } published } && intent.From == fixedHead && current.HeadSha == published)
+            {
+                // The remote write succeeded but its Pushed checkpoint did not. The exact committed intent and safe worker
+                // sessions identify that publication; no second session or push is needed, and its head still needs review.
+                foreach (var id in attempt.Where(e => e.Step == Steps.Session).Select(e => e.ClaudeSessionId).OfType<string>().Distinct())
+                    await ledger.ReplayTaintsAsync(item, id, ct);
+                _ = await GrantPushAsync(item, session, ct);
+                await ledger.CheckpointAsync(item, Steps.Pushed, session, published, ct);
+                pushed = published;
+            }
+            else if (current.HeadSha != fixedHead) throw new InvalidOperationException("The recovered PR moved before its fixer started.");
+        }
         // A fixer found looping is never resumed (a run that stopped after the detection left only its checkpoint): the round failed.
         if (pushed is null && StuckSession(attempt) is { } found)
         {
@@ -807,6 +826,8 @@ public sealed partial class RunPipeline
             {
                 workspace = await workspaces.RestoreAsync(repo, branch, ct, baseBranch);
                 run.Workspace = workspace;
+                if (recovery is not null && await workspaces.HeadAsync(workspace, ct) != fixedHead)
+                    throw new InvalidOperationException("The recovered branch moved while its fixer worktree was restored.");
                 if (prepare is not null)
                 {
                     await prepare(workspace, ct);
@@ -830,6 +851,11 @@ public sealed partial class RunPipeline
             }
             await ThrowIfControlledAsync(item, ct);
             var grant = await GrantPushAsync(item, session, ct);
+            if (recovery is not null) grant = grant.WithExpectedRemoteHead(fixedHead, async (to, c) =>
+            {
+                await ledger.CheckpointAsync(item, Steps.RecoveryPushIntent, session,
+                    new BaseUpdate(BaseUpdate.Kinds.Update, fixedHead, "", to).ToDetail(), c);
+            });
             // The PR branch is always ahead of the base, so this pushes even when the fixer changed nothing (the same head):
             // that round is judged like any other (a review round with no fewer blocking findings fails; red CI stays red).
             await workspaces.CommitAndPushAsync(repo, workspace, commitMessage, grant, ct);
@@ -1199,7 +1225,7 @@ public sealed partial class RunPipeline
         {
             return null;
         }
-        var recorded = history.Where(e => e.Step == Steps.NewTests).Select(e => NewTestsResult.FromDetail(e.Detail))
+        var recorded = Plans.Changeset.CurrentPass(history).Where(e => e.Step == Steps.NewTests).Select(e => NewTestsResult.FromDetail(e.Detail))
             .LastOrDefault(r => r is not null && r.BaseSha == pull.BaseSha && r.HeadSha == pull.HeadSha);
         if (recorded is not null && recorded.Outcome != NewTestsOutcome.Error)
         {

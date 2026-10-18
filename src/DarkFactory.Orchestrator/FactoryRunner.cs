@@ -291,8 +291,13 @@ public static class FactoryRunner
 
     /// <param name="adjustGate">Acceptance harness only: wraps the production gate stage (e.g. to push after the verdict).</param>
     /// <param name="testSandbox">Tests only: the sandbox in place of the configured one (a fake helper that is the current one for itself).</param>
+    public static Task<RunOutcome> RecoverAsync(FactoryOptions options, IWorkSource source, int storyId, string head, string expectedBase, string owner,
+        TextWriter log, CancellationToken ct) =>
+        RunAsync(options, source, storyId, false, log, ct, null, recoveryHead: head, recoveryOwner: owner, recoveryBase: expectedBase);
+
     internal static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log,
-        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null)
+        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null,
+        string? recoveryHead = null, string? recoveryOwner = null, string? recoveryBase = null)
     {
         // Resolve every credential before touching the ledger so a missing one fails fast.
         var routerKey = options.RouterKey;
@@ -406,7 +411,8 @@ public static class FactoryRunner
                 ? new Prepare.WorkerPrepare(artifacts, Prepare.WorkerPrepare.SpoolRootOf(options.WorkRoot), log)
                 : null);
 
-        return await pipeline.RunAsync(storyId, ct);
+        return recoveryHead is null ? await pipeline.RunAsync(storyId, ct)
+            : await pipeline.RecoverAsync(storyId, recoveryHead, recoveryOwner!, ct, recoveryBase);
     }
 
     /// <summary>

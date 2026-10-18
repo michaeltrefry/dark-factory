@@ -18,6 +18,8 @@ public sealed class FakeWorkSource(WorkStory story, bool commentFails = false) :
     /// <summary>When set, claims are refused with this reason and nothing is written.</summary>
     public string? RefuseClaim { get; set; }
     public bool InScope { get; set; } = true;
+    public string? RecoveryClaimRefusal { get; set; }
+    public Task<string?> RecoveryClaimRefusalAsync(int id, CancellationToken ct) => Task.FromResult(RecoveryClaimRefusal);
 
     public async Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct)
     {

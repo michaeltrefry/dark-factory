@@ -309,6 +309,8 @@ public sealed partial class RunPipeline
             await ThrowIfControlledAsync(item, ct);
             await ThrowIfFrozenAsync(item, ct);
             await workspaces.PushAsync(repo, workspace, ct);
+            if (Recovery.Of(await ledger.HistoryAsync(item, ct)) is not null)
+                await ledger.CheckpointAsync(item, Steps.RecoveryBasePushed, null, merge.Head, ct);
             log.WriteLine($"[queue] merged {pull.BaseRef} ({Ci.Short(merge.BaseSha)}) into {Ci.Short(head)} as {Ci.Short(merge.Head)} and pushed it");
             return UpdateOutcome.Updated;
         }

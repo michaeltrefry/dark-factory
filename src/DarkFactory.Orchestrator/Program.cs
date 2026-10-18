@@ -7,7 +7,7 @@ using DarkFactory.Orchestrator.Sessions;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.Extensions.Hosting;
 
-return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync).Parse(args).InvokeAsync();
+return await FactoryCli.Build(RunAsync, SetupGitHubAppAsync, ProtectRepoAsync, WorkAsync, SetDashboardPasswordAsync, ControlAsync, KanbanKeyAsync, RecoverAsync).Parse(args).InvokeAsync();
 
 static async Task<int> KanbanKeyAsync(Guid id, bool epic, CancellationToken ct)
 {
@@ -56,6 +56,16 @@ static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToke
         async c => await FactoryRunner.CheckHelperAsync(options.WorkerSlots, c, options.WorkerPrepare) ?? await CheckRouterEnrollmentAsync(options, c),
         c => FactoryRunner.RunAsync(options, sources.Of(item.Naming), item.Id, ignoreScope, Console.Out, c), Console.Error, ct,
         requireSource: () => sources.Of(item.Naming));
+}
+
+static async Task<int> RecoverAsync(ItemRef item, string head, string expectedBase, CancellationToken ct)
+{
+    var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
+    using var sources = new WorkSourceRegistry(options);
+    return await FactoryRunner.RunCommandAsync(options,
+        async c => await FactoryRunner.CheckHelperAsync(options.WorkerSlots, c, options.WorkerPrepare) ?? await CheckRouterEnrollmentAsync(options, c),
+        c => FactoryRunner.RecoverAsync(options, sources.Of(item.Naming), item.Id, head, expectedBase, $"{Environment.UserName} (cli)", Console.Out, c),
+        Console.Error, ct, requireSource: () => sources.Of(item.Naming));
 }
 
 static async Task<int> WorkAsync(CancellationToken ct)

@@ -14,6 +14,8 @@ public enum WorkState
     /// </summary>
     Planned,
     Implement,
+    /// <summary>Owner-adopted repaired PR; durable fresh attempt, resumed through Review without implementation.</summary>
+    Recovering,
     Review,
     Fixing,
     CI,
@@ -48,7 +50,7 @@ public sealed record TransitionContext(WorkState? PausedFrom = null, int FixRoun
     /// Whether entering <paramref name="state"/> starts an item's attempt at a change afresh, so the fix rounds before it no longer
     /// count: Implement (a fresh branch from the base), or Planned (a plan item, whose changeset pull request has no Implement).
     /// </summary>
-    public static bool StartsAttempt(WorkState state) => state is WorkState.Implement or WorkState.Planned;
+    public static bool StartsAttempt(WorkState state) => state is WorkState.Implement or WorkState.Planned or WorkState.Recovering;
 
     /// <summary>Whether <paramref name="from"/> → <paramref name="to"/> starts a fix round (counted against <see cref="Lifecycle.MaxFixRounds"/>).</summary>
     public static bool IsFixRound(WorkState from, WorkState to) =>
@@ -96,7 +98,8 @@ public static class Lifecycle
         // A reverted change reopens: back to Intake, or straight to Implement.
         [WorkState.Watch] = [WorkState.Done, WorkState.Intake, WorkState.Implement],
         // A human re-queues an escalated item.
-        [WorkState.Escalated] = [WorkState.Intake],
+        [WorkState.Escalated] = [WorkState.Intake, WorkState.Recovering],
+        [WorkState.Recovering] = [WorkState.Review],
     };
 
     public static bool IsTerminal(WorkState state) => state is WorkState.Done or WorkState.Cancelled;

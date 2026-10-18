@@ -570,6 +570,10 @@ public sealed partial class RunPipeline(
         /// the old head, the base commit, the merge commit), recorded before the merge commit is pushed.
         /// </summary>
         public const string BaseUpdate = "base-update";
+        /// <summary>Recovery only: its base update was published, so the former head is no longer a pending push.</summary>
+        public const string RecoveryBasePushed = "recovery-base-pushed";
+        /// <summary>Recovery fixer: exact From/To committed before the conditional remote write, for crash reconciliation.</summary>
+        public const string RecoveryPushIntent = "recovery-push-intent";
         /// <summary>MergeGate: the head does not merge with the base (Detail: the <see cref="Gate.BaseUpdate"/> JSON with the conflicted files).</summary>
         public const string MergeConflict = "merge-conflict";
         /// <summary>
@@ -796,6 +800,7 @@ public sealed partial class RunPipeline(
             };
             if (gate is not null)
             {
+                handlers[WorkState.Recovering] = RecoveringAsync;
                 handlers[WorkState.Review] = ReviewAsync;
                 handlers[WorkState.Fixing] = FixAsync;
                 handlers[WorkState.CI] = CiAsync;
@@ -813,7 +818,7 @@ public sealed partial class RunPipeline(
     /// <summary>States the factory's handlers drive (the production pipeline has a <see cref="GateStage"/>); an item in one is in flight.</summary>
     public static readonly IReadOnlySet<WorkState> HandledStates = new HashSet<WorkState>
     {
-        WorkState.Intake, WorkState.Plan, WorkState.Implement, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing,
+        WorkState.Intake, WorkState.Plan, WorkState.Implement, WorkState.Recovering, WorkState.Review, WorkState.Fixing, WorkState.CI, WorkState.CIHealing,
         WorkState.MergeGate, WorkState.Merge,
     };
 

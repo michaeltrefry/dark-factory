@@ -117,6 +117,9 @@ public sealed class WorkLedger(LedgerDbContext db, TimeProvider time)
     public Task<WorkItem?> FindAsync(string source, string externalId, CancellationToken ct) =>
         db.WorkItems.SingleOrDefaultAsync(x => x.Source == source && x.ExternalId == externalId, ct);
 
+    /// <summary>Reloads an existing item under its run lock, without writing metadata.</summary>
+    public Task ReloadAsync(WorkItem item, CancellationToken ct) => db.Entry(item).ReloadAsync(ct);
+
     /// <summary>The source's items not Done or Cancelled, oldest first.</summary>
     public Task<List<WorkItem>> ActiveItemsAsync(string source, CancellationToken ct) =>
         db.WorkItems.Where(x => x.Source == source && x.State != WorkState.Done && x.State != WorkState.Cancelled).OrderBy(x => x.Id).ToListAsync(ct);

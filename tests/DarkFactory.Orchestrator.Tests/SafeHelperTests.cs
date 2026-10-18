@@ -575,8 +575,12 @@ public class SafeHelperTests
                 "Assert.All(off.Worker" + "Slots!.All, s => Assert.Null(s.Sandbox.Swift));",
                 "Assert.All(on.Worker" + "Slots!.All, s => Assert.Equal(new SwiftToolchain(\"/usr/bin/swift\", \"/usr/bin/xcodebuild\", SwiftToolchain.DefaultWrapperPath), s.Sandbox.Swift));",
             ],
-            // A source scan's pattern (the text names the property; nothing is run).
-            ["LockScopeTests.cs"] = ["Assert.Equal(2, Lines(@\"FactoryRunner\\.CheckHelperAsync\\(options\\.Worker" + "Slots\").Count(l => l.StartsWith(\"Program.cs: \", StringComparison.Ordinal)));"],
+            // Exact read-only source assertions, including recover's startup check; neither expression invokes a helper.
+            ["LockScopeTests.cs"] =
+            [
+                "Assert.Equal(3, Lines(@\"FactoryRunner\\.CheckHelperAsync\\(options\\.Worker" + "Slots\").Count(l => l.StartsWith(\"Program.cs: \", StringComparison.Ordinal)));",
+                "Assert.Contains(\"FactoryRunner.CheckHelperAsync(options.Worker" + "Slots\", body);",
+            ],
             ["IntakeLoopTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],
             // sc-25871 (PlanRunnerLockTests): the same nonexistent helper, for a run that must reach neither the lock nor the helper.
             ["PlanReleaseTests.cs"] = ["[\"Worker:Launch" + "Helper\"] = \"/nonexistent/df-test-helper\","],

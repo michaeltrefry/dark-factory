@@ -14,7 +14,8 @@ public static class FactoryCli
         Func<CancellationToken, Task<int>> work,
         Func<CancellationToken, Task<int>> setDashboardPassword,
         Func<string, string, CancellationToken, Task<int>> control,
-        Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null)
+        Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null,
+        Func<WorkSources.ItemRef, string, string, CancellationToken, Task<int>>? recover = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
@@ -40,6 +41,39 @@ public static class FactoryCli
             ignoreScopeOption,
         };
         runCommand.SetAction((parse, ct) => run(parse.GetValue(storyArgument)!, parse.GetValue(ignoreScopeOption), ct));
+
+        var recoveryItem = new Argument<WorkSources.ItemRef>("item-id")
+        {
+            CustomParser = result =>
+            {
+                if (WorkSources.ItemNaming.ParseAny(result.Tokens.Single().Value) is { } item) return item;
+                result.AddError("Expected sc-N, gh-N or kb-N.");
+                return null;
+            },
+        };
+        var recoveryHead = new Option<string>("--head")
+        {
+            Required = true,
+            Description = "The owner's exact repaired PR head (40 hex characters); no PR URL or branch can be supplied",
+            CustomParser = result =>
+            {
+                var value = result.Tokens.Single().Value;
+                if (value.Length == 40 && value.All(char.IsAsciiHexDigit)) return value.ToLowerInvariant();
+                result.AddError("--head must be a full 40-hex commit SHA.");
+                return null;
+            },
+        };
+        var recoveryBase = new Option<string>("--base")
+        {
+            Required = true,
+            Description = "Owner assertion of the expected base (required for legacy rows); must match the recorded plan base or actual repository default",
+        };
+        var recoverCommand = new Command("recover", "Adopt an Escalated item's existing repaired open PR, without implementing or pushing; start a fresh full review/gate attempt. Honors scope and every control.")
+        {
+            recoveryItem, recoveryHead, recoveryBase,
+        };
+        recoverCommand.SetAction((parse, ct) => recover is null ? Task.FromResult(1)
+            : recover(parse.GetValue(recoveryItem)!, parse.GetValue(recoveryHead)!, parse.GetValue(recoveryBase)!, ct));
 
         var nameOption = new Option<string>("--name")
         {
@@ -151,6 +185,7 @@ public static class FactoryCli
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
+            recoverCommand,
             new Command("kanban", "KanbanBoard work items") { kanbanKeyCommand },
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),
