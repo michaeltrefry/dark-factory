@@ -24,6 +24,55 @@ public class GitWorkspaceTests
         Git(seed, "push", _remote, "main");
     }
 
+    [Theory]
+    [InlineData("factory/sc-77")]
+    [InlineData("factory/changeset-sc-77")]
+    public async Task A_recovery_lease_refuses_a_concurrent_remote_repair_without_overwriting_it(string branch)
+    {
+        var workspace = Workspace();
+        var ws = await workspace.PrepareAsync(Repo, branch, default);
+        File.WriteAllText(Path.Combine(ws.Path, "initial.txt"), "initial\n");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "initial", TestGrants.Untainted, default));
+        var adopted = await workspace.HeadAsync(ws, default);
+        var other = Path.Combine(_root, "repair");
+        Git(_root, "clone", _remote, other);
+        Git(other, "checkout", branch);
+        File.WriteAllText(Path.Combine(other, "owner.txt"), "owner repair\n");
+        Git(other, "add", ".");
+        Git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "owner repair");
+        Git(other, "push", "origin", branch);
+        var repaired = Git(other, "rev-parse", "HEAD").Trim();
+        File.WriteAllText(Path.Combine(ws.Path, "fixer.txt"), "fixer on adopted head\n");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => workspace.CommitAndPushAsync(Repo, ws, "fixer",
+            TestGrants.Untainted.WithExpectedRemoteHead(adopted), default));
+        Assert.Equal(repaired, Git(_root, "--git-dir=" + _remote, "rev-parse", "refs/heads/" + branch).Trim());
+        var push = _gitCalls.Last(c => Subcommand(c.Args) == "push");
+        Assert.Contains($"--force-with-lease=refs/heads/{branch}:{adopted}", push.Args);
+        Assert.DoesNotContain("--force", push.Args);
+    }
+
+    [Fact]
+    public async Task A_recovery_lease_allows_a_fixer_when_the_exact_adopted_remote_head_still_holds()
+    {
+        var workspace = Workspace();
+        var ws = await workspace.PrepareAsync(Repo, "factory/sc-77", default);
+        File.WriteAllText(Path.Combine(ws.Path, "initial.txt"), "initial\n");
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "initial", TestGrants.Untainted, default));
+        var adopted = await workspace.HeadAsync(ws, default);
+        File.WriteAllText(Path.Combine(ws.Path, "fixer.txt"), "fixer\n");
+        string? intended = null;
+        var grant = TestGrants.Untainted.WithExpectedRemoteHead(adopted, (to, _) =>
+        {
+            // The exact commit is durable before the remote moves, not discovered after an ambiguous write.
+            Assert.Equal(adopted, Git(_root, "--git-dir=" + _remote, "rev-parse", "refs/heads/factory/sc-77").Trim());
+            intended = to;
+            return Task.CompletedTask;
+        });
+        Assert.True(await workspace.CommitAndPushAsync(Repo, ws, "fixer", grant, default));
+        Assert.Equal(await workspace.HeadAsync(ws, default), intended);
+        Assert.Equal(intended, Git(_root, "--git-dir=" + _remote, "rev-parse", "refs/heads/factory/sc-77").Trim());
+    }
+
     private const string Token = "ghs_FakeInstallationToken123";
     private static readonly string BasicAuth = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"x-access-token:{Token}"));
 

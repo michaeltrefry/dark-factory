@@ -34,6 +34,12 @@ public class GatePipelineTests
     internal sealed class FakeGateGitHub : IGateGitHub
     {
         public string Head { get; set; } = Sha1;
+        public string PullUrl { get; set; } = PrUrl;
+        public string DefaultBranch { get; set; } = "main";
+        public string HeadRef { get; set; } = "factory/sc-77";
+        public string HeadRepo { get; set; } = Sandbox.FullName;
+        public string BaseRef { get; set; } = "main";
+        public bool Draft { get; set; }
         public bool Open { get; set; } = true;
         public bool Merged { get; set; }
         public string? MergeCommitSha { get; set; }
@@ -53,8 +59,8 @@ public class GatePipelineTests
         {
             Calls.Add($"pull {number}");
             OnPullRead?.Invoke(++_reads);
-            return Task.FromResult(new PullFacts(number, PrUrl, Open && !Merged, Merged, false, Head, "main", BaseSha, MergeCommitSha,
-                ChangedFiles ?? DiffPaths.Parse(Diff(Head)).Files));
+            return Task.FromResult(new PullFacts(number, PullUrl, Open && !Merged, Merged, Draft, Head, BaseRef, BaseSha, MergeCommitSha,
+                ChangedFiles ?? DiffPaths.Parse(Diff(Head)).Files, DefaultBranch, HeadRef, HeadRepo));
         }
 
         /// <summary>The PR's diff for a head commit; by default a one-line change to an unrisky file.</summary>
@@ -249,7 +255,7 @@ public class GatePipelineTests
         public FakeGateGitHub GitHub { get; } = new();
         /// <summary>The new-tests check's runs (sc-25382); by default the PR adds one test that fails on the base and passes on the head.</summary>
         public FakeTestRunner TestRunner { get; } = new();
-        public FakeReviewer Reviewer { get; init; } = new();
+        public FakeReviewer Reviewer { get; set; } = new();
         /// <summary>When set, the panel's calls go here instead of <see cref="Reviewer"/> (e.g. a real <see cref="RouterReviewer"/>).</summary>
         public IReviewer? Panel { get; init; }
         /// <summary>When set, each review first waits for CodeGraph's overlay of the head through this (sc-25708).</summary>
@@ -282,8 +288,10 @@ public class GatePipelineTests
         public Task<RunOutcome> Run(string? implementerModel = ImplementerModel, CancellationToken ct = default) =>
             Run([implementerModel], ct);
 
-        public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) =>
-            new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels), Prs, Sandbox, TextWriter.Null,
+        public Task<RunOutcome> Run(string?[] implementerModels, CancellationToken ct = default) => Pipeline(implementerModels).RunAsync(77, ct);
+
+        public RunPipeline Pipeline(string?[]? implementerModels = null) =>
+            new RunPipeline(Stories, Ledger, Locks, Workspaces, new HarnessWorker(this, implementerModels ?? [ImplementerModel]), Prs, Sandbox, TextWriter.Null,
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
@@ -291,8 +299,7 @@ public class GatePipelineTests
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures,
                     swift: Swift,
-                    workerPrepare: WorkerPrepare)
-                .RunAsync(77, ct);
+                    workerPrepare: WorkerPrepare);
 
         /// <summary><c>Worker:Prepare</c>'s worker side (sc-26232): prefetch and a request spool for each implementing session; none by default.</summary>
         public Orchestrator.Prepare.WorkerPrepare? WorkerPrepare { get; init; }

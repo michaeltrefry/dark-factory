@@ -18,8 +18,25 @@ public class FactoryCliTests
             _ => { calls.Add("work"); return Task.FromResult(0); },
             _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
             (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); },
-            (id, epic, _) => { calls.Add(epic ? $"kanban key --epic {id}" : $"kanban key {id}"); return Task.FromResult(0); });
+            (id, epic, _) => { calls.Add(epic ? $"kanban key --epic {id}" : $"kanban key {id}"); return Task.FromResult(0); },
+            (id, head, expectedBase, _) => { calls.Add($"recover {id} {head} {expectedBase}"); return Task.FromResult(0); });
         return (root, calls);
+    }
+
+    [Theory]
+    [InlineData("sc-7", "sc-7")]
+    [InlineData("gh-7", "gh-7")]
+    [InlineData("kb-7", "kb-7")]
+    public async Task Recovery_requires_an_item_and_exact_head_without_a_PR_or_branch_override(string value, string expected)
+    {
+        var (root, calls) = Cli();
+        var head = new string('a', 40);
+        Assert.Equal(0, await root.Parse(["recover", value, "--head", head, "--base", "main"]).InvokeAsync());
+        Assert.Equal([$"recover {expected} {head} main"], calls);
+        Assert.NotEmpty(root.Parse(["recover", value]).Errors);
+        Assert.NotEmpty(root.Parse(["recover", value, "--head", "short"]).Errors);
+        Assert.NotEmpty(root.Parse(["recover", value, "--head", head, "--pr", "https://example.test/pull/1"]).Errors);
+        Assert.NotEmpty(root.Parse(["recover", value, "--head", head, "--ignore-scope"]).Errors);
     }
 
     [Theory]

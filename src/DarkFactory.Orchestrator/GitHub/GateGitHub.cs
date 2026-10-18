@@ -108,7 +108,7 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         await GitHubApp.EnsureSuccess(response, $"read pull request #{number}", ct);
         var pull = (await response.Content.ReadFromJsonAsync<PullDto>(ct))!;
         return new PullFacts(pull.Number, pull.HtmlUrl, pull.State == "open", pull.Merged, pull.Draft, pull.Head.Sha, pull.Base.Ref, pull.Base.Sha,
-            pull.MergeCommitSha, pull.ChangedFiles, pull.Base.Repo?.DefaultBranch);
+            pull.MergeCommitSha, pull.ChangedFiles, pull.Base.Repo?.DefaultBranch, pull.Head.Ref, pull.Head.Repo?.FullName);
     }
 
     public async Task<string> GetDiffAsync(RepoRef repo, string baseSha, string headSha, CancellationToken ct)
@@ -383,7 +383,8 @@ public sealed class GitHubGate(HttpClient http, GitHubApp gateApp) : IGateGitHub
         [property: JsonPropertyName("sha")] string Sha,
         [property: JsonPropertyName("repo")] RefRepoDto? Repo = null);
 
-    private sealed record RefRepoDto([property: JsonPropertyName("default_branch")] string? DefaultBranch);
+    private sealed record RefRepoDto([property: JsonPropertyName("default_branch")] string? DefaultBranch,
+        [property: JsonPropertyName("full_name")] string? FullName);
 
     private sealed record CheckRunsDto(
         [property: JsonPropertyName("total_count")] int TotalCount,

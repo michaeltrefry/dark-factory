@@ -50,6 +50,25 @@ public class ShortcutWorkSourceTests
         return (api, time, new ShortcutWorkSource(api.Client(ShortcutWorkSource.DefaultBaseAddress.ToString()), "tok", Team, time));
     }
 
+    [Theory]
+    [InlineData(false, false, false, false)]
+    [InlineData(false, true, false, false)]
+    [InlineData(false, false, true, false)]
+    [InlineData(false, true, true, true)]
+    [InlineData(true, true, true, false)]
+    public async Task Recovery_checks_authenticated_current_ownership_without_any_write(bool archived, bool owner, bool label, bool accepted)
+    {
+        var (api, _, source) = Api();
+        api.On("GET /api/v3/member", _ => FakeApi.Json(HttpStatusCode.OK, "{\"id\":\"factory-member\"}"));
+        var story = JsonNode.Parse(StoryJson)!.AsObject();
+        story["archived"] = archived;
+        story["owner_ids"] = new JsonArray(owner ? "factory-member" : "someone-else");
+        story["labels"] = label ? new JsonArray(new JsonObject { ["name"] = "factory-claimed" }) : new JsonArray();
+        api.On("GET /api/v3/stories/1", _ => FakeApi.Json(HttpStatusCode.OK, story.ToJsonString()));
+        Assert.Equal(accepted, await source.RecoveryClaimRefusalAsync(1, default) is null);
+        Assert.All(api.Requests, request => Assert.Equal(HttpMethod.Get, request.Method));
+    }
+
     [Fact]
     public async Task Rate_limited_call_is_retried_after_its_retry_after()
     {

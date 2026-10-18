@@ -124,6 +124,13 @@ public sealed class ShortcutWorkSource(HttpClient http, string apiToken, WatchSc
             .ToList();
     }
 
+    public async Task<string?> RecoveryClaimRefusalAsync(int id, CancellationToken ct)
+    {
+        var me = await MeAsync(ct);
+        var story = await GetStoryAsync(id, ct);
+        return !story.Archived && ClaimedBy(story, me) ? null : "the story is archived or no longer claimed by the factory";
+    }
+
     public async Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct)
     {
         var me = await MeAsync(ct);

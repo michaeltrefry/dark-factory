@@ -36,6 +36,8 @@ public class LifecycleTests
     [InlineData(Watch, Done)]
     [InlineData(Watch, Intake)]
     [InlineData(Watch, Implement)]
+    [InlineData(Escalated, Recovering)]
+    [InlineData(Recovering, Review)]
     [InlineData(Escalated, Intake)]
     public void Spec_lifecycle_steps_are_legal(WorkState from, WorkState to) => Assert.True(Legal(from, to), Lifecycle.Check(from, to, None));
 

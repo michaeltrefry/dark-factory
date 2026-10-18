@@ -15,8 +15,9 @@ public static class GitRemoteWrites
     /// <c>git &lt;tree&gt; push [--force] origin HEAD:refs/heads/&lt;branch&gt;</c>: <paramref name="tree"/> are the global options
     /// naming the git dir and work tree.
     /// </summary>
-    public static string[] Push(IReadOnlyList<string> tree, string branch, bool force) =>
-        [.. tree, "push", .. (force ? ["--force"] : Array.Empty<string>()), "origin", $"HEAD:refs/heads/{branch}"];
+    public static string[] Push(IReadOnlyList<string> tree, string branch, bool force, string? expectedHead = null) =>
+        [.. tree, "push", .. (expectedHead is not null ? [$"--force-with-lease=refs/heads/{branch}:{expectedHead}"]
+            : force ? ["--force"] : Array.Empty<string>()), "origin", $"HEAD:refs/heads/{branch}"];
 
     /// <summary>
     /// <c>git push origin &lt;sha&gt;:refs/heads/&lt;branch&gt;</c>, never forced: creates <paramref name="branch"/> at a commit the

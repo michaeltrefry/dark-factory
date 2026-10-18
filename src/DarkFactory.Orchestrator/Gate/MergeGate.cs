@@ -10,7 +10,7 @@ namespace DarkFactory.Orchestrator.Gate;
 /// an item of no plan must target (sc-25872).
 /// </summary>
 public sealed record PullFacts(int Number, string HtmlUrl, bool Open, bool Merged, bool Draft, string HeadSha, string BaseRef, string BaseSha,
-    string? MergeCommitSha, int? ChangedFiles = null, string? DefaultBranch = null);
+    string? MergeCommitSha, int? ChangedFiles = null, string? DefaultBranch = null, string? HeadRef = null, string? HeadRepo = null);
 
 /// <summary>
 /// One CI check of a commit: a check run, or a commit status mapped onto the same shape. <see cref="Id"/>: the check run's id

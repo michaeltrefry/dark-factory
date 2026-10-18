@@ -126,7 +126,8 @@ public sealed record Changeset(
         {
             if (rows[i].Step is null)
             {
-                if (rows[i].State == WorkState.Planned && previous == WorkState.Merge)
+                if ((rows[i].State == WorkState.Recovering && rows[i].Detail != "unpaused")
+                    || (rows[i].State == WorkState.Planned && previous == WorkState.Merge))
                 {
                     last = i;
                 }
@@ -157,7 +158,7 @@ public sealed record Changeset(
             : transitions[^1] == WorkState.Paused ? TransitionContext.From(transitions).PausedFrom
             : escalated && transitions is [.., var from, WorkState.Escalated] ? from
             : transitions[^1];
-        if (state is not (WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge))
+        if (state is not (WorkState.Recovering or WorkState.Review or WorkState.Fixing or WorkState.CI or WorkState.CIHealing or WorkState.MergeGate or WorkState.Merge))
         {
             return null;
         }

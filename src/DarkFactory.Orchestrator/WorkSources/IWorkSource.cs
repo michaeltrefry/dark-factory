@@ -193,6 +193,10 @@ public interface IWorkSource
     /// </summary>
     Task<ClaimResult> ClaimAsync(int id, bool ignoreScope, CancellationToken ct);
 
+    /// <summary>Read-only live ownership check for owner recovery. No claim, renewal or status write; unsupported sources refuse.</summary>
+    Task<string?> RecoveryClaimRefusalAsync(int id, CancellationToken ct) =>
+        Task.FromResult<string?>("this source cannot verify live recovery ownership");
+
     /// <summary>
     /// Keeps the factory's claim on an item it is working (sc-25983), for a source whose claims expire unless renewed: asked once
     /// per intake poll for every item of the source the ledger would resume by itself (<see cref="IItemRunner.RenewableAsync"/>,

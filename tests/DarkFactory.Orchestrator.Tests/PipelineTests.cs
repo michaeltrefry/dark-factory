@@ -173,6 +173,7 @@ public class RunPipelineTests
         public string Root { get; set; } = "/wt";
         /// <summary>Runs while a push is in progress, e.g. to set a control then.</summary>
         public Func<Task>? OnPush { get; set; }
+        public Func<Task>? AfterPush { get; set; }
         /// <summary>Runs on each restore of a branch's worktree (e.g. as a fix round starts), before it returns.</summary>
         public Action? OnRestore { get; set; }
         /// <summary>The base each worktree was asked for (sc-25872): the branch, then its base (null: the default branch).</summary>
@@ -221,11 +222,15 @@ public class RunPipelineTests
         public async Task<bool> CommitAndPushAsync(RepoRef repo, Workspace workspace, string message, PushGrant grant, CancellationToken ct)
         {
             Grants.Add(grant);
+            if (grant.ExpectedRemoteHead is { } expected && Head() != expected)
+                throw new InvalidOperationException("Remote head does not match the recovery lease.");
             Calls.Add($"push {repo} {workspace.Branch} {message}");
             if (OnPush is not null)
             {
                 await OnPush();
             }
+            if (grant.BeforePush is { } beforePush) await beforePush(Head(), ct);
+            if (AfterPush is not null) await AfterPush();
             return hasChanges;
         }
         /// <summary>The commit a worktree's HEAD is at (what the last push pushed).</summary>

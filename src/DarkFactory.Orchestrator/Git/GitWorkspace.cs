@@ -905,7 +905,15 @@ public sealed class GitWorkspace(
             return false;
         }
         // A changeset branch holds its plan's merged stories: a fix round on it only ever adds to what origin has.
-        await Git(dir, auth, ct, GitRemoteWrites.Push(tree, workspace.Branch, force: !ItemNaming.IsChangesetBranch(workspace.Branch)));
+        if (grant.ExpectedRemoteHead is { } expected && ItemNaming.IsChangesetBranch(workspace.Branch)
+            && (await Git(dir, null, ct, [.. tree, "merge-base", expected, "HEAD"])).Trim() != expected)
+        {
+            throw new InvalidOperationException("A recovered changeset push must preserve its expected remote head as an ancestor.");
+        }
+        if (grant.BeforePush is { } beforePush)
+            await beforePush(await HeadAsync(workspace, ct), ct);
+        await Git(dir, auth, ct, GitRemoteWrites.Push(tree, workspace.Branch, force: !ItemNaming.IsChangesetBranch(workspace.Branch),
+            expectedHead: grant.ExpectedRemoteHead));
         return true;
     }
 

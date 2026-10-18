@@ -245,4 +245,12 @@ public sealed class PushGrant
 
     /// <summary>The worker sessions whose work the push publishes, none tainted when the grant was issued.</summary>
     public IReadOnlyList<string> Sessions { get; }
+
+    /// <summary>Recovery requires an atomic match of this remote head before replacement.</summary>
+    internal string? ExpectedRemoteHead { get; private init; }
+
+    internal Func<string, CancellationToken, Task>? BeforePush { get; private init; }
+
+    internal PushGrant WithExpectedRemoteHead(string head, Func<string, CancellationToken, Task>? beforePush = null) =>
+        new(Sessions) { ExpectedRemoteHead = head, BeforePush = beforePush };
 }
