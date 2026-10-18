@@ -770,8 +770,17 @@ public class LockScopeTests
         Assert.Equal(["Gate/SandboxTestRunner.cs", "Worker/ClaudeWorker.cs"],
             Lines(@"private WorkerSandbox\? Sandbox => slots\?\.Current;").Select(l => l.Split(": ")[0].Replace(separator, '/')).Order());
         Assert.StartsWith("Worker" + separator + "WorkerSandbox.cs: ", Assert.Single(Lines(@"await EndAsync\(process\)")));
-        // `factory run` and `factory work` both check the installed helper at start-up (read, not run), before anything is claimed.
-        Assert.Equal(2, Lines(@"FactoryRunner\.CheckHelperAsync\(options\.WorkerSlots").Count(l => l.StartsWith("Program.cs: ", StringComparison.Ordinal)));
+        // `factory run`, `factory recover` and `factory work` check the installed helper at start-up (read, not run), before any work.
+        Assert.Equal(3, Lines(@"FactoryRunner\.CheckHelperAsync\(options\.WorkerSlots").Count(l => l.StartsWith("Program.cs: ", StringComparison.Ordinal)));
+        var program = string.Join('\n', files["Program.cs"]);
+        foreach (var command in new[] { "RunAsync", "RecoverAsync", "WorkAsync" })
+        {
+            var start = program.IndexOf($"static async Task<int> {command}(", StringComparison.Ordinal);
+            Assert.True(start >= 0, $"No CLI handler for {command}");
+            var end = program.IndexOf("\nstatic ", start + 1, StringComparison.Ordinal);
+            var body = end < 0 ? program[start..] : program[start..end];
+            Assert.Contains("FactoryRunner.CheckHelperAsync(options.WorkerSlots", body);
+        }
         // Whoever else names the launch helper only compares or reports it; sudo is started in one method.
         Assert.Equal(["Worker/WorkerSandbox.cs"], Lines(@"new ProcessStartInfo\(SudoPath\)").Select(l => l.Split(": ")[0].Replace(separator, '/')));
         // And the lock the sandbox requires there is real: nothing starts without it.

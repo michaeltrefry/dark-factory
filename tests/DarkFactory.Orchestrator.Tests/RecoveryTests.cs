@@ -58,6 +58,7 @@ public class RecoveryTests
     [InlineData("draft")]
     [InlineData("branch")]
     [InlineData("fork")]
+    [InlineData("unknown-head-repo")]
     [InlineData("base")]
     [InlineData("head")]
     [InlineData("unchanged")]
@@ -87,6 +88,7 @@ public class RecoveryTests
             case "draft": h.GitHub.Draft = true; break;
             case "branch": h.GitHub.HeadRef = "factory/sc-78"; break;
             case "fork": h.GitHub.HeadRepo = "outsider/fork"; break;
+            case "unknown-head-repo": h.GitHub.HeadRepo = null!; break;
             case "base": h.GitHub.BaseRef = "other"; break;
             case "head": h.GitHub.Head = ShaA; break;
             case "unchanged": head = ShaC; h.GitHub.Head = ShaC; break;
