@@ -76,7 +76,8 @@ public class SetupScriptTests
         var calls = run.Calls;
         Assert.DoesNotContain(calls, c => c.Contains("factory-worker-launch")); // the helper (whose exit kills every worker process) never runs
         Assert.DoesNotContain(calls, c => c.StartsWith("KILL ")); // pkill, killall and pgrep are fakes that only record
-        Assert.DoesNotContain(calls, c => !c.StartsWith("sudo ") && !c.StartsWith("security ")); // no installs, dscl, ACLs, sudoers
+        // No installs, dscl writes, ACLs or sudoers: only the read of the home the worker's account records (sc-26579).
+        Assert.DoesNotContain(calls, c => !c.StartsWith("sudo ") && !c.StartsWith("security ") && c != "dscl . -read /Users/_dftest NFSHomeDirectory");
         Assert.All(calls.Where(c => c.StartsWith("sudo ")), c =>
             Assert.Matches(@"^sudo -u _dftest env -i HOME=/Users/_dftest PATH=\S+ (/bin/rm|/bin/test|/usr/bin/security) ", c));
     }
@@ -282,6 +283,215 @@ public class SetupScriptTests
         Assert.Contains($"_dftest has uid '{uid}', outside 400-499", output);
         Assert.False(File.Exists(run.InstalledHelper));
         Assert.DoesNotContain(run.Calls, c => c.StartsWith("install ") || c.StartsWith("sudo "));
+    }
+
+    // ---- Worker homes on a factory volume (sc-26579): --home-root <dir> puts each slot's home at <dir>/<worker> ----
+
+    /// <summary>The calls that create or change an account, a home or anything installed (none may precede a refusal).</summary>
+    private static bool Changes(string c) =>
+        c.StartsWith("dscl . -create") || c.StartsWith("chown ") || c.StartsWith("chmod ") || c.StartsWith("mkdir ")
+        || c.StartsWith("install ") || c.StartsWith("sudo ") || c.StartsWith("visudo ");
+
+    /// <summary>
+    /// Makes <c>factory</c> in the temp directory (the home root's parent, which setup never creates) and returns its real
+    /// path (no symlink in it: /var is /private/var on macOS), the form setup records homes in.
+    /// </summary>
+    private async Task<string> FactoryDirAsync()
+    {
+        Directory.CreateDirectory(Path.Combine(_dir, "factory"));
+        var (exitCode, stdout, stderr) = await BashAsync($"cd -P '{_dir}/factory' && pwd -P");
+        Assert.True(exitCode == 0, stderr);
+        return stdout.Trim();
+    }
+
+    [Fact]
+    public async Task Setup_with_a_home_root_puts_each_slots_home_there_owned_by_its_user_and_closed()
+    {
+        var homes = $"{await FactoryDirAsync()}/homes";
+        var run = new WholeScriptRun(_dir, existingHome: $"{homes}/_dftest");
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--home-root", homes + "/");
+
+        Assert.True(exitCode == 0, output);
+        var calls = run.Calls.ToList();
+        // The volume is checked before anything changes; the home root is made root's, and each home is the user's own, 0700.
+        var check = calls.IndexOf("diskutil info /dev/disk9s1");
+        Assert.True(check >= 0 && check < calls.FindIndex(Changes), output);
+        Assert.Contains($"install -d -o root -g wheel -m 0755 {homes}", calls);
+        Assert.Contains($"dscl . -create /Users/_dftest2 NFSHomeDirectory {homes}/_dftest2", calls);
+        foreach (var user in new[] { "_dftest", "_dftest2" })
+        {
+            Assert.Contains($"chown {user}:{user} {homes}/{user}", calls);
+            Assert.Contains($"chmod 0700 {homes}/{user}", calls);
+            Assert.Contains(calls, c => c.StartsWith($"sudo -u {user} env -i HOME={homes}/{user} ") && c.Contains("claude.ai/install.sh"));
+        }
+        Assert.DoesNotContain(calls, c => c.Contains("/Users/_dftest") && !c.StartsWith("dscl . -read /Users/") && !c.StartsWith("dscl . -create /Users/"));
+    }
+
+    [Fact]
+    public async Task Setup_without_a_home_root_keeps_homes_in_users_and_reads_no_volume()
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Contains("dscl . -create /Users/_dftest2 NFSHomeDirectory /Users/_dftest2", run.Calls);
+        Assert.DoesNotContain(run.Calls, c => c.StartsWith("diskutil ") || c.StartsWith("stat -f %Sd"));
+    }
+
+    [Theory]
+    [InlineData("Disabled", "APFS", "/dev/disk9s1", "ignores ownership (Owners: Disabled). Enable it, then re-run: sudo diskutil enableOwnership '/Volumes/Factory'")]
+    [InlineData("", "APFS", "/dev/disk9s1", "ignores ownership (Owners: )")]
+    [InlineData("Enabled", "ExFAT", "/dev/disk9s1", "(Factory, mounted at /Volumes/Factory, /dev/disk9s1) is ExFAT, not APFS. Put the homes on a local APFS volume")]
+    [InlineData("Enabled", "APFS", "/dev/disk4s2", "is not on a local disk volume (device 'disk9s1' is unknown to diskutil)")]
+    public async Task Setup_refuses_a_home_root_on_a_volume_that_is_not_local_apfs_with_owners_before_any_account_changes(
+        string owners, string personality, string node, string expected)
+    {
+        var homes = $"{await FactoryDirAsync()}/homes";
+        var run = new WholeScriptRun(_dir, homeVolume: WholeScriptRun.HomeVolume(owners, personality, node));
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--home-root", homes);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"--home-root {homes}: ", output);
+        Assert.Contains(expected, output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Theory]
+    [InlineData("/Users/_dftest", "{home root}", "_dftest already exists with its home at '/Users/_dftest', not {home root}/_dftest", "(no --home-root)")]
+    [InlineData("/Volumes/Old/homes/_dftest", "{home root}", "its home at '/Volumes/Old/homes/_dftest', not {home root}/_dftest", "(--home-root /Volumes/Old/homes)")]
+    [InlineData("/Volumes/Old/homes/_dftest", null, "its home at '/Volumes/Old/homes/_dftest', not /Users/_dftest", "(--home-root /Volumes/Old/homes)")]
+    public async Task Setup_refuses_to_move_an_existing_workers_home_before_any_account_changes(
+        string recorded, string? homeRoot, string expected, string remedy)
+    {
+        var root = $"{await FactoryDirAsync()}/homes";
+        var run = new WholeScriptRun(_dir, existingHome: recorded);
+
+        var (exitCode, output) = homeRoot is null ? await run.RunAsync("--slots", "2") : await run.RunAsync("--slots", "2", "--home-root", root);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains(expected.Replace("{home root}", root) + ": setup never moves a home.", output);
+        Assert.Contains($"Re-run with the home root it was set up with {remedy}", output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Fact]
+    public async Task Setup_refuses_a_home_root_that_others_than_root_may_write()
+    {
+        var homes = $"{await FactoryDirAsync()}/homes";
+        var run = new WholeScriptRun(_dir, existingHome: $"{homes}/_dftest", writablePath: homes);
+
+        var (exitCode, output) = await run.RunAsync("--home-root", homes);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"{homes} must be owned by root and writable by no one else", output);
+        Assert.DoesNotContain(run.Calls, c => c.StartsWith("dscl . -create") || c.StartsWith("chown ") || c.StartsWith("sudo "));
+    }
+
+    [Fact]
+    public async Task Setup_refuses_a_home_root_below_a_directory_others_may_write_before_any_account_changes()
+    {
+        // A worker that may write a directory above the home root could move it away and put its own in its place.
+        var factory = await FactoryDirAsync();
+        var run = new WholeScriptRun(_dir, existingHome: $"{factory}/homes/_dftest", writablePath: factory);
+
+        var (exitCode, output) = await run.RunAsync("--home-root", $"{factory}/homes");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"{factory} (owner 'root', mode '775') must be owned by root or owner and writable by no one", output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Fact]
+    public async Task Setup_refuses_a_home_root_whose_parent_does_not_exist_and_creates_nothing_above_it()
+    {
+        // Under /Volumes an unmounted volume's directory is missing: creating it would put the homes on the boot disk.
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--home-root", $"{_dir}/unmounted/homes");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"{_dir}/unmounted does not exist. Mount the volume (or create the directory the homes go in) first", output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Fact]
+    public async Task Setup_refuses_a_home_root_under_volumes_that_is_not_on_the_volume_mounted_there()
+    {
+        // /Volumes itself is on the boot disk: a home root right under it, whose volume is not mounted, must not land there.
+        Assert.SkipUnless(Directory.Exists("/Volumes") && !Directory.Exists("/Volumes/dftest-not-mounted"), "needs macOS's /Volumes");
+        var run = new WholeScriptRun(_dir); // the fake diskutil answers a volume mounted at /Volumes/Factory
+
+        var (exitCode, output) = await run.RunAsync("--home-root", "/Volumes/dftest-not-mounted");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("not on a volume mounted at /Volumes/dftest-not-mounted. Mount that volume first.", output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Fact]
+    public async Task Setup_refuses_a_home_root_that_is_a_symlink()
+    {
+        // stat would read the link, not the volume it leads to (e.g. one with Owners: Disabled).
+        var factory = await FactoryDirAsync();
+        Directory.CreateDirectory(Path.Combine(_dir, "elsewhere"));
+        File.CreateSymbolicLink(Path.Combine(_dir, "factory", "homes"), Path.Combine(_dir, "elsewhere"));
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--home-root", $"{_dir}/factory/homes");
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"--home-root {factory}/homes is a symlink or not a directory", output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Fact]
+    public async Task Setup_resolves_a_home_root_through_a_symlinked_parent_and_records_the_real_path()
+    {
+        var factory = await FactoryDirAsync();
+        File.CreateSymbolicLink(Path.Combine(_dir, "linked"), Path.Combine(_dir, "factory"));
+        var run = new WholeScriptRun(_dir, existingHome: $"{factory}/homes/_dftest");
+
+        var (exitCode, output) = await run.RunAsync("--slots", "2", "--home-root", $"{_dir}/linked/homes");
+
+        Assert.True(exitCode == 0, output);
+        Assert.Contains($"stat -f %Sd {factory}", run.Calls); // the volume of the directory itself, not of the link
+        Assert.Contains($"dscl . -create /Users/_dftest2 NFSHomeDirectory {factory}/homes/_dftest2", run.Calls);
+    }
+
+    [Theory]
+    [InlineData("relative/homes", "--home-root must be an absolute directory")]
+    [InlineData("/", "--home-root must be an absolute directory")]
+    [InlineData("/Volumes/Factory/../homes", "--home-root must be an absolute directory")]
+    [InlineData("/Volumes/Factory/my homes", "--home-root must be an absolute directory")]
+    [InlineData("{dir}/ownerhome/homes", "--home-root must be outside the owner's home")]
+    [InlineData("{dir}/work/root/homes", "--home-root must be outside the owner's home (no worker can enter it) and the work root")]
+    public async Task Setup_refuses_a_home_root_it_cannot_use(string homeRoot, string expected)
+    {
+        var run = new WholeScriptRun(_dir);
+
+        var (exitCode, output) = await run.RunAsync("--home-root", homeRoot.Replace("{dir}", _dir));
+
+        Assert.Equal(64, exitCode);
+        Assert.Contains(expected, output);
+        Assert.DoesNotContain(run.Calls, Changes);
+    }
+
+    [Fact]
+    public async Task Remove_worker_login_uses_the_home_the_account_records_whatever_the_home_root()
+    {
+        // The recorded home is the fake home directory itself, so the real rm acts on it.
+        var recorded = Path.Combine(_dir, "home");
+        var run = new WholeScriptRun(_dir, existingHome: recorded);
+
+        var (exitCode, output) = await run.RunAsync("--remove-worker-login", "--home-root", "/Volumes/Elsewhere");
+
+        Assert.True(exitCode == 0, output);
+        Assert.False(File.Exists(run.CredentialsFile), "the credentials file in the recorded home was not removed");
+        Assert.All(run.Calls.Where(c => c.StartsWith("sudo ")), c => Assert.StartsWith($"sudo -u _dftest env -i HOME={recorded} ", c));
+        Assert.DoesNotContain(run.Calls, c => c.StartsWith("diskutil "));
     }
 
     // ---- The Swift toolchain (sc-26130): the xcodebuild wrapper, and swift/xcodebuild checked as every slot's user ----
@@ -497,6 +707,7 @@ public class SetupScriptTests
         private readonly string _items;
         private readonly string _sudoers;
         private readonly string _users;
+        private readonly string _homes;
 
         /// <summary>Where setup installs slot 1's helper (its default).</summary>
         public const string HelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
@@ -507,8 +718,12 @@ public class SetupScriptTests
         /// <param name="notAquaFor">A worker user whose <c>launchctl managername</c> answers <c>Background</c> (no GUI login session).</param>
         /// <param name="noRuntimeFor">A worker user whose <c>xcrun simctl list runtimes -j</c> lists only an unavailable iOS runtime.</param>
         /// <param name="noIphoneFor">A worker user whose <c>xcrun simctl list devicetypes -j</c> lists only an iPad.</param>
+        /// <param name="existingHome">The home the existing first worker's account records (sc-26579).</param>
+        /// <param name="homeVolume">What the fake <c>diskutil info</c> prints for the volume every path is on (default: <see cref="HomeVolume"/>()).</param>
+        /// <param name="writablePath">A path the fake <c>stat -f %Lp</c> gives mode 775 (every other: 755).</param>
         public WholeScriptRun(string dir, string uid = "450", string secondUid = "451", string? swiftFailsFor = null,
-            string? sdksMissingFor = null, bool xcodeSelected = true, string? notAquaFor = null, string? noRuntimeFor = null, string? noIphoneFor = null)
+            string? sdksMissingFor = null, bool xcodeSelected = true, string? notAquaFor = null, string? noRuntimeFor = null, string? noIphoneFor = null,
+            string existingHome = "/Users/_dftest", string? homeVolume = null, string? writablePath = null)
         {
             _dir = dir;
             InstalledHelper = Path.Combine(dir, "installed-helper");
@@ -580,12 +795,34 @@ public class SetupScriptTests
                 """);
             SandboxSupport.Executable(bin, "uname", "#!/bin/sh\necho Darwin\n");
             SandboxSupport.Executable(bin, "id", "#!/bin/sh\n[ \"$1\" = -u ] && echo 0\nexit 0\n");
-            SandboxSupport.Executable(bin, "stat", "#!/bin/sh\necho root\n");
+            // stat: the owner of a path (root), its mode (775 for writablePath, else 755), and the disk device it is on.
+            SandboxSupport.Executable(bin, "stat", $$"""
+                #!/bin/sh
+                echo "stat $*" >>'{{_log}}'
+                case "$2" in
+                    %Sd) echo disk9s1 ;;
+                    %Lp) [ "$3" = '{{writablePath ?? "/nonexistent"}}' ] && echo 775 || echo 755 ;;
+                    *) echo root ;;
+                esac
+                """);
+            SandboxSupport.Executable(bin, "diskutil", $$"""
+                #!/bin/sh
+                echo "diskutil $*" >>'{{_log}}'
+                [ "$*" = "info /dev/disk9s1" ] || exit 1
+                printf '%s\n' '{{homeVolume ?? HomeVolume()}}'
+                """);
+            // The homes accounts record: the owner's, the first worker's (existingHome), and each one a run creates.
+            _homes = Path.Combine(dir, "homes.recorded");
+            File.WriteAllText(_homes, $"owner {dir}/ownerhome\n_dftest {existingHome}\n");
             SandboxSupport.Executable(bin, "dscl", $$"""
                 #!/bin/sh
                 echo "dscl $*" >>'{{_log}}'
                 case "$*" in
-                    *NFSHomeDirectory*) echo "NFSHomeDirectory: {{dir}}/ownerhome" ;;
+                    ". -create /Users/"*" NFSHomeDirectory "*) echo "${3#/Users/} $5" >>'{{_homes}}' ;;
+                    *NFSHomeDirectory*)
+                        u=${3#/Users/}
+                        h=$(awk -v u="$u" '$1 == u { h = $2 } END { print h }' '{{_homes}}')
+                        echo "NFSHomeDirectory: ${h:-/Users/$u}" ;;
                     *PrimaryGroupID*) echo "PrimaryGroupID: 450" ;;
                     */Users/_dftest2\ UniqueID*) echo "UniqueID: {{secondUid}}" ;;
                     */Users/_dftest[3-8]\ UniqueID*) n="$*"; n=${n#*/Users/_dftest}; echo "UniqueID: $((449 + ${n%% *}))" ;;
@@ -632,6 +869,18 @@ public class SetupScriptTests
                 : "#!/bin/sh\necho 'xcode-select: error: unable to get active developer directory' >&2\nexit 2\n");
         }
 
+        /// <summary><c>diskutil info</c> of a volume (macOS 26's layout, cut), local unless <paramref name="node"/> says otherwise.</summary>
+        public static string HomeVolume(string owners = "Enabled", string personality = "APFS", string node = "/dev/disk9s1") => $"""
+               Device Identifier:         disk9s1
+               Device Node:               {node}
+               Volume Name:               Factory
+               Mounted:                   Yes
+               Mount Point:               /Volumes/Factory
+               File System Personality:   {personality}
+               Owners:                    {owners}
+               Device Location:           Internal
+            """;
+
         public string CredentialsFile { get; }
 
         public string InstalledHelper { get; }
@@ -663,7 +912,7 @@ public class SetupScriptTests
             // Refuse to run unless every privileged command resolves to its fake.
             var (exitCode, stdout, stderr) = await BashAsync(_dir, $$"""
                 export PATH='{{bin}}':/usr/bin:/bin
-                for c in sudo id uname dscl chown chmod install visudo mkdir stat security pkill killall pgrep rm xcode-select; do
+                for c in sudo id uname dscl chown chmod install visudo mkdir stat diskutil security pkill killall pgrep rm xcode-select; do
                     [ "$(command -v "$c")" = '{{bin}}'/"$c" ] || { echo "fake $c not first on PATH" >&2; exit 99; }
                 done
                 /bin/bash '{{script}}' --owner owner --worker _dftest --work-root '{{_dir}}/work/root' {{args}} 2>&1
