@@ -279,6 +279,7 @@ dotnet run --project src/DarkFactory.Orchestrator -- github-repo protect owner/n
 sudo scripts/setup-worker-user.sh             # the owner, once and after any change to scripts/factory-worker-launch: the sandbox user and its helper
 sudo scripts/setup-worker-user.sh --slots 2   # the same for 2 worker slots (_factory, _factory2), then Worker__Slots=2
 sudo scripts/setup-worker-user.sh --slots 2 --swift   # also require each slot's Swift/Xcode toolchain (Worker__Swift=true)
+sudo scripts/setup-worker-user.sh --home-root /Volumes/Factory/homes   # homes at <dir>/<worker> (local APFS, Owners: Enabled; an existing home is never moved, sc-26579)
 ```
 
 ## Configuration
