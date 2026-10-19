@@ -112,7 +112,8 @@ as_worker() { sudo -u "$worker" env -i "HOME=$worker_home" PATH=/usr/bin:/bin:/u
 
 # account_home <user> - the home the user's account records (dscl prints it after the key, or wrapped on the next line).
 account_home() {
-    dscl . -read "/Users/$1" NFSHomeDirectory | awk '{ for (i = 1; i <= NF; i++) if ($i != "NFSHomeDirectory:") { print $i; exit } }'
+    { dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null || true; } \
+        | awk '{ for (i = 1; i <= NF; i++) if ($i != "NFSHomeDirectory:") { print $i; exit } }'
 }
 
 # --remove-worker-login: delete each worker's own Claude login and nothing else. Never through the
@@ -169,29 +170,59 @@ for slot in $(seq 1 "$slots"); do
     esac
 done
 
-# --home-root, checked before any account is created or changed. Its volume (that of its nearest existing directory) must be
-# a local APFS volume that honours ownership: on one that ignores it (Owners: Disabled, the default for an added disk) every
-# file reads as owned by whoever looks, so a home's owner and its 0700 would keep no worker out of another's.
+# --home-root, checked before any account is created or changed.
+#  - Outside the owner's home and the work root (as given, and as resolved below).
+#  - Its parent exists (nothing above it is created: under /Volumes an unmounted volume would otherwise leave the homes on
+#    the boot disk, and the volume, mounted later, at "/Volumes/<name> 1"), and the path is resolved through it (pwd -P), so
+#    the checks below and the homes are on the volume the directory really is on; the root itself may not be a symlink.
+#  - That volume is a local APFS volume that honours ownership: on one that ignores it (Owners: Disabled, the default for
+#    an added disk) every file reads as owned by whoever looks, so a home's owner and its 0700 would keep no worker out of
+#    another's. Under /Volumes/<name> it must be the volume mounted there.
+#  - No directory above it can be changed by a worker: each is owned by root or the owner and writable by no one else (or
+#    root's and sticky, like /tmp), so no worker can move the home root away and put its own in its place.
 if [ -n "$home_root" ]; then
-    case "$home_root/" in
-        "$owner_home"/* | "$work_root"/*)
-            echo "--home-root must be outside the owner's home (no worker can enter it) and the work root (every worker reads it)." >&2
-            exit 64 ;;
-    esac
-    existing=$home_root
-    while [ ! -e "$existing" ]; do existing=$(dirname "$existing"); done
-    device=$(stat -f %Sd "$existing" 2>/dev/null || true)
+    home_root_outside() {
+        case "$home_root/" in
+            "$owner_home"/* | "$work_root"/*)
+                echo "--home-root must be outside the owner's home (no worker can enter it) and the work root (every worker reads it)." >&2
+                exit 64 ;;
+        esac
+    }
+    home_root_outside
+    home_parent=$(dirname "$home_root")
+    if [ ! -d "$home_parent" ]; then
+        echo "--home-root $home_root: $home_parent does not exist. Mount the volume (or create the directory the homes go in) first: setup creates only the home root itself." >&2
+        exit 1
+    fi
+    home_root=$(cd -P "$home_parent" && pwd -P)/$(basename "$home_root")
+    home_root=${home_root#/}; home_root=/$home_root # a parent of / gives //name
+    home_parent=$(dirname "$home_root")
+    home_root_outside
+    if [ -L "$home_root" ] || { [ -e "$home_root" ] && [ ! -d "$home_root" ]; }; then
+        echo "--home-root $home_root is a symlink or not a directory: give the real directory." >&2
+        exit 1
+    fi
+    if [ -d "$home_root" ]; then on=$home_root; else on=$home_parent; fi
+    device=$(stat -f %Sd "$on" 2>/dev/null || true)
     volume_info=
     if [[ $device =~ ^disk[0-9]+(s[0-9]+)*$ ]]; then
         volume_info=$(diskutil info "/dev/$device" 2>/dev/null || true)
     fi
     volume_field() { printf '%s\n' "$volume_info" | sed -n "s/^ *$1: *//p" | head -n 1; }
     volume_mount=$(volume_field 'Mount Point')
-    volume="the volume of $existing ($(volume_field 'Volume Name'), mounted at ${volume_mount:-nowhere}, /dev/$device)"
+    volume="the volume of $on ($(volume_field 'Volume Name'), mounted at ${volume_mount:-nowhere}, /dev/$device)"
     if [ -z "$volume_info" ] || [ "$(volume_field 'Device Node')" != "/dev/$device" ]; then
-        echo "--home-root $home_root: $existing is not on a local disk volume (device '${device:-none}' is unknown to diskutil). Put the homes on a local APFS volume (diskutil apfs addVolume, or a second disk erased as APFS)." >&2
+        echo "--home-root $home_root: $on is not on a local disk volume (device '${device:-none}' is unknown to diskutil). Put the homes on a local APFS volume (diskutil apfs addVolume, or a second disk erased as APFS)." >&2
         exit 1
     fi
+    case "$home_root/" in
+        /Volumes/?*)
+            mounted_at=${home_root#/Volumes/}; mounted_at=/Volumes/${mounted_at%%/*}
+            if [ "$volume_mount" != "$mounted_at" ]; then
+                echo "--home-root $home_root: $on is on $volume, not on a volume mounted at $mounted_at. Mount that volume first." >&2
+                exit 1
+            fi ;;
+    esac
     case "$(volume_field 'File System Personality')" in
         *APFS*) ;;
         *)  echo "--home-root $home_root: $volume is $(volume_field 'File System Personality'), not APFS. Put the homes on a local APFS volume (diskutil apfs addVolume, or a second disk erased as APFS)." >&2
@@ -201,6 +232,19 @@ if [ -n "$home_root" ]; then
         echo "--home-root $home_root: $volume ignores ownership (Owners: $(volume_field 'Owners')). Enable it, then re-run: sudo diskutil enableOwnership '${volume_mount:-<its mount point>}'" >&2
         exit 1
     fi
+    dir=$home_parent
+    while :; do
+        dir_owner=$(stat -f %Su "$dir" 2>/dev/null || true)
+        dir_mode=$(stat -f %Lp "$dir" 2>/dev/null || true)
+        if ! [[ $dir_mode =~ ^[0-7]{3,4}$ ]] || { [ "$dir_owner" != root ] && [ "$dir_owner" != "$owner" ]; } \
+            || { (( 8#$dir_mode & 8#022 )) && ! { [ "$dir_owner" = root ] && (( 8#$dir_mode & 8#1000 )); }; }; then
+            echo "--home-root $home_root: $dir (owner '$dir_owner', mode '$dir_mode') must be owned by root or $owner and writable by no one" >&2
+            echo "else (or root's and sticky), so no worker can move the home root away. Choose another --home-root, or fix $dir." >&2
+            exit 1
+        fi
+        [ "$dir" = / ] && break
+        dir=$(dirname "$dir")
+    done
 fi
 
 # A worker that already exists keeps its home: a different one (another --home-root, or none) is refused, never moved - its
@@ -210,9 +254,11 @@ for slot in $(seq 1 "$slots"); do
     if dscl . -read "/Users/$worker" >/dev/null 2>&1; then
         recorded=$(account_home "$worker")
         if [ "$recorded" != "$worker_home" ]; then
-            if [ "$(dirname "$recorded")" = /Users ]; then was="no --home-root"; else was="--home-root $(dirname "$recorded")"; fi
+            if [ "$recorded" = "/Users/$worker" ]; then was=" (no --home-root)"
+            elif [ "$(basename "$recorded")" = "$worker" ]; then was=" (--home-root $(dirname "$recorded"))"
+            else was=; fi
             echo "$worker already exists with its home at '$recorded', not $worker_home: setup never moves a home." >&2
-            echo "Re-run with the home root it was set up with ($was), or move the home and its account's" >&2
+            echo "Re-run with the home root it was set up with$was, or move the home and its account's" >&2
             echo "NFSHomeDirectory yourself (dscl . -create /Users/$worker NFSHomeDirectory <home>) with the factory stopped." >&2
             exit 1
         fi
@@ -239,7 +285,8 @@ free_id() { # lowest id in 400-499 unused as both a UID and a GID
 # The home root (--home-root): owned by root, so no worker can swap another's home in it.
 if [ -n "$home_root" ]; then
     [ -d "$home_root" ] || install -d -o root -g wheel -m 0755 "$home_root"
-    if [ "$(stat -f %Su "$home_root")" != root ] || (( 8#$(stat -f %Lp "$home_root") & 8#022 )); then
+    home_mode=$(stat -f %Lp "$home_root" 2>/dev/null || true)
+    if [ "$(stat -f %Su "$home_root" 2>/dev/null || true)" != root ] || ! [[ $home_mode =~ ^[0-7]{3,4}$ ]] || (( 8#$home_mode & 8#022 )); then
         echo "$home_root must be owned by root and writable by no one else, so no worker can swap another's home in it" >&2
         echo "(sudo chown root:wheel $home_root && sudo chmod go-w $home_root)." >&2
         exit 1
