@@ -501,6 +501,9 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         // As the helper sets them: no build server or node outlives the run.
         psi.Environment["MSBUILDDISABLENODEREUSE"] = "1";
         psi.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
+        // Roslyn's compiler server is separate from both MSBuild servers and node reuse. It otherwise remains in this
+        // step's owned group after a successful build, making descendant-safe teardown wait out the entire run deadline.
+        psi.Environment["UseSharedCompilation"] = "false";
         Process process;
         try
         {

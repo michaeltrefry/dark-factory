@@ -1221,6 +1221,32 @@ public class GateCloneTests : IDisposable
         Assert.Contains(report.BuildErrors, e => e.Line == 115 && e.Message.Contains("SaveResult"));
     }
 
+    [Fact]
+    public async Task Managed_build_steps_disable_shared_compilation_so_a_successful_build_does_not_leave_a_compiler_server()
+    {
+        var (unused, sha) = await ShRunner();
+        var record = Path.Combine(_root, "compiler-server");
+        var runner = new SandboxTestRunner(Workspace(), slots: null, TimeSpan.FromSeconds(5))
+        {
+            DirectStopForTest = p => { if (!p.HasExited) OwnProcess.Of(p).KillGroupIfStillLeading(); },
+        };
+        // Model csc's persistent compiler server without invoking a compiler, package restore or native toolchain.
+        var script = $"if [ \"${{UseSharedCompilation:-}}\" != false ]; then sleep 600 & child=$!; printf '%s\\n' {OwnProcess.ShellRecord("$child")} > '{record}'; fi; "
+            + "printf '%s\\n' 'Build succeeded.'; exit 0";
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c", script]) { CaptureOutput = "build" };
+        try
+        {
+            var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new XunitNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+            Assert.Equal(TestRunStatus.NoResults, report.Status);
+            Assert.Contains("→ exit 0", report.Log);
+            Assert.False(File.Exists(record));
+        }
+        finally
+        {
+            if (File.Exists(record)) OwnProcess.Parse(File.ReadAllText(record)).KillIfStillRunning();
+        }
+    }
+
     /// <summary>A shell step that writes each (path, content) under the results directory (contents passed as arguments).</summary>
     private static TestStep Writes(string results, params (string Path, string Content)[] files) =>
         new(TestPhase.Test, "/bin/sh", ["-c", string.Join(" && ", files.Select((f, i) =>
