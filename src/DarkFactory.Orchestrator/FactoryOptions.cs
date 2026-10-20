@@ -534,6 +534,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
         : null;
 
+    /// <summary><c>Review:MaxOutputTokens</c> (positive integer, default 8192): requested output limit of every panel turn.</summary>
+    public int ReviewMaxOutputTokens => AtLeast("Review:MaxOutputTokens", Gate.RouterReviewer.DefaultMaxOutputTokens, 1);
+
     /// <summary><c>Review:TimeoutMinutes</c> (&gt; 0, default 10): the longest one reviewer call may take.</summary>
     public TimeSpan ReviewTimeout => Positive("Review:TimeoutMinutes", 10, TimeSpan.FromMinutes);
 
@@ -565,7 +568,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     {
         _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerPrepare, WorkerSlots, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
-        _ = (QuietThreshold, Metrics, ReviewTimeout, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
+        _ = (QuietThreshold, Metrics, ReviewTimeout, ReviewMaxOutputTokens, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl);
         CheckWorkerAuth();
         // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.

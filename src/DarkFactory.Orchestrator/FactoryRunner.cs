@@ -292,12 +292,12 @@ public static class FactoryRunner
     /// <param name="adjustGate">Acceptance harness only: wraps the production gate stage (e.g. to push after the verdict).</param>
     /// <param name="testSandbox">Tests only: the sandbox in place of the configured one (a fake helper that is the current one for itself).</param>
     public static Task<RunOutcome> RecoverAsync(FactoryOptions options, IWorkSource source, int storyId, string head, string expectedBase, string owner,
-        TextWriter log, CancellationToken ct) =>
-        RunAsync(options, source, storyId, false, log, ct, null, recoveryHead: head, recoveryOwner: owner, recoveryBase: expectedBase);
+        TextWriter log, CancellationToken ct, bool retryIncompleteReview = false) =>
+        RunAsync(options, source, storyId, false, log, ct, null, recoveryHead: head, recoveryOwner: owner, recoveryBase: expectedBase, retryIncompleteReview: retryIncompleteReview);
 
     internal static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log,
         CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null,
-        string? recoveryHead = null, string? recoveryOwner = null, string? recoveryBase = null)
+        string? recoveryHead = null, string? recoveryOwner = null, string? recoveryBase = null, bool retryIncompleteReview = false)
     {
         // Resolve every credential before touching the ledger so a missing one fails fast.
         var routerKey = options.RouterKey;
@@ -361,7 +361,7 @@ public static class FactoryRunner
         using var kanbanHttp = OutboundHttp.KanbanApi(options.KanbanMcpUrl);
         // One upstream registry: the reviewers' tools and the review's overlay wait (sc-25708) share its CodeGraph client.
         var upstreams = CreateUpstreams(options, codeGraphHttp, kanbanHttp, log);
-        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: new ReviewTools(workspaces, upstreams.CodeGraph, upstreams.Kanban, log));
+        var reviewer = new RouterReviewer(reviewerHttp, routerKey, tools: new ReviewTools(workspaces, upstreams.CodeGraph, upstreams.Kanban, log), maxOutputTokens: options.ReviewMaxOutputTokens);
         // Prepare recipes' artifacts (sc-26232): downloaded by the harness alone, through the gateway, into the read-only cache.
         using var artifactHttp = OutboundHttp.ArtifactDownload(DnsArtifactResolver.Instance);
         var artifacts = new Prepare.ArtifactFetcher(artifactHttp, DnsArtifactResolver.Instance,
@@ -412,7 +412,7 @@ public static class FactoryRunner
                 : null);
 
         return recoveryHead is null ? await pipeline.RunAsync(storyId, ct)
-            : await pipeline.RecoverAsync(storyId, recoveryHead, recoveryOwner!, ct, recoveryBase);
+            : await pipeline.RecoverAsync(storyId, recoveryHead, recoveryOwner!, ct, recoveryBase, retryIncompleteReview);
     }
 
     /// <summary>

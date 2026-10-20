@@ -10,7 +10,8 @@ namespace DarkFactory.Orchestrator;
 public sealed partial class RunPipeline
 {
     /// <summary>The owner's exact adoption, committed in the Recovering transition, not a detached checkpoint.</summary>
-    internal sealed record Recovery(string Owner, string Repo, string Branch, string Base, string Pull, string RejectedHead, string Head, string BaseEvidence = "owner assertion validated against repository default")
+    internal sealed record Recovery(string Owner, string Repo, string Branch, string Base, string Pull, string RejectedHead, string Head, string BaseEvidence = "owner assertion validated against repository default",
+        string? Kind = null, long? SourceVerdictId = null, long? SourceEscalationId = null, int? MaxOutputTokens = null)
     {
         public string ToDetail() => JsonSerializer.Serialize(this);
         public static Recovery? Of(IReadOnlyList<LedgerEntry> history)
@@ -32,7 +33,7 @@ public sealed partial class RunPipeline
     /// the single Recovering transition commits both evidence and a fresh attempt. A crash afterwards is resumed by run/work,
     /// never by Implement. No worker, checkout, push, claim or control write is made by admission.
     /// </summary>
-    public async Task<RunOutcome> RecoverAsync(int storyId, string head, string owner, CancellationToken ct, string? assertedBase = null)
+    public async Task<RunOutcome> RecoverAsync(int storyId, string head, string owner, CancellationToken ct, string? assertedBase = null, bool retryIncompleteReview = false)
     {
         var item = await ledger.FindAsync(Naming.Source, Naming.Format(storyId), ct);
         if (item is null)
@@ -97,7 +98,9 @@ public sealed partial class RunPipeline
                     "the last worker has no recorded completion; recover only after it is stopped");
                 var rejected = Verdicts(history).LastOrDefault()?.HeadSha ?? Recovery.Of(history)?.RejectedHead;
                 Require(IsCommit(rejected), "no recorded reviewed/rejected head");
-                Require(head != rejected && head != pushed?.Detail, "the repaired head is unchanged from the rejected/pushed head");
+                if (!retryIncompleteReview)
+                    Require(head != rejected && head != pushed?.Detail, "the repaired head is unchanged from the rejected/pushed head");
+                else Require(head == rejected, "an incomplete-review retry must name the exact failed panel head");
                 var pull = await Gate.GitHub.GetPullAsync(repo, number, ct);
                 var recordedBase = ofPlan.Changeset?.Branch ?? changeset?.Base;
                 Require(!string.IsNullOrWhiteSpace(assertedBase), "--base is required: legacy ordinary rows do not record the original base name");
@@ -106,9 +109,23 @@ public sealed partial class RunPipeline
                     "--base must match the ledger's changeset base, or the repository's actual default branch for an ordinary story");
                 recovery = new Recovery(owner, repo.FullName, branch, expectedBase!, url, rejected!, head,
                     recordedBase is null ? "owner assertion validated against repository default" : "ledger changeset base (owner assertion matched)");
+                if (retryIncompleteReview)
+                {
+                    var policyText = await Gate.GitHub.GetPolicyAsync(repo, pull.BaseSha, ct)
+                        ?? throw new InvalidOperationException("the current base has no gate policy");
+                    var policy = GatePolicy.Parse(policyText);
+                    var diff = await Gate.GitHub.GetDiffAsync(repo, pull.BaseSha, head, ct);
+                    var required = ReviewRoles.Required(policy.SecurityReviewReasons(policy.Classify(diff)).Count > 0);
+                    var proof = IncompleteReviewEvidence.Require(history, head, url, required);
+                    Require(Gate.Reviewer.MaxOutputTokens > 0, "Review:MaxOutputTokens must be positive");
+                    recovery = recovery with { Kind = "incomplete-review", SourceVerdictId = proof.VerdictId,
+                        SourceEscalationId = proof.EscalationId, MaxOutputTokens = Gate.Reviewer.MaxOutputTokens };
+                }
                 ValidateRecoveryPull(recovery, pull, head, requireOpen: true);
                 // Re-read at the boundary: no approval can be based on a stale preflight answer.
-                ValidateRecoveryPull(recovery, await Gate.GitHub.GetPullAsync(repo, number, ct), head, requireOpen: true);
+                var freshPull = await Gate.GitHub.GetPullAsync(repo, number, ct);
+                ValidateRecoveryPull(recovery, freshPull, head, requireOpen: true);
+                Require(!retryIncompleteReview || freshPull.BaseSha == pull.BaseSha, "the PR base commit moved during incomplete-review admission");
                 await RequireRecoveryControlsAsync(item, ct);
                 if (await source.RecoveryClaimRefusalAsync(storyId, ct) is { } claimRefusal)
                     throw new InvalidOperationException(claimRefusal);

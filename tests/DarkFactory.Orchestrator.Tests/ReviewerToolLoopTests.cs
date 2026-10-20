@@ -150,7 +150,7 @@ public class ReviewerToolLoopTests
             (call.Tool, call.Arguments, call.ResultSha256, call.Error, call.Commit));
         // E1: the raw result's UTF-8 size beside its hash, and every turn's served model and class (the last turn's also kept as before).
         Assert.Equal(Encoding.UTF8.GetByteCount(XSource), call.Bytes);
-        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high"), new ServedTurn(2, "claude-final-turn", "high")], review.Turns!);
+        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high", StopReason: "tool_use", MaxOutputTokens: 8192), new ServedTurn(2, "claude-final-turn", "high", StopReason: "end_turn", MaxOutputTokens: 8192)], review.Turns!);
         Assert.Equal(("claude-final-turn", "high"), (review.ServedModel, review.ServedClass));
 
         // Both turns: one session, the high class, the placeholder model, never a pinned model, the tools offered.
@@ -193,7 +193,7 @@ public class ReviewerToolLoopTests
         var review = await Reviewer(router, Repo(new() { ["src/X.cs"] = XSource })).ReviewAsync(Request, CancellationToken.None);
 
         Assert.False(review.Clean);
-        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high"), new ServedTurn(2, "small-model", "low")], review.Turns!);
+        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high", StopReason: "tool_use", MaxOutputTokens: 8192), new ServedTurn(2, "small-model", "low", StopReason: "end_turn", MaxOutputTokens: 8192)], review.Turns!);
         Assert.Equal("low", review.ServedClass);
     }
 
@@ -437,7 +437,7 @@ public class ReviewerToolLoopTests
         Assert.Equal(Confirmation.Confirmed, confirmation.Outcome);
         Assert.Equal(ReviewTools.Sha256(XSource), Assert.Single(confirmation.Tools!).ResultSha256);
         Assert.Equal(Encoding.UTF8.GetByteCount(XSource), confirmation.Tools![0].Bytes);
-        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high"), new ServedTurn(2, "claude-opus-5-5", "high")], confirmation.Turns!);
+        Assert.Equal([new ServedTurn(1, "claude-opus-5-5", "high", StopReason: "tool_use", MaxOutputTokens: 8192), new ServedTurn(2, "claude-opus-5-5", "high", StopReason: "end_turn", MaxOutputTokens: 8192)], confirmation.Turns!);
         Assert.All(router.Requests, r => Assert.Equal(Confirm.Session, r.Headers[RouterReviewer.SessionHeader]));
     }
 

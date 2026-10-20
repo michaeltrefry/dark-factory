@@ -555,7 +555,9 @@ public sealed partial class RunPipeline
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
         var risky = policy.SecurityReviewReasons(policy.Classify(diff));
-        var roles = ReviewRoles.Required(risky.Count > 0);
+        var recovery = Recovery.Of(await ledger.HistoryAsync(run.Item, ct));
+        // An incomplete panel is not an approval. This boundary always starts all roles, security included.
+        var roles = ReviewRoles.Required(risky.Count > 0 || recovery?.Kind == "incomplete-review");
         var carried = previous is null ? []
             : changedBy is not { } change ? FixLoop.Carried(previous, roles)
             : CiHeal.Carried(previous, roles, policy, await Gate.GitHub.GetDiffAsync(run.Repo, change.From, change.To, ct));
@@ -578,7 +580,7 @@ public sealed partial class RunPipeline
             var prompt = ReviewPrompts.For(role);
             var session = await NameReviewSessionAsync(run, pull, role, prompt, ct);
             var review = await RouterCallAsync(() => Gate.Reviewer.ReviewAsync(
-                new ReviewRequest(story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay), ct), ct);
+                new ReviewRequest(story, run.Repo.FullName, pull, diff, files, role, prompt, session, overlay, recovery?.MaxOutputTokens), ct), ct);
             if (review.Clean)
             {
                 var findings = new List<Finding>();
@@ -1051,8 +1053,9 @@ public sealed partial class RunPipeline
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", prompt, ct);
         var story = await ReviewStoryAsync(run, ct);
+        var recovery = Recovery.Of(await ledger.HistoryAsync(run.Item, ct));
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
-            new ConfirmRequest(story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay), ct), ct);
+            new ConfirmRequest(story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay, recovery?.MaxOutputTokens), ct), ct);
         log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"})");
         return finding.ConfirmedBy(confirmation);
     }
