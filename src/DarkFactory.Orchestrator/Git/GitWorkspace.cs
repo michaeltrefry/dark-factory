@@ -1010,6 +1010,12 @@ public sealed class GitWorkspace(
     /// <summary>Deletes the directory, as the worker user first; false when that user is busy and <paramref name="waitForWorker"/> is false (nothing deleted).</summary>
     private async Task<bool> DeleteDirectoryAsync(string worktree, CancellationToken ct, bool waitForWorker = true)
     {
+        if (Gate.DirectTestProcess.Protected(worktree))
+        {
+            if (waitForWorker) throw Gate.DirectTestProcess.Unconfirmed(worktree);
+            Console.Error.WriteLine($"[cleanup] leaving {worktree}: a test process tree has not been confirmed stopped; protection marker {Gate.DirectTestProcess.Marker(worktree)} must be cleared by a human after checking its processes.");
+            return false;
+        }
         if (Directory.Exists(worktree))
         {
             if (sandbox is not null)

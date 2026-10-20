@@ -561,13 +561,13 @@ public static class NewTestsCheck
                 }
             }
             var judged = Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun);
-            results.Add(set.Notes.Count == 0 ? judged : judged with { Reason = $"{judged.Reason} ({string.Join("; ", set.Notes)})" });
+            results.Add(set.Notes.Count == 0 ? judged : judged with { Reason = SafeExcerpt($"{judged.Reason} ({string.Join("; ", set.Notes)})", 4000) });
         }
         return results.FirstOrDefault(r => !r.Passed) ?? results[0] with
         {
             Strategy = string.Join(", ", results.Select(r => r.Strategy)),
             Tests = results.SelectMany(r => r.Tests).ToList(),
-            Reason = string.Join("; ", results.Select(r => r.Reason)),
+            Reason = SafeExcerpt(string.Join("; ", results.Select(r => r.Reason)), 4000),
         };
     }
 
@@ -603,7 +603,7 @@ public static class NewTestsCheck
             : new NewTestResult(t, baseRun.Status == TestRunStatus.BuildFailed ? Unproven : Summary(baseRun, t), Summary(headRun, t), Cases(baseRun, t), Cases(headRun, t)))
             .ToList();
         NewTestsResult Result(string outcome, string reason) =>
-            new(baseSha, headSha, outcome, reason, strategy, Status(evidence.Run.Status), Status(headRun.Status), rows)
+            new(baseSha, headSha, outcome, SafeExcerpt(reason, 4000), strategy, Status(evidence.Run.Status), Status(headRun.Status), rows)
             {
                 BaseRetry = evidence.Retry is { } retry ? Status(retry.Status) : null,
                 BaseRemoved = evidence.Retry is null ? [] : evidence.First?.Removed ?? [],
@@ -629,7 +629,7 @@ public static class NewTestsCheck
         if (unattributable.Count > 0)
         {
             return Result(NewTestsOutcome.Error,
-                $"the base {b} does not build with the PR's test files for a reason that says nothing about the new tests (not a compiler error in those files): {string.Join("; ", unattributable.Take(10))}{BuildDiagnostics(baseRun)}");
+                $"the base {b} does not build with the PR's test files for a reason that says nothing about the new tests (not a compiler error in those files): {string.Join("; ", unattributable.Take(10).Select(e => SafeExcerpt(e, 300)))}{BuildDiagnostics(baseRun)}");
         }
 
         foreach (var (run, label) in new[] { (evidence.Run, $"the base {b}"), (evidence.Retry, $"the base retry {b}"), (headRun, $"the head {h}") })
@@ -656,7 +656,7 @@ public static class NewTestsCheck
             var why = (evidence.RetryFailure ?? evidence.First)!;
             var blocking = why.Unremovable.Concat(why.Removed).ToList();
             Name(rows.Where(r => r.Base == Unproven),
-                $"new test(s) could not be shown to fail on the base {b}: it does not build with the PR's test files for a reason outside their own declarations ({string.Join("; ", blocking.Take(10))})");
+                $"new test(s) could not be shown to fail on the base {b}: it does not build with the PR's test files for a reason outside their own declarations ({string.Join("; ", blocking.Take(10).Select(e => SafeExcerpt(e, 300)))})");
         }
         Name(rows.Where(r => r.Head != TestCaseResult.Passed).Select(r => r with { Test = $"{r.Test} ({r.Head})" }), $"new test(s) do not pass on the head {h}");
         if (reasons.Count > 0)
@@ -700,20 +700,19 @@ public static class NewTestsCheck
     /// No raw build log is persisted: at most three redacted, single-line, 300-character located diagnostics.</summary>
     private static string BuildDiagnostics(TestRunReport report)
     {
-        var diagnostics = report.BuildErrors.Where(e => e.Path is not null).Take(3).Select(e =>
-        {
-            var safe = new string(e.ToString().Where(c => !char.IsControl(c) && char.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.Format).ToArray());
-            safe = CiHeal.Redact(safe);
-            return safe.Length > 300 ? safe[..300] + "…" : safe;
-        }).ToList();
+        var diagnostics = report.BuildErrors.Where(e => e.Path is not null).Take(3).Select(e => SafeExcerpt(e.ToString(), 300)).ToList();
         return diagnostics.Count == 0 ? "" : "; compiler diagnostics: " + string.Join("; ", diagnostics);
     }
 
-    private static string Tail(string log)
+    /// <summary>The outgoing persistence boundary: normalize and redact BEFORE any clipping, never after a token was split.</summary>
+    private static string SafeExcerpt(string text, int limit, bool keepEnd = false)
     {
-        var text = log.Trim();
-        return text.Length <= 600 ? text : "…" + text[^600..];
+        var safe = new string(text.Where(c => !char.IsControl(c) && char.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.Format).ToArray());
+        safe = CiHeal.Redact(safe).Trim();
+        return safe.Length <= limit ? safe : keepEnd ? "…" + safe[^(limit - 1)..] : safe[..(limit - 1)] + "…";
     }
+
+    private static string Tail(string log) => SafeExcerpt(log, 600, keepEnd: true);
 
     private static readonly HashSet<string> CodeExtensions = new(StringComparer.OrdinalIgnoreCase)
     {

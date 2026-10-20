@@ -40,6 +40,22 @@ public class OwnProcessTests
     }
 
     [Fact]
+    public void Never_signals_a_group_whose_leaders_start_time_no_longer_matches()
+    {
+        var own = OwnProcess.StartDetached(_dir);
+        try
+        {
+            Reused(own).KillGroupIfStillLeading();
+            Thread.Sleep(200);
+            Assert.True(own.IsAlive);
+        }
+        finally
+        {
+            own.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
     public async Task Kills_its_own_process_while_the_start_time_matches()
     {
         var own = OwnProcess.StartDetached(_dir);

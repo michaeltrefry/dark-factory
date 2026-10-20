@@ -771,7 +771,7 @@ public class XcodeRunTests
             "Toolchain /usr/bin/xcodebuild -version",
             "Toolchain /usr/bin/xcrun --find xcresulttool",
             $"Restore {wrapper} clean-derived-data",
-            $"Build {wrapper} --gate build-for-testing -project App/Words.xcodeproj -scheme Words -destination platform=macOS -quiet",
+            $"Build {wrapper} --gate build-for-testing -project App/Words.xcodeproj -scheme Words -destination platform=macOS",
             $"Test {wrapper} --gate test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/blank() -resultBundlePath {bundle} -quiet",
             $"Test /usr/bin/xcrun xcresulttool get test-results tests --path {bundle}",
             $"Test {wrapper} --gate test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/Spaces/empty() -resultBundlePath .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")} -quiet",

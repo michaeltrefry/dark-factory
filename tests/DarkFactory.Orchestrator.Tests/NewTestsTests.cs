@@ -1101,6 +1101,126 @@ public class GateCloneTests : IDisposable
         Assert.True(result.Reason.Length < 1100);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Real_build_reports_redact_and_bound_every_outgoing_failure_excerpt(bool headFailure)
+    {
+        var (runner, sha) = await ShRunner();
+        const string secret = "private-signing-value";
+        var diagnostic = headFailure ? new string('x', 10000) + "\nerror: signing failed password=" + secret
+            : "error: signing failed password=" + secret + "; " + new string('x', 10000);
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c", "printf '%s\\n' \"$1\" >&2; exit 1", "sh", diagnostic])
+            { CaptureOutput = "build", CaptureBuildStderr = true };
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Contains(secret, Assert.Single(report.BuildErrors).Message); // raw evidence is transient, sanitization is at the result boundary
+        var explanation = new BuildFailure([], report.BuildErrors.Select(e => e.ToString()).ToList(), [], [], new Dictionary<string, string>());
+        var head = new TestRunReport(TestRunStatus.Ran, new Dictionary<string, IReadOnlyList<TestCaseResult>>(), "");
+        var result = NewTestsCheck.Judge("base", "head", "swift", ["T/test()"], new BaseEvidence(report, explanation), headFailure ? report : head);
+        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
+        Assert.DoesNotContain(secret, result.Reason);
+        Assert.DoesNotContain(secret, System.Text.Json.JsonSerializer.Serialize(result));
+        Assert.Contains("[redacted]", result.Reason);
+        Assert.True(result.Reason.Length <= 4000, $"durable reason is {result.Reason.Length} characters");
+        Assert.Contains("signing failed", result.Reason);
+    }
+
+    [Fact]
+    public async Task A_command_exiting_before_its_pipe_holding_child_still_stops_only_its_owned_group()
+    {
+        var (unused, sha) = await ShRunner();
+        var git = Workspace();
+        var record = Path.Combine(_root, "pipe-child");
+        var cleaned = Path.Combine(_root, "pipe-cleaned");
+        OwnProcess? child = null;
+        var unrelated = OwnProcess.StartDetached(_root);
+        var runner = new SandboxTestRunner(git, slots: null, TimeSpan.FromMilliseconds(500))
+        {
+            DirectStopForTest = p => { if (!p.HasExited) OwnProcess.Of(p).KillGroupIfStillLeading(); },
+        };
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c",
+            $"sleep 600 & child=$!; printf '%s\\n' {OwnProcess.ShellRecord("$child")} > '{record}'; exit 1"])
+            { CaptureOutput = "build", CaptureBuildStderr = true };
+        try
+        {
+            var running = runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [],
+                [step, new TestStep(TestPhase.Cleanup, "/bin/sh", ["-c", $"touch '{cleaned}'"])], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+            while (!File.Exists(record) && !running.IsCompleted) await Task.Delay(10);
+            child = OwnProcess.Parse(File.ReadAllText(record));
+            var report = await running.WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(TestRunStatus.TimedOut, report.Status);
+            await OwnProcess.WaitUntilDeadAsync(child);
+            Assert.True(unrelated.IsAlive);
+            Assert.True(File.Exists(cleaned));
+            Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+        }
+        finally
+        {
+            child?.KillIfStillRunning();
+            unrelated.KillIfStillRunning();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_termination_waiter_ignoring_cancellation_cannot_block_and_its_worktree_is_protected_from_every_cleanup(bool cancelled)
+    {
+        var (unused, sha) = await ShRunner();
+        var git = Workspace();
+        var cleaned = Path.Combine(_root, "retained-cleaned");
+        var held = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        OwnProcess? own = null;
+        Task<TestRunReport>? running = null;
+        using var cancellation = new CancellationTokenSource();
+        if (cancelled) cancellation.CancelAfter(TimeSpan.FromMilliseconds(300));
+        var runner = new SandboxTestRunner(git, slots: null, cancelled ? TimeSpan.FromMinutes(1) : TimeSpan.FromMilliseconds(300))
+        {
+            DirectStopGrace = TimeSpan.FromMilliseconds(100),
+            DirectStopForTest = p => { own = OwnProcess.Of(p); own.KillGroupIfStillLeading(); },
+            DirectWaitForTest = (_, _) => held.Task,
+        };
+        try
+        {
+            running = runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [],
+                [new TestStep(TestPhase.Build, "/bin/sh", ["-c", "sleep 600"]),
+                 new TestStep(TestPhase.Cleanup, "/bin/sh", ["-c", $"touch '{cleaned}'"])], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), cancellation.Token);
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => running.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.True(DarkFactory.Orchestrator.Worker.WorkerStillRunning.IsMarked(error));
+            var path = Assert.Single(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+            Assert.True(File.Exists(DirectTestProcess.Marker(path)));
+            Assert.False(File.Exists(cleaned));
+            var fresh = Workspace(); // a new factory/workspace sees the durable marker too, with no process-local registry
+            await Assert.ThrowsAsync<InvalidOperationException>(() => fresh.RemoveAsync(Repo, new Workspace(path, "gate-sc-1-base", "main", ""), CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => fresh.PrepareCommitAsync(Repo, "gate-sc-1-base", sha, CancellationToken.None));
+            await fresh.SweepOrphansAsync((_, _) => Task.FromResult(false), LiveRuns.None, CancellationToken.None);
+            Assert.True(Directory.Exists(path));
+            Assert.False(File.Exists(cleaned));
+        }
+        finally
+        {
+            held.TrySetResult(); // release a mutated unbounded waiter too; no detached background test task
+            if (running is not null) { try { await running; } catch (Exception) { } }
+            own?.KillIfStillRunning();
+        }
+    }
+
+    [Fact]
+    public async Task Verbose_xcode_build_keeps_seven_stderr_helper_errors_without_inventing_a_linker_error()
+    {
+        var (runner, sha) = await ShRunner();
+        var root = Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name, "gate-sc-1-base");
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c", "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit 65", "sh",
+            XcodeBuildDiagnosticShape.Stdout(root), XcodeBuildDiagnosticShape.Stderr(root)]) { CaptureOutput = "build", CaptureBuildStderr = true };
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new XcodeNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Equal(TestRunStatus.BuildFailed, report.Status);
+        Assert.Equal(7, report.BuildErrors.Count);
+        Assert.Contains("→ exit 65", report.Log);
+        Assert.All(report.BuildErrors, e => Assert.Equal(XcodeBuildDiagnosticShape.Path, e.Path));
+        Assert.Contains(report.BuildErrors, e => e.Line == 90 && e.Message.Contains("PhotoLibrarySaving"));
+        Assert.Contains(report.BuildErrors, e => e.Line == 115 && e.Message.Contains("SaveResult"));
+    }
+
     /// <summary>A shell step that writes each (path, content) under the results directory (contents passed as arguments).</summary>
     private static TestStep Writes(string results, params (string Path, string Content)[] files) =>
         new(TestPhase.Test, "/bin/sh", ["-c", string.Join(" && ", files.Select((f, i) =>

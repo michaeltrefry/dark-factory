@@ -29,6 +29,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     /// <summary>How long a stopped run gets to exit after its helper's stdin closes.</summary>
     private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(10);
 
+    internal TimeSpan DirectStopGrace { get; init; } = StopGrace;
+    internal Action<Process>? DirectStopForTest { get; init; }
+    internal Func<Process, CancellationToken, Task>? DirectWaitForTest { get; init; }
+
+
     /// <summary>The largest result file or build log read (a larger result file makes the run's report unreadable).</summary>
     public const long MaxResultFileBytes = 50 * 1024 * 1024;
 
@@ -58,19 +63,28 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         }
         var workspace = await git.PrepareCommitAsync(repo, spec.Name, spec.Commit, ct);
         var cleaned = false;
+        var retain = false;
         try
         {
             var report = await RunInWorktreeAsync(workspace, spec, ct);
             cleaned = true;
             return await CleanUpAsync(workspace.Path, spec) is { Length: > 0 } cleanup ? report with { Log = report.Log + cleanup } : report;
         }
+        catch (Exception ex) when (WorkerStillRunning.IsMarked(ex))
+        {
+            retain = true;
+            throw;
+        }
         finally
         {
-            if (!cleaned)
+            if (!retain && !DirectTestProcess.Protected(workspace.Path))
             {
-                await CleanUpAsync(workspace.Path, spec); // a timed-out, failed or cancelled run is cleaned up too
+                if (!cleaned)
+                {
+                    await CleanUpAsync(workspace.Path, spec); // only after termination was confirmed
+                }
+                if (!DirectTestProcess.Protected(workspace.Path)) await git.RemoveAsync(repo, workspace, CancellationToken.None);
             }
-            await git.RemoveAsync(repo, workspace, CancellationToken.None);
         }
     }
 
@@ -79,19 +93,21 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
 
     /// <summary>
     /// The run's <see cref="TestPhase.Cleanup"/> steps, each bounded by <see cref="CleanupTimeout"/> and on no cancellation
-    /// token, whatever happened before; their log (empty when there are none). Never throws: a failed clean-up decides nothing.
+    /// token, whatever happened before; their log (empty when there are none). Ordinary cleanup failures decide nothing,
+    /// but unconfirmed process termination propagates: neither another cleanup command nor deletion may run beneath it.
     /// </summary>
     private async Task<string> CleanUpAsync(string worktree, TestRunSpec spec)
     {
         var log = new StringBuilder();
         foreach (var step in spec.Steps.Where(s => s.Phase == TestPhase.Cleanup))
         {
+            if (DirectTestProcess.Protected(worktree)) break;
             try
             {
                 var (exit, output, timedOut, _) = await RunStepAsync(worktree, step, CleanupTimeout, CancellationToken.None);
                 log.AppendLine($"$ {Describe(step)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
             }
-            catch (Exception e) when (e is not OutOfMemoryException)
+            catch (Exception e) when (e is not OutOfMemoryException && !WorkerStillRunning.IsMarked(e))
             {
                 log.AppendLine($"$ {Describe(step)} → could not be run: {e.Message}");
             }
@@ -259,21 +275,30 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         Process started;
         try
         {
-            started = Sandbox is null ? StartDirect(directory, step) : Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
+            started = Sandbox is null ? StartDirect(directory, step, worktree) : Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
         }
         catch (System.ComponentModel.Win32Exception e) when (Sandbox is null)
         {
             // Unsandboxed, a program that is not installed fails at start; sandboxed, the helper exits 127 for it.
             return (127, $"{step.Program} could not be started: {e.Message}", false, null);
         }
+        var stopped = false;
         try
         {
-            return await RunStartedAsync(started, step, remaining, ct);
+            var result = await RunStartedAsync(started, step, remaining, worktree, ct);
+            stopped = true;
+            return result;
+        }
+        catch (OperationCanceledException ex) when (!WorkerStillRunning.IsMarked(ex))
+        {
+            stopped = true;
+            throw;
         }
         finally
         {
             if (Sandbox is null)
             {
+                if (stopped) File.Delete(DirectTestProcess.Marker(worktree));
                 started.Dispose();
             }
             else
@@ -285,36 +310,47 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         }
     }
 
-    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStartedAsync(Process process, TestStep step, TimeSpan remaining, CancellationToken ct)
+    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStartedAsync(Process process, TestStep step, TimeSpan remaining, string worktree, CancellationToken ct)
     {
         var output = new Tail();
         var capture = step.CaptureOutput is null ? null : new Capture(maxResultFileBytes);
         var errors = step.Phase == TestPhase.Build && step.CaptureBuildStderr && capture is not null ? new Capture(maxResultFileBytes) : null;
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
         bounded.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
-        var stdout = PumpAsync(process.StandardOutput, output, capture, bounded.Token);
-        var stderr = PumpAsync(process.StandardError, output, errors, bounded.Token);
+        using var drainCancellation = new CancellationTokenSource();
+        var stdout = PumpAsync(process.StandardOutput, output, capture, drainCancellation.Token);
+        var stderr = PumpAsync(process.StandardError, output, errors, drainCancellation.Token);
+        var drains = Task.WhenAll(stdout, stderr);
         try
         {
             await process.WaitForExitAsync(bounded.Token);
-            await Task.WhenAll(stdout, stderr);
+            await drains.WaitAsync(bounded.Token);
+            if (Sandbox is null) await DirectTestProcess.WaitStoppedAsync(process, bounded.Token);
         }
         catch (OperationCanceledException)
         {
-            await StopAsync(process);
-            // Both drains are bounded too: a child retaining a pipe must not hold the run or its slot forever.
-            bounded.Cancel();
-            try { await Task.WhenAll(stdout, stderr); }
-            catch (OperationCanceledException) { }
+            var stopped = await StopAsync(process);
+            if (Sandbox is null)
+            {
+                // A retained pipe can belong to an escaped descendant even after the original leader died. Neither that
+                // pid nor a group number alone authorizes a late signal. Keep the worktree if all pipe holders cannot exit.
+                try { await drains.WaitAsync(DirectStopGrace); }
+                catch (TimeoutException) { stopped = false; }
+                if (!stopped) throw DirectTestProcess.Unconfirmed(worktree);
+            }
             ct.ThrowIfCancellationRequested();
             return (-1, output.ToString(), true, null);
         }
         finally
         {
+            drainCancellation.Cancel();
             if (Sandbox is not null)
             {
-                WorkerSandbox.Stop(process); // the helper then kills whatever the step left running
+                WorkerSandbox.Stop(process); // always stop the helper, even if a drain cannot finish
             }
+            try { await drains.WaitAsync(Sandbox is null ? DirectStopGrace : StopGrace); }
+            catch (OperationCanceledException) { }
+            catch (TimeoutException) { throw DirectTestProcess.Unconfirmed(worktree); }
         }
         var captured = capture?.Text;
         if (errors is not null)
@@ -357,21 +393,26 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         }
     }
 
-    private async Task StopAsync(Process process)
+    private async Task<bool> StopAsync(Process process)
     {
         if (Sandbox is null)
         {
-            if (!process.HasExited)
+            (DirectStopForTest ?? DirectTestProcess.Stop)(process);
+            using var grace = new CancellationTokenSource(DirectStopGrace);
+            try
             {
-                process.Kill(entireProcessTree: true);
-                await process.WaitForExitAsync(CancellationToken.None);
+                // WaitAsync is intentional even if an injected/platform waiter ignores cancellation.
+                await (DirectWaitForTest ?? DirectTestProcess.WaitStoppedAsync)(process, grace.Token).WaitAsync(DirectStopGrace);
+                return true;
             }
-            return;
+            catch (Exception e) when (e is OperationCanceledException or TimeoutException)
+            {
+                return false;
+            }
         }
         WorkerSandbox.Stop(process);
-        // If it is still running as the worker user after the grace: the next helper exit (the worktree's deletion, under the same
-        // hold of the lock) kills it, and until it is gone the lock is kept (WorkerSandbox.EndAsync).
-        await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
+        // An unresponsive helper keeps its slot lock through WorkerSandbox.EndAsync, as before.
+        return await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
     }
 
     private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null, CancellationToken ct = default)
@@ -427,16 +468,23 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     /// <summary>The variables an unsandboxed run keeps from the owner's environment (no secrets: never the router key or a token).</summary>
     private static readonly string[] PassThrough = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "DOTNET_ROOT"];
 
-    private static Process StartDirect(string worktree, TestStep step)
+    private static Process StartDirect(string directory, TestStep step, string worktree)
     {
-        var psi = new ProcessStartInfo(step.Program)
+        File.WriteAllText(DirectTestProcess.Marker(worktree), $"Test command: {Path.GetFileName(step.Program)}; termination not yet confirmed.\n");
+        var grouped = !OperatingSystem.IsWindows();
+        var psi = grouped ? new ProcessStartInfo(DirectTestProcess.Launcher) : new ProcessStartInfo(step.Program);
+        psi.WorkingDirectory = directory;
+        psi.RedirectStandardInput = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.UseShellExecute = false;
+        if (grouped)
         {
-            WorkingDirectory = worktree,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add(DirectTestProcess.Supervisor);
+            psi.ArgumentList.Add("--");
+            psi.ArgumentList.Add(step.Program);
+        }
         foreach (var arg in step.Args)
         {
             psi.ArgumentList.Add(arg);
@@ -453,7 +501,17 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         // As the helper sets them: no build server or node outlives the run.
         psi.Environment["MSBUILDDISABLENODEREUSE"] = "1";
         psi.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
-        var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {step.Program}.");
+        Process process;
+        try
+        {
+            process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {step.Program}.");
+        }
+        catch
+        {
+            File.Delete(DirectTestProcess.Marker(worktree));
+            throw;
+        }
+        File.AppendAllText(DirectTestProcess.Marker(worktree), $"Owned supervisor pid: {process.Id}.\n");
         process.StandardInput.Close();
         return process;
     }
