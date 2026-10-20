@@ -81,9 +81,9 @@ internal static class IncompleteReviewEvidence
                 // Typed records must agree with their actual turn stop, budget, and deterministic error. Legacy is exact,
                 // never a substring (nor a user-supplied reason). A mixed typed/legacy role is not a historical record.
                 Check(review.Findings!.Count == 0);
-                Check(legacy ? review.Error == LegacyTruncation
-                    : review.Failure == ReviewFailure.OutputTruncated && turns[^1].StopReason == "max_tokens"
-                        && review.Error == (turns.Count > RouterReviewer.MaxTurns ? "No usable final answer after the turn cap: " : "") + LegacyTruncation);
+                var expectedError = (turns.Count > RouterReviewer.MaxTurns ? "No usable final answer after the turn cap: " : "") + LegacyTruncation;
+                Check(review.Error == expectedError && (legacy
+                    || review.Failure == ReviewFailure.OutputTruncated && turns[^1].StopReason == "max_tokens"));
                 truncated = true;
             }
         }

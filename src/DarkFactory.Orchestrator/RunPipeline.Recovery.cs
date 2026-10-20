@@ -115,7 +115,8 @@ public sealed partial class RunPipeline
                         ?? throw new InvalidOperationException("the current base has no gate policy");
                     var policy = GatePolicy.Parse(policyText);
                     var diff = await Gate.GitHub.GetDiffAsync(repo, pull.BaseSha, head, ct);
-                    var required = ReviewRoles.Required(policy.SecurityReviewReasons(policy.Classify(diff)).Count > 0);
+                    var required = ReviewRoles.Required(policy.SecurityReviewReasons(policy.Classify(diff)).Count > 0
+                        || Recovery.Of(history)?.Kind == "incomplete-review");
                     var proof = IncompleteReviewEvidence.Require(history, head, url, required);
                     Require(Gate.Reviewer.MaxOutputTokens > 0, "Review:MaxOutputTokens must be positive");
                     recovery = recovery with { Kind = "incomplete-review", SourceVerdictId = proof.VerdictId,

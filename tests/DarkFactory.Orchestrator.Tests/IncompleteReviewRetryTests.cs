@@ -15,6 +15,7 @@ public class IncompleteReviewRetryTests
     private sealed class TruncatedPanel(bool legacy = false) : IReviewer
     {
         public bool Truncate { get; set; } = true;
+        public int TurnCount { get; set; } = 1;
         public int MaxOutputTokens { get; set; } = 24576;
         public List<ReviewRequest> Requests { get; } = [];
         public Task<RoleReview> ReviewAsync(ReviewRequest r, CancellationToken ct)
@@ -23,19 +24,22 @@ public class IncompleteReviewRetryTests
             var stop = Truncate && r.Role != ReviewRoles.Security ? "max_tokens" : "end_turn";
             var review = RouterReviewer.InterpretReview(r.Role, "router-selected", "high", stop, "{\"findings\":[]}")
                 with { Session = r.Session, Prompt = r.Prompt.Id,
-                    Turns = [new ServedTurn(1, "router-selected", "high", StopReason: legacy ? null : stop,
-                        MaxOutputTokens: legacy ? null : r.MaxOutputTokens ?? MaxOutputTokens)] };
+                    Turns = Enumerable.Range(1, TurnCount).Select(n => new ServedTurn(n, "router-selected", "high",
+                        StopReason: legacy ? null : n == TurnCount ? stop : "tool_use",
+                        MaxOutputTokens: legacy ? null : r.MaxOutputTokens ?? MaxOutputTokens)).ToList() };
+            if (TurnCount > RouterReviewer.MaxTurns && review.Error is not null)
+                review = review with { Error = "No usable final answer after the turn cap: " + review.Error };
             if (legacy) review = review with { Failure = null };
             return Task.FromResult(review);
         }
         public Task<Confirmation> ConfirmAsync(ConfirmRequest r, CancellationToken ct) => throw new InvalidOperationException("No finding to confirm");
     }
 
-    private static async Task<(Harness H, TruncatedPanel Panel)> Failed(bool legacy = false)
+    private static async Task<(Harness H, TruncatedPanel Panel)> Failed(bool legacy = false, bool security = true, int turns = 1)
     {
-        var panel = new TruncatedPanel(legacy);
+        var panel = new TruncatedPanel(legacy) { TurnCount = turns };
         var h = new Harness { Panel = panel };
-        h.GitHub.PolicyText = Support.TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base");
+        if (security) h.GitHub.PolicyText = Support.TestPolicies.Standard(normalChecks: "ci-green, review-pass, security-review, risk-threshold, new-tests-fail-on-base");
         Assert.Equal(WorkState.Escalated, (await h.Run()).State);
         return (h, panel);
     }
@@ -299,6 +303,80 @@ public class IncompleteReviewRetryTests
         Assert.Equal(sessions, panel.Requests.Count);
         Assert.Empty(h.Merges);
         Assert.Single((await h.Rows()), r => r.State == WorkState.Recovering && r.Step is null);
+    }
+
+    [Fact]
+    public async Task Non_risky_two_role_failure_can_explicitly_retry_a_second_three_role_truncation()
+    {
+        var (h, _) = await Failed(security: false);
+        Assert.Equal(2, RunPipeline.Verdicts(await h.Rows()).Single().Reviews.Count);
+        var first = await h.Pipeline().RecoverAsync(77, h.GitHub.Head, "owner", default, "main", retryIncompleteReview: true);
+        Assert.DoesNotContain("Recovery refused", first.Error ?? "");
+        Assert.Equal(3, RunPipeline.Verdicts(await h.Rows()).Single().Reviews.Count);
+        var second = await h.Pipeline().RecoverAsync(77, h.GitHub.Head, "owner", default, "main", retryIncompleteReview: true);
+        Assert.DoesNotContain("Recovery refused", second.Error ?? "");
+        Assert.Equal(2, (await h.Rows()).Count(r => r.State == WorkState.Recovering && r.Step is null));
+    }
+
+    [Theory]
+    [InlineData(9, true, true)]
+    [InlineData(9, false, false)]
+    [InlineData(1, true, false)]
+    public async Task Historical_final_turn_error_is_reconstructed_exactly_from_turn_count(int turns, bool prefix, bool admitted)
+    {
+        var (h, panel) = await Failed(legacy: true, turns: turns);
+        var rows = await h.Rows();
+        var vrow = rows.Last(r => r.Step == RunPipeline.Steps.Verdict);
+        var v = ReviewVerdict.FromDetail(vrow.Detail)!;
+        var reviews = v.Reviews.Select(r => r.Error is null ? r : r with
+            { Error = (prefix ? "No usable final answer after the turn cap: " : "") + IncompleteReviewEvidence.LegacyTruncation }).ToList();
+        v = ReviewPanel.Decide(v.HeadSha, v.RiskyPaths, reviews);
+        vrow.Detail = v.ToDetail();
+        rows.Last(r => r.Step is null && r.State == WorkState.Escalated).Detail = $"ReviewFailedException: The review panel failed {PrUrl} at {Ci.Short(v.HeadSha)}: {v.Summary}";
+        await h.Db.SaveChangesAsync();
+        panel.Truncate = false;
+        var result = await h.Pipeline().RecoverAsync(77, h.GitHub.Head, "owner", default, "main", retryIncompleteReview: true);
+        Assert.Equal(admitted, !(result.Error ?? "").StartsWith("Recovery refused:", StringComparison.Ordinal));
+        Assert.Equal(admitted ? 1 : 0, (await h.Rows()).Count(r => r.State == WorkState.Recovering && r.Step is null));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sanitized_actual_canary_panel_and_checkpoints_require_exact_linkage(bool corruptSession)
+    {
+        using var fixture = JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory,
+            "Fixtures", "reviews", "sc-26252-incomplete-panel.json")));
+        var root = fixture.RootElement;
+        var detail = root.GetProperty("verdict").GetRawText();
+        var v = ReviewVerdict.FromDetail(detail)!;
+        Assert.Equal(8192, root.GetProperty("historicalMaxOutputTokens").GetInt32());
+        Assert.Equal(new[] { 6, 5, 1 }, v.Reviews.Select(r => r.Turns!.Count));
+        Assert.Equal(new[] { 21, 9, 0 }, v.Reviews.Select(r => r.Tools!.Count));
+        Assert.All(v.Reviews, r => Assert.Null(r.Failure));
+        Assert.All(v.Reviews.SelectMany(r => r.Turns!), t => { Assert.Null(t.StopReason); Assert.Null(t.MaxOutputTokens); });
+        var sessions = root.GetProperty("sessions").EnumerateArray().Select(s => s.GetString()!).ToList();
+        if (corruptSession) sessions[0] += " incorrect";
+        // Only admission's structured evidence context is replayed; no worker-session bodies or operational calls.
+        var rows = new List<LedgerEntry>
+        {
+            new() { Id = 1000, State = WorkState.Implement, Outcome = StepOutcome.Passed },
+            new() { Id = 1071, State = WorkState.Review, Detail = "https://github.com/SceneWorks/SceneWorks-mobile/pull/7", Outcome = StepOutcome.Passed },
+        };
+        rows.AddRange(sessions.Select((session, i) => new LedgerEntry { Id = 1076 + i, State = WorkState.Review,
+            Step = RunPipeline.Steps.ReviewSession, Detail = session, Outcome = StepOutcome.Passed }));
+        rows.Add(new() { Id = root.GetProperty("verdictId").GetInt64(), State = WorkState.Review,
+            Step = RunPipeline.Steps.Verdict, Detail = detail, Outcome = StepOutcome.Failed });
+        rows.Add(new() { Id = root.GetProperty("escalationId").GetInt64(), State = WorkState.Escalated,
+            Detail = root.GetProperty("escalation").GetString(), Outcome = StepOutcome.Escalated });
+        if (corruptSession)
+            Assert.Throws<InvalidOperationException>(() => IncompleteReviewEvidence.Require(rows, v.HeadSha, "https://github.com/SceneWorks/SceneWorks-mobile/pull/7", ReviewRoles.All));
+        else
+        {
+            var proof = IncompleteReviewEvidence.Require(rows, v.HeadSha, "https://github.com/SceneWorks/SceneWorks-mobile/pull/7", ReviewRoles.All);
+            Assert.Equal(1079, proof.VerdictId);
+            Assert.Equal(1080, proof.EscalationId);
+        }
     }
 
 }

@@ -1,0 +1,346 @@
+{
+  "verdict": {
+    "sha": "b24fa4442a672157dada698dce04e8661d94bb3d",
+    "risky": [
+      "SceneWorksMobile.xcodeproj/project.pbxproj (protected)"
+    ],
+    "reviews": [
+      {
+        "role": "correctness",
+        "class": "high",
+        "error": "The answer ended early (max_tokens).",
+        "tools": [
+          {
+            "tool": "read_file",
+            "bytes": 5018,
+            "error": false,
+            "sha256": "38f8599df911ecfa5c532f7fddd4b6ef9b23e023b27259915d795563ede3c73b",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 2909,
+            "error": false,
+            "sha256": "052adbdbb308a30ba59765f44c0b0a8243e2b70c58d19106187197559b26da44",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 6147,
+            "error": false,
+            "sha256": "10316f9d4ae0a336294a2e74a80b641ba721397e05d9b13eeeba3e2341acf5b6",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3138,
+            "error": false,
+            "sha256": "9aad21bcdf85c6066c8ce01e79bf2b1937ffff9f63bc2bb22988148260ed27ae",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3236,
+            "error": false,
+            "sha256": "4ee3015ab7121b369c9eb86fdc91e799873c528b407647e7dfde2c9741d1ecef",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3018,
+            "error": false,
+            "sha256": "2bf853d5473151fa36a4e5ccf26a6d1284e42fdab61c8830387344ef95c72c16",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 700,
+            "error": false,
+            "sha256": "fd953ade39dff54b1cbbc14d0870961419561e82f7884d6c995e15f9725cf84a",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 2063,
+            "error": false,
+            "sha256": "1b462af3cb92b0642596ee5a7e25561a1f325137617d4f7bea3fe7db7fc4fd4f",
+            "arguments": "{}"
+          },
+          {
+            "tool": "grep",
+            "bytes": 177,
+            "error": false,
+            "sha256": "41f9f5ef7698ab439e9c0682d8a5ea97fc13b2b56e96f77881ee04f08583237a",
+            "arguments": "{}"
+          },
+          {
+            "tool": "grep",
+            "bytes": 874,
+            "error": false,
+            "sha256": "3cfd9898e21edf9ae5505849fc4802b441ca343a1e98773892b62391c3d3c929",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 10327,
+            "error": false,
+            "sha256": "63bb9301f9e6c79e053273fd14920f8cc346fdcdcbaf74ec580bc8757763ebd7",
+            "arguments": "{}"
+          },
+          {
+            "tool": "grep",
+            "bytes": 477,
+            "error": false,
+            "sha256": "a5dfe4f43dd9d4b94dff4eebca079234aa1151f7e45e085fecd78a1b844207bc",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 1439,
+            "error": false,
+            "sha256": "2b9b3c018a92bfc70ab70126ee06eefa2b9102255de10a036e4f9ec71f178a0b",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 2713,
+            "error": false,
+            "sha256": "d9c0e8ef7443f337c6d1deb4ece0c2c019f2ace555d8302bfcfa20e05cc8ce0f",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3426,
+            "error": false,
+            "sha256": "d2b3c4ffa8eae8ec8d55c2ceb93b042608ccf9121a960bf3d59a0f5453bb9f10",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 5691,
+            "error": false,
+            "sha256": "3b1df5be48712f18cce20a0e24115ebb589f75d77ba2bb2a599739873ba7ef26",
+            "arguments": "{}"
+          },
+          {
+            "tool": "analyze_impact",
+            "bytes": 482,
+            "error": false,
+            "commit": "b24fa4442a672157dada698dce04e8661d94bb3d",
+            "sha256": "d206892c913ae80cce367526346d6e1ed6749c874c119297f39592bf2a666dc8",
+            "arguments": "{}"
+          },
+          {
+            "tool": "analyze_impact",
+            "bytes": 484,
+            "error": false,
+            "commit": "b24fa4442a672157dada698dce04e8661d94bb3d",
+            "sha256": "0901b0bdf694d1c38e3c54d2802e25bda9b2ffd57d83e633e0fe5edc29ba6a23",
+            "arguments": "{}"
+          },
+          {
+            "tool": "analyze_impact",
+            "bytes": 493,
+            "error": false,
+            "commit": "b24fa4442a672157dada698dce04e8661d94bb3d",
+            "sha256": "8d66c5441088fe17f7298d10261017ebc6d907999edb7c31126f667700e3deac",
+            "arguments": "{}"
+          },
+          {
+            "tool": "search_graph",
+            "bytes": 632,
+            "error": false,
+            "commit": "b24fa4442a672157dada698dce04e8661d94bb3d",
+            "sha256": "a973ed50715d6e157b3beb3499d6b5d03d857c44c7f26de1488eabb9935c8340",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 15992,
+            "error": false,
+            "sha256": "b1a7b688131d995729c2e8cfd69fd5a783954600b924610f3ed698045274219f",
+            "arguments": "{}"
+          }
+        ],
+        "turns": [
+          {
+            "turn": 1,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 2,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 3,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 4,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 5,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 6,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          }
+        ],
+        "prompt": "factory/prompts/correctness.md@sha256:1be1b220c7410517ab9a2f7c5ea4676aaed4760763fa8e8ee6bde09958daf8ec",
+        "served": "openrouter-auto-beta",
+        "carried": null,
+        "session": "2d777159-3b36-4436-8397-f49835abc4bf",
+        "summary": "",
+        "findings": []
+      },
+      {
+        "role": "spec-conformance",
+        "class": "high",
+        "error": "The answer ended early (max_tokens).",
+        "tools": [
+          {
+            "tool": "read_file",
+            "bytes": 99,
+            "error": true,
+            "sha256": "265a300eb543a8c1d635d114fd3a1e11bbc5bd5cff959fcd9ad9f932dc9dfdc6",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 6147,
+            "error": false,
+            "sha256": "10316f9d4ae0a336294a2e74a80b641ba721397e05d9b13eeeba3e2341acf5b6",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 5018,
+            "error": false,
+            "sha256": "38f8599df911ecfa5c532f7fddd4b6ef9b23e023b27259915d795563ede3c73b",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 2909,
+            "error": false,
+            "sha256": "052adbdbb308a30ba59765f44c0b0a8243e2b70c58d19106187197559b26da44",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3138,
+            "error": false,
+            "sha256": "9aad21bcdf85c6066c8ce01e79bf2b1937ffff9f63bc2bb22988148260ed27ae",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3236,
+            "error": false,
+            "sha256": "4ee3015ab7121b369c9eb86fdc91e799873c528b407647e7dfde2c9741d1ecef",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 700,
+            "error": false,
+            "sha256": "fd953ade39dff54b1cbbc14d0870961419561e82f7884d6c995e15f9725cf84a",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 3271,
+            "error": false,
+            "sha256": "2a2156b739105ca8b9edb8a42a6170feb25178dba3c3555467bb05accc1d95af",
+            "arguments": "{}"
+          },
+          {
+            "tool": "read_file",
+            "bytes": 2400,
+            "error": false,
+            "sha256": "971d055e9f9486678e567a7184ec8ca2f45e6c896a4eb039cbf3a07d2142e54a",
+            "arguments": "{}"
+          }
+        ],
+        "turns": [
+          {
+            "turn": 1,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 2,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 3,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 4,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          },
+          {
+            "turn": 5,
+            "class": "high",
+            "served": "openrouter-auto-beta"
+          }
+        ],
+        "prompt": "factory/prompts/spec-conformance.md@sha256:387684883955e102feaac96d52429877408a14f2be9dcb83ad77e4ea965280b3",
+        "served": "openrouter-auto-beta",
+        "carried": null,
+        "session": "fc4b77ed-a95e-44e3-a00d-0c14333858ce",
+        "summary": "",
+        "findings": []
+      },
+      {
+        "role": "security",
+        "class": "high",
+        "error": null,
+        "tools": [],
+        "turns": [
+          {
+            "turn": 1,
+            "class": "high",
+            "served": "claude-opus-5-5"
+          }
+        ],
+        "prompt": "factory/prompts/security.md@sha256:f9f27ba475f08b013f4b0c9774db3a76d9564ee86126a9983d5655601079f92d",
+        "served": "claude-opus-5-5",
+        "carried": null,
+        "session": "f36d32c2-7c54-4ee1-a70e-955172f0b612",
+        "summary": "",
+        "findings": []
+      }
+    ],
+    "summary": "correctness (openrouter-auto-beta): The answer ended early (max_tokens).; spec-conformance (openrouter-auto-beta): The answer ended early (max_tokens).",
+    "verdict": "fail",
+    "codegraph": {
+      "base": "6d90ba71ee96278db90ebe2ec55552620e6540ee",
+      "head": "b24fa4442a672157dada698dce04e8661d94bb3d",
+      "outcome": "ready",
+      "overlay": 106
+    }
+  },
+  "sessions": [
+    "2d777159-3b36-4436-8397-f49835abc4bf high b24fa4442a672157dada698dce04e8661d94bb3d correctness factory/prompts/correctness.md@sha256:1be1b220c7410517ab9a2f7c5ea4676aaed4760763fa8e8ee6bde09958daf8ec",
+    "fc4b77ed-a95e-44e3-a00d-0c14333858ce high b24fa4442a672157dada698dce04e8661d94bb3d spec-conformance factory/prompts/spec-conformance.md@sha256:387684883955e102feaac96d52429877408a14f2be9dcb83ad77e4ea965280b3",
+    "f36d32c2-7c54-4ee1-a70e-955172f0b612 high b24fa4442a672157dada698dce04e8661d94bb3d security factory/prompts/security.md@sha256:f9f27ba475f08b013f4b0c9774db3a76d9564ee86126a9983d5655601079f92d"
+  ],
+  "verdictId": 1079,
+  "escalation": "ReviewFailedException: The review panel failed https://github.com/SceneWorks/SceneWorks-mobile/pull/7 at b24fa4442a67: correctness (openrouter-auto-beta): The answer ended early (max_tokens).; spec-conformance (openrouter-auto-beta): The answer ended early (max_tokens).",
+  "provenance": "Sanitized structured canary verdict 1079 and linked escalation 1080; tool arguments removed and role summaries emptied. No worker-session bodies.",
+  "escalationId": 1080,
+  "historicalMaxOutputTokens": 8192
+}
