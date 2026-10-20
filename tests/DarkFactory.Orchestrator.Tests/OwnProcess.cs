@@ -136,6 +136,16 @@ internal sealed record OwnProcess(int Pid, string Start)
         }
     }
 
+    /// <summary>The fresh group of this test's still-live, recorded leader only. Never a group inferred from a dead pid.</summary>
+    public void KillGroupIfStillLeading()
+    {
+        if (!IsAlive) return;
+        using var ps = Process.Start(new ProcessStartInfo("/bin/ps", ["-o", "pgid=", "-p", Pid.ToString()]) { RedirectStandardOutput = true })!;
+        var text = ps.StandardOutput.ReadToEnd();
+        ps.WaitForExit();
+        if (int.TryParse(text.Trim(), out var group) && group == Pid && IsAlive) SendSignal(-Pid, SigKill);
+    }
+
     /// <summary>
     /// Asserts every process dies within 5 s. Only those still alive (same start time) at the deadline are killed, so a
     /// failure leaks nothing; one confirmed dead is never signalled.

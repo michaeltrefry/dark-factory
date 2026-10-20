@@ -135,7 +135,7 @@ public class XcodeIosTests
             "Toolchain /usr/bin/xcrun --find xcresulttool",
             $"Restore {wrapper} clean-derived-data",
             $"Restore /bin/bash -c {script} factory-ios-simulator prepare {device} .factory-test-results-x",
-            $"Build {wrapper} --gate build-for-testing -project Tally.xcodeproj -scheme Tally -destination platform=iOS Simulator,name={device} -quiet",
+            $"Build {wrapper} --gate build-for-testing -project Tally.xcodeproj -scheme Tally -destination platform=iOS Simulator,name={device}",
             $"Test /bin/bash -c {script} factory-ios-simulator session {device} .factory-test-results-x {wrapper} 720 "
                 + $"-project Tally.xcodeproj Tally {XcodeIosFixture.UnitTestId} {Hash(XcodeIosFixture.UnitTestId)} -project Tally.xcodeproj Tally {XcodeIosFixture.UiTestId} {Hash(XcodeIosFixture.UiTestId)}",
             $"Cleanup /bin/bash -c {script} factory-ios-simulator remove {device}",

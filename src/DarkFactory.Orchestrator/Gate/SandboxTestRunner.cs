@@ -29,6 +29,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     /// <summary>How long a stopped run gets to exit after its helper's stdin closes.</summary>
     private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(10);
 
+    internal TimeSpan DirectStopGrace { get; init; } = StopGrace;
+    internal Action<Process>? DirectStopForTest { get; init; }
+    internal Func<Process, CancellationToken, Task>? DirectWaitForTest { get; init; }
+
+
     /// <summary>The largest result file or build log read (a larger result file makes the run's report unreadable).</summary>
     public const long MaxResultFileBytes = 50 * 1024 * 1024;
 
@@ -58,19 +63,28 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         }
         var workspace = await git.PrepareCommitAsync(repo, spec.Name, spec.Commit, ct);
         var cleaned = false;
+        var retain = false;
         try
         {
             var report = await RunInWorktreeAsync(workspace, spec, ct);
             cleaned = true;
             return await CleanUpAsync(workspace.Path, spec) is { Length: > 0 } cleanup ? report with { Log = report.Log + cleanup } : report;
         }
+        catch (Exception ex) when (WorkerStillRunning.IsMarked(ex))
+        {
+            retain = true;
+            throw;
+        }
         finally
         {
-            if (!cleaned)
+            if (!retain && !DirectTestProcess.Protected(workspace.Path))
             {
-                await CleanUpAsync(workspace.Path, spec); // a timed-out, failed or cancelled run is cleaned up too
+                if (!cleaned)
+                {
+                    await CleanUpAsync(workspace.Path, spec); // only after termination was confirmed
+                }
+                if (!DirectTestProcess.Protected(workspace.Path)) await git.RemoveAsync(repo, workspace, CancellationToken.None);
             }
-            await git.RemoveAsync(repo, workspace, CancellationToken.None);
         }
     }
 
@@ -79,19 +93,21 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
 
     /// <summary>
     /// The run's <see cref="TestPhase.Cleanup"/> steps, each bounded by <see cref="CleanupTimeout"/> and on no cancellation
-    /// token, whatever happened before; their log (empty when there are none). Never throws: a failed clean-up decides nothing.
+    /// token, whatever happened before; their log (empty when there are none). Ordinary cleanup failures decide nothing,
+    /// but unconfirmed process termination propagates: neither another cleanup command nor deletion may run beneath it.
     /// </summary>
     private async Task<string> CleanUpAsync(string worktree, TestRunSpec spec)
     {
         var log = new StringBuilder();
         foreach (var step in spec.Steps.Where(s => s.Phase == TestPhase.Cleanup))
         {
+            if (DirectTestProcess.Protected(worktree)) break;
             try
             {
                 var (exit, output, timedOut, _) = await RunStepAsync(worktree, step, CleanupTimeout, CancellationToken.None);
                 log.AppendLine($"$ {Describe(step)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
             }
-            catch (Exception e) when (e is not OutOfMemoryException)
+            catch (Exception e) when (e is not OutOfMemoryException && !WorkerStillRunning.IsMarked(e))
             {
                 log.AppendLine($"$ {Describe(step)} → could not be run: {e.Message}");
             }
@@ -172,7 +188,9 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 return TestRunReport.Failed(TestRunStatus.BuildFailed, log.ToString()) with
                 {
                     BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern, maxResultFileBytes).Concat(buildOutputs)
-                        .Where(l => l.Content is not null).SelectMany(l => spec.Strategy.ParseBuildErrors(l.Content!, roots)).Distinct().ToList(),
+                        .SelectMany(l => l.Content is null
+                            ? new[] { new BuildError(null, 0, 0, "capture", $"{l.Name}: build diagnostics incomplete (unreadable or larger than {maxResultFileBytes} bytes)") }
+                            : spec.Strategy.ParseBuildErrors(l.Content, roots)).Distinct().ToList(),
                 };
             }
             // Only the reports the test steps ask their runner for (one format per run), so nothing else is read as results.
@@ -232,7 +250,8 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     }
 
     /// <summary>
-    /// Runs one step. <c>Captured</c> is its whole standard output when the step asks for it (<see cref="TestStep.CaptureOutput"/>),
+    /// Runs one step. <c>Captured</c> is its standard output (<see cref="TestStep.CaptureOutput"/>), with stderr only for
+    /// build diagnostics explicitly requesting <see cref="TestStep.CaptureBuildStderr"/> (never test result formats),
     /// null when it does not or the output is larger than the result-file limit.
     /// </summary>
     private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStepAsync(string worktree, TestStep step, TimeSpan remaining, CancellationToken ct)
@@ -256,21 +275,30 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         Process started;
         try
         {
-            started = Sandbox is null ? StartDirect(directory, step) : Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
+            started = Sandbox is null ? StartDirect(directory, step, worktree) : Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
         }
         catch (System.ComponentModel.Win32Exception e) when (Sandbox is null)
         {
             // Unsandboxed, a program that is not installed fails at start; sandboxed, the helper exits 127 for it.
             return (127, $"{step.Program} could not be started: {e.Message}", false, null);
         }
+        var stopped = false;
         try
         {
-            return await RunStartedAsync(started, step, remaining, ct);
+            var result = await RunStartedAsync(started, step, remaining, worktree, ct);
+            stopped = true;
+            return result;
+        }
+        catch (OperationCanceledException ex) when (!WorkerStillRunning.IsMarked(ex))
+        {
+            stopped = true;
+            throw;
         }
         finally
         {
             if (Sandbox is null)
             {
+                if (stopped) File.Delete(DirectTestProcess.Marker(worktree));
                 started.Dispose();
             }
             else
@@ -282,75 +310,132 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         }
     }
 
-    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStartedAsync(Process process, TestStep step, TimeSpan remaining, CancellationToken ct)
+    private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStartedAsync(Process process, TestStep step, TimeSpan remaining, string worktree, CancellationToken ct)
     {
         var output = new Tail();
         var capture = step.CaptureOutput is null ? null : new Capture(maxResultFileBytes);
-        var stdout = PumpAsync(process.StandardOutput, output, capture);
-        var stderr = PumpAsync(process.StandardError, output);
+        var errors = step.Phase == TestPhase.Build && step.CaptureBuildStderr && capture is not null ? new Capture(maxResultFileBytes) : null;
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
         bounded.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+        using var drainCancellation = new CancellationTokenSource();
+        var stdout = PumpAsync(process.StandardOutput, output, capture, drainCancellation.Token);
+        var stderr = PumpAsync(process.StandardError, output, errors, drainCancellation.Token);
+        var drains = Task.WhenAll(stdout, stderr);
         try
         {
             await process.WaitForExitAsync(bounded.Token);
+            await drains.WaitAsync(bounded.Token);
+            if (Sandbox is null) await DirectTestProcess.WaitStoppedAsync(process, bounded.Token);
         }
         catch (OperationCanceledException)
         {
-            await StopAsync(process);
-            if (ct.IsCancellationRequested)
+            var stopped = await StopAsync(process);
+            if (Sandbox is null)
             {
-                throw;
+                // A retained pipe can belong to an escaped descendant even after the original leader died. Neither that
+                // pid nor a group number alone authorizes a late signal. Keep the worktree if all pipe holders cannot exit.
+                try { await drains.WaitAsync(DirectStopGrace); }
+                catch (TimeoutException) { stopped = false; }
+                if (!stopped) throw DirectTestProcess.Unconfirmed(worktree);
             }
+            ct.ThrowIfCancellationRequested();
             return (-1, output.ToString(), true, null);
         }
         finally
         {
+            drainCancellation.Cancel();
             if (Sandbox is not null)
             {
-                WorkerSandbox.Stop(process); // the helper then kills whatever the step left running
+                WorkerSandbox.Stop(process); // always stop the helper, even if a drain cannot finish
+            }
+            try { await drains.WaitAsync(Sandbox is null ? DirectStopGrace : StopGrace); }
+            catch (OperationCanceledException) { }
+            catch (TimeoutException) { throw DirectTestProcess.Unconfirmed(worktree); }
+        }
+        var captured = capture?.Text;
+        if (errors is not null)
+        {
+            // Deterministic stream order, not arrival order: diagnostics never depend on how the two pumps interleave.
+            captured = captured is not null && errors.Text is { } stderrText ? captured + "\n" + stderrText : null;
+            if (captured is not null && Encoding.UTF8.GetByteCount(captured) > maxResultFileBytes)
+            {
+                captured = null;
             }
         }
-        await Task.WhenAll(stdout, stderr);
-        return (process.ExitCode, output.ToString(), false, capture?.Text);
+        return (process.ExitCode, output.ToString(), false, captured);
     }
 
-    /// <summary>A step's whole standard output, up to <paramref name="maxChars"/> characters: past that it is dropped (<see cref="Text"/> null).</summary>
-    private sealed class Capture(long maxChars)
+    /// <summary>Bounded UTF-8 evidence; once oversized none of it can be used as partial proof.</summary>
+    private sealed class Capture(long maxBytes)
     {
         private StringBuilder? _text = new();
+        private readonly Encoder _encoder = Encoding.UTF8.GetEncoder();
+        private long _bytes;
 
-        public string? Text => _text?.ToString();
-
-        public void Add(string line)
+        public string? Text
         {
-            if (_text is not null && _text.Length + line.Length + 1 > maxChars)
+            get
+            {
+                var text = _text?.ToString();
+                return text is not null && Encoding.UTF8.GetByteCount(text) <= maxBytes ? text : null;
+            }
+        }
+
+        public void Add(string text)
+        {
+            if (_text is null) return;
+            _bytes += _encoder.GetByteCount(text.AsSpan(), flush: false);
+            if (_bytes > maxBytes)
             {
                 _text = null;
             }
-            _text?.Append(line).Append('\n');
+            _text?.Append(text);
         }
     }
 
-    private async Task StopAsync(Process process)
+    private async Task<bool> StopAsync(Process process)
     {
         if (Sandbox is null)
         {
-            process.Kill(entireProcessTree: true);
-            return;
+            (DirectStopForTest ?? DirectTestProcess.Stop)(process);
+            using var grace = new CancellationTokenSource(DirectStopGrace);
+            try
+            {
+                // WaitAsync is intentional even if an injected/platform waiter ignores cancellation.
+                await (DirectWaitForTest ?? DirectTestProcess.WaitStoppedAsync)(process, grace.Token).WaitAsync(DirectStopGrace);
+                return true;
+            }
+            catch (Exception e) when (e is OperationCanceledException or TimeoutException)
+            {
+                return false;
+            }
         }
         WorkerSandbox.Stop(process);
-        // If it is still running as the worker user after the grace: the next helper exit (the worktree's deletion, under the same
-        // hold of the lock) kills it, and until it is gone the lock is kept (WorkerSandbox.EndAsync).
-        await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
+        // An unresponsive helper keeps its slot lock through WorkerSandbox.EndAsync, as before.
+        return await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
     }
 
-    private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null)
+    private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null, CancellationToken ct = default)
     {
-        while (await reader.ReadLineAsync() is { } line)
+        var buffer = new char[4096];
+        var line = new StringBuilder();
+        while (await reader.ReadAsync(buffer.AsMemory(), ct) is var count && count > 0)
         {
-            tail.Add(line);
-            capture?.Add(line);
+            capture?.Add(new string(buffer, 0, count));
+            for (var n = 0; n < count; n++)
+            {
+                if (buffer[n] == '\n')
+                {
+                    tail.Add(line.ToString());
+                    line.Clear();
+                }
+                else if (line.Length < 2000)
+                {
+                    line.Append(buffer[n]);
+                }
+            }
         }
+        if (line.Length > 0) tail.Add(line.ToString());
     }
 
     /// <summary>
@@ -383,16 +468,23 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     /// <summary>The variables an unsandboxed run keeps from the owner's environment (no secrets: never the router key or a token).</summary>
     private static readonly string[] PassThrough = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "DOTNET_ROOT"];
 
-    private static Process StartDirect(string worktree, TestStep step)
+    private static Process StartDirect(string directory, TestStep step, string worktree)
     {
-        var psi = new ProcessStartInfo(step.Program)
+        File.WriteAllText(DirectTestProcess.Marker(worktree), $"Test command: {Path.GetFileName(step.Program)}; termination not yet confirmed.\n");
+        var grouped = !OperatingSystem.IsWindows();
+        var psi = grouped ? new ProcessStartInfo(DirectTestProcess.Launcher) : new ProcessStartInfo(step.Program);
+        psi.WorkingDirectory = directory;
+        psi.RedirectStandardInput = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.UseShellExecute = false;
+        if (grouped)
         {
-            WorkingDirectory = worktree,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add(DirectTestProcess.Supervisor);
+            psi.ArgumentList.Add("--");
+            psi.ArgumentList.Add(step.Program);
+        }
         foreach (var arg in step.Args)
         {
             psi.ArgumentList.Add(arg);
@@ -409,7 +501,20 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         // As the helper sets them: no build server or node outlives the run.
         psi.Environment["MSBUILDDISABLENODEREUSE"] = "1";
         psi.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
-        var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {step.Program}.");
+        // Roslyn's compiler server is separate from both MSBuild servers and node reuse. It otherwise remains in this
+        // step's owned group after a successful build, making descendant-safe teardown wait out the entire run deadline.
+        psi.Environment["UseSharedCompilation"] = "false";
+        Process process;
+        try
+        {
+            process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {step.Program}.");
+        }
+        catch
+        {
+            File.Delete(DirectTestProcess.Marker(worktree));
+            throw;
+        }
+        File.AppendAllText(DirectTestProcess.Marker(worktree), $"Owned supervisor pid: {process.Id}.\n");
         process.StandardInput.Close();
         return process;
     }

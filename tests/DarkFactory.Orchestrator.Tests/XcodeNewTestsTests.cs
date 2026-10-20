@@ -771,13 +771,14 @@ public class XcodeRunTests
             "Toolchain /usr/bin/xcodebuild -version",
             "Toolchain /usr/bin/xcrun --find xcresulttool",
             $"Restore {wrapper} clean-derived-data",
-            $"Build {wrapper} --gate build-for-testing -project App/Words.xcodeproj -scheme Words -destination platform=macOS -quiet",
+            $"Build {wrapper} --gate build-for-testing -project App/Words.xcodeproj -scheme Words -destination platform=macOS",
             $"Test {wrapper} --gate test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/blank() -resultBundlePath {bundle} -quiet",
             $"Test /usr/bin/xcrun xcresulttool get test-results tests --path {bundle}",
             $"Test {wrapper} --gate test-without-building -project App/Words.xcodeproj -scheme Words -destination platform=macOS -only-testing:WordsTests/Spaces/empty() -resultBundlePath .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")} -quiet",
             $"Test /usr/bin/xcrun xcresulttool get test-results tests --path .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")}",
             $"Cleanup {wrapper} clean-derived-data",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
+        Assert.All(steps, s => Assert.Equal(s.Phase == TestPhase.Build, s.CaptureBuildStderr));
         Assert.Equal(["xcode-build-0", XcodeNewTests.OutputName("WordsTests/blank()"), XcodeNewTests.JsonName("WordsTests/blank()")],
             steps.Skip(3).Take(3).Select(s => s.CaptureOutput));
         // The first step after the toolchain's and the last both delete the worktree's DerivedData (a failed first one fails the run).

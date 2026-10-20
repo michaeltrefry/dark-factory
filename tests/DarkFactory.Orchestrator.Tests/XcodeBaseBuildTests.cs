@@ -23,6 +23,30 @@ public class XcodeBaseBuildTests
 
     private static IReadOnlyList<BuildError> Errors(string name) => Strategy.ParseBuildErrors(Recorded(name), [Root]);
 
+    [Fact]
+    public async Task Verbose_build_shape_attributes_seven_helper_errors_and_retries_all_fourteen_tests_individually()
+    {
+        var runner = Mac((XcodeBuildDiagnosticShape.Path, XcodeBuildDiagnosticShape.Source));
+        var errors = Strategy.ParseBuildErrors(XcodeBuildDiagnosticShape.Stdout(Root) + "\n" + XcodeBuildDiagnosticShape.Stderr(Root), [Root]);
+        Assert.Equal(7, errors.Count);
+        Assert.All(errors, e => Assert.Equal(XcodeBuildDiagnosticShape.Path, e.Path));
+        runner.Answer = spec => Stage(spec) switch
+        {
+            "head" => Passing(spec),
+            "base" => FakeTestRunner.NotBuilt([.. errors]),
+            _ => Failing(spec),
+        };
+        var result = await Check(runner);
+        Assert.Equal(NewTestsOutcome.Pass, result.Outcome);
+        Assert.Equal(14, result.Tests.Count);
+        Assert.All(result.Tests, t => Assert.Equal("failed", t.Base));
+        Assert.Equal([XcodeBuildDiagnosticShape.Path + ":90 class RecordingSaver", XcodeBuildDiagnosticShape.Path + ":109 actor ControllableSaver"], result.BaseRemoved);
+        var retry = Assert.Single(runner.Runs, r => Stage(r) == "base-retry");
+        Assert.Equal(14, FakeTestRunner.Filtered(retry.Steps).Count());
+        Assert.DoesNotContain("class RecordingSaver", retry.Replacements[XcodeBuildDiagnosticShape.Path]);
+        Assert.DoesNotContain("actor ControllableSaver", retry.Replacements[XcodeBuildDiagnosticShape.Path]);
+    }
+
     // ---- The test files as the recordings built them -------------------------------------------------------------------
 
     private const string CountFile = "WordsTests/CountTests.swift";
@@ -276,4 +300,34 @@ public class XcodeBaseBuildTests
         Assert.Equal(NewTestsOutcome.Error, result.Outcome);
         Assert.Contains(XcodeFixture.TestFile, result.Reason);
     }
+}
+
+/// <summary>Minimal sanitized verbose-build shape from sc-26252; no private log or production source is recorded.</summary>
+internal static class XcodeBuildDiagnosticShape
+{
+    internal const string Path = "WordsTests/ImageExportTests.swift";
+    internal static string Source
+    {
+        get
+        {
+            var lines = Enumerable.Repeat("", 116).ToArray();
+            lines[0] = "import Testing";
+            lines[1] = "@testable import Words";
+            for (var n = 0; n < 14; n++) lines[n + 3] = $"@Test func export{n}() {{ #expect(isBlank(\" \") ) }}";
+            lines[89] = "final class RecordingSaver: PhotoLibrarySaving {";
+            lines[90] = "    var result: SaveResult";
+            lines[94] = "    init(result: SaveResult) { self.result = result }";
+            lines[99] = "    func save() -> SaveResult { result }";
+            lines[105] = "}";
+            lines[108] = "actor ControllableSaver: PhotoLibrarySaving {";
+            lines[112] = "    var result: SaveResult";
+            lines[114] = "    func save() -> SaveResult { result }";
+            lines[115] = "}";
+            return string.Join('\n', lines) + "\n";
+        }
+    }
+    internal static string Stdout(string root) => $"Ld {root}/DerivedData/App/__preview.dylib\nLd {root}/DerivedData/App/App.debug.dylib\n";
+    internal static string Stderr(string root) => string.Join('\n', new[] { 90, 91, 95, 100, 109, 113, 115 }.Select(line =>
+        $"{root}/{Path}:{line}:{(line is 90 or 109 ? 28 : 19)}: error: cannot find type '{(line is 90 or 109 ? "PhotoLibrarySaving" : "SaveResult")}' in scope"))
+        + "\n** TEST BUILD FAILED **\nThe following build commands failed:\n SwiftEmitModule normal arm64 (in target 'WordsTests')\n EmitSwiftModule normal arm64 (in target 'WordsTests')\n(2 failures)\n";
 }
