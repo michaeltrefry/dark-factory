@@ -197,6 +197,31 @@ change fails closed. If interrupted after adoption, `factory run <item>` or `fac
 resumes the durable recovery, without returning to implementation. Existing controls and
 sandbox/taint rules still hold; recovery is not a gate bypass.
 
+#### Retry a panel truncated by its output budget
+
+`Review:MaxOutputTokens` is a positive integer, default **8192** for compatibility. Set it
+with configuration or `Review__MaxOutputTokens` in the environment. Every review and
+confirmation request uses it, including tool turns, the final-answer turn and transient
+resends. The panel still streams on the router's `high` class, with the existing deadlines;
+`max_tokens` is an unusable answer even if its text contains valid findings JSON. Increasing
+the requested budget does not establish what cap the router or its selected provider applies.
+
+An explicit `recover … --retry-incomplete-review` may adopt the **same exact head**, but only
+when the latest current-attempt structured verdict is a complete failed panel: each required
+role exactly once, none carried, no blocking findings, unusable confirmations, wrong classes
+or other failure, and at least one output truncation. The exact panel-generated escalation
+must be linked to it. Malformed, ambiguous, stale or consumed evidence is refused. Historical
+verdicts qualify only through the factory's exact historical truncation error and complete
+structured panel/session records, never by searching escalation prose or an operator reason.
+All existing ownership, taint, scope, control, freeze, lock and PR head/base checks still apply.
+
+The retry discriminator, source verdict/escalation row IDs, exact head and requested output
+budget are committed atomically in `Recovering`. Resumption keeps that budget even if the
+process configuration changes. A fresh full panel, **including security**, and the ordinary
+CI/new-tests/gate/merge queue must pass; no old approval crosses this boundary. Another
+truncation escalates again and needs a new explicit invocation against its new evidence;
+there is no automatic retry loop. Without the flag, unchanged-head rejection is unchanged.
+
 Workers run as a dedicated hidden macOS user (`_factory`), not as you — see
 [Worker sandbox](#worker-sandbox).
 

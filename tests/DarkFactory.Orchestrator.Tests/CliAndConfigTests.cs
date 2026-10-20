@@ -19,7 +19,7 @@ public class FactoryCliTests
             _ => { calls.Add("dashboard set-password"); return Task.FromResult(0); },
             (action, scope, _) => { calls.Add($"{action} {scope}"); return Task.FromResult(0); },
             (id, epic, _) => { calls.Add(epic ? $"kanban key --epic {id}" : $"kanban key {id}"); return Task.FromResult(0); },
-            (id, head, expectedBase, _) => { calls.Add($"recover {id} {head} {expectedBase}"); return Task.FromResult(0); });
+            (id, head, expectedBase, retry, _) => { calls.Add($"recover {id} {head} {expectedBase}" + (retry ? " retry-incomplete-review" : "")); return Task.FromResult(0); });
         return (root, calls);
     }
 
@@ -33,6 +33,8 @@ public class FactoryCliTests
         var head = new string('a', 40);
         Assert.Equal(0, await root.Parse(["recover", value, "--head", head, "--base", "main"]).InvokeAsync());
         Assert.Equal([$"recover {expected} {head} main"], calls);
+        Assert.Equal(0, await root.Parse(["recover", value, "--head", head, "--base", "main", "--retry-incomplete-review"]).InvokeAsync());
+        Assert.Equal($"recover {expected} {head} main retry-incomplete-review", calls.Last());
         Assert.NotEmpty(root.Parse(["recover", value]).Errors);
         Assert.NotEmpty(root.Parse(["recover", value, "--head", "short"]).Errors);
         Assert.NotEmpty(root.Parse(["recover", value, "--head", head, "--pr", "https://example.test/pull/1"]).Errors);

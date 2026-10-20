@@ -21,14 +21,14 @@ public sealed record RepoFiles(IReadOnlyList<string> Paths, bool Truncated);
 /// head as <c>sha</c>.
 /// </summary>
 public sealed record ReviewRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, RepoFiles Files, string Role, ReviewPrompt Prompt,
-    string Session, CodeGraphOverlay? Overlay = null);
+    string Session, CodeGraphOverlay? Overlay = null, int? MaxOutputTokens = null);
 
 /// <summary>
 /// A second opinion's check of one blocking <see cref="Finding"/> a <see cref="Role"/> reviewer reported, with the same CodeGraph
 /// overlay state as the review (<see cref="ReviewRequest.Overlay"/>).
 /// </summary>
 public sealed record ConfirmRequest(WorkStory Story, string Repo, PullFacts Pull, string Diff, RepoFiles Files, string Role, Finding Finding,
-    ReviewPrompt Prompt, string Session, CodeGraphOverlay? Overlay = null);
+    ReviewPrompt Prompt, string Session, CodeGraphOverlay? Overlay = null, int? MaxOutputTokens = null);
 
 /// <summary>
 /// The router refused a review call for usage (429/529, or its exhaustion body: simple-router's 429 <c>rate_limit_error</c>
@@ -50,6 +50,8 @@ internal sealed class RouterRefusedRequestException(string message) : InvalidOpe
 
 public interface IReviewer
 {
+    int MaxOutputTokens => RouterReviewer.DefaultMaxOutputTokens;
+
     /// <summary>
     /// One role's review on the high model class, accounted under <see cref="ReviewRequest.Session"/>.
     /// An answer that is not a clean findings line served on the high class is a <see cref="RoleReview"/> with an
@@ -87,7 +89,7 @@ public interface IReviewer
 /// calls included, and a stream silent for the idle gap fails.
 /// </summary>
 public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? idleTimeout = null, ReviewTools? tools = null,
-    TimeSpan? transientRetryDelay = null) : IReviewer
+    TimeSpan? transientRetryDelay = null, int maxOutputTokens = RouterReviewer.DefaultMaxOutputTokens) : IReviewer
 {
     /// <summary>
     /// A turn whose stream fails with a transient upstream error (<see cref="RouterTransientStreamException"/>) is sent again — the
@@ -131,7 +133,9 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// <summary>At most this many of the base's file paths go into a prompt (the prompt says when the list is cut).</summary>
     public const int MaxFilePaths = 5_000;
 
-    private const int MaxTokens = 8192;
+    public const int DefaultMaxOutputTokens = 8192;
+    public int MaxOutputTokens { get; } = RequireBudget(maxOutputTokens);
+    private static int RequireBudget(int value) => value > 0 ? value : throw new ArgumentOutOfRangeException(nameof(value), "Review:MaxOutputTokens must be a positive integer.");
     private const int MaxTitle = 300;
     private const int MaxDetail = 2_000;
 
@@ -142,15 +146,16 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             return new RoleReview(request.Role, null, null, request.Session, request.Prompt.Id, [], "",
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one review reads; not reviewed.");
         }
-        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildPrompt(request), request.Repo, request.Pull, request.Overlay, false, ct);
+        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildPrompt(request), request.Repo, request.Pull, request.Overlay, false, RequireBudget(request.MaxOutputTokens ?? MaxOutputTokens), ct);
         var review = session.Problem is { } problem
-            ? new RoleReview(request.Role, session.Served, session.ServedClass, null, null, [], "", problem)
+            ? new RoleReview(request.Role, session.Served, session.ServedClass, null, null, [], "", problem, Failure: ReviewFailure.UnusableAnswer)
             : InterpretReview(request.Role, session.Served, session.ServedClass, session.Stop, session.Text);
         if (session.AfterCap && review.Error is { } error)
         {
             review = review with { Error = $"{AfterCap}: {error}" };
         }
-        return review with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns };
+        return review with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns,
+            Failure = review.Error is null ? null : review.Failure ?? ReviewFailure.UnusableAnswer };
     }
 
     public async Task<Confirmation> ConfirmAsync(ConfirmRequest request, CancellationToken ct)
@@ -160,15 +165,16 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
             return new Confirmation(Confirmation.Unusable, null, null, request.Session, request.Prompt.Id,
                 $"The diff is {request.Diff.Length} characters, more than the {MaxDiffChars} one call reads.");
         }
-        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildConfirmPrompt(request), request.Repo, request.Pull, request.Overlay, true, ct);
+        var session = await ConverseAsync(request.Session, request.Prompt.Text, BuildConfirmPrompt(request), request.Repo, request.Pull, request.Overlay, true, RequireBudget(request.MaxOutputTokens ?? MaxOutputTokens), ct);
         var confirmation = session.Problem is { } problem
-            ? new Confirmation(Confirmation.Unusable, session.Served, session.ServedClass, null, null, problem)
+            ? new Confirmation(Confirmation.Unusable, session.Served, session.ServedClass, null, null, problem, Failure: ReviewFailure.UnusableAnswer)
             : InterpretConfirmation(session.Served, session.ServedClass, session.Stop, session.Text);
         if (session.AfterCap && confirmation.Outcome == Confirmation.Unusable)
         {
             confirmation = confirmation with { Reason = $"{AfterCap}: {confirmation.Reason}" };
         }
-        return confirmation with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns };
+        return confirmation with { Session = request.Session, Prompt = request.Prompt.Id, Tools = session.Tools, Turns = session.Turns,
+            Failure = confirmation.Outcome != Confirmation.Unusable ? null : confirmation.Failure ?? ReviewFailure.UnusableAnswer };
     }
 
     private const string AfterCap = "No usable final answer after the turn cap";
@@ -199,7 +205,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// answer (sc-25706); asking for tools again there is unusable. The client's timeout bounds the whole session.
     /// </summary>
     private async Task<SessionEnd> ConverseAsync(string session, string system, string user, string repo, PullFacts pull, CodeGraphOverlay? overlay,
-        bool confirm, CancellationToken ct)
+        bool confirm, int outputBudget, CancellationToken ct)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         if (http.Timeout != Timeout.InfiniteTimeSpan)
@@ -229,7 +235,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                 IReadOnlyList<string>? retried;
                 try
                 {
-                    (answer, servedClass, retried) = await TurnWithRetriesAsync(session, system, messages, definitions, final, deadline.Token);
+                    (answer, servedClass, retried) = await TurnWithRetriesAsync(session, system, messages, definitions, final, outputBudget, deadline.Token);
                 }
                 catch (RouterRefusedRequestException refused) when (turn > 1)
                 {
@@ -243,7 +249,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
                     // The first turn's refusal fails the call as any other refusal does, as before the tool loop.
                     throw new InvalidOperationException(refused.Message);
                 }
-                served.Add(new ServedTurn(turn, answer.Served, servedClass, retried));
+                served.Add(new ServedTurn(turn, answer.Served, servedClass, retried, answer.StopReason, outputBudget));
                 if (ReviewModels.CallProblem(servedClass) is not null || answer.StopReason != "tool_use")
                 {
                     return new SessionEnd(answer.Served, servedClass, answer.StopReason, answer.Text, null, Calls(), final, Turns());
@@ -307,14 +313,14 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// the failed attempt is kept but its error). Every other failure, usage refusals included, is thrown at once as before.
     /// </summary>
     private async Task<(StreamedAnswer Answer, string? ServedClass, IReadOnlyList<string>? Retried)> TurnWithRetriesAsync(string session,
-        string system, List<object> messages, IReadOnlyList<object> definitions, bool final, CancellationToken deadline)
+        string system, List<object> messages, IReadOnlyList<object> definitions, bool final, int outputBudget, CancellationToken deadline)
     {
         List<string>? failed = null;
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                var (answer, servedClass) = await TurnAsync(session, system, messages, definitions, final, deadline);
+                var (answer, servedClass) = await TurnAsync(session, system, messages, definitions, final, outputBudget, deadline);
                 return (answer, servedClass, failed);
             }
             catch (RouterTransientStreamException transient) when (attempt <= MaxTransientRetries)
@@ -336,7 +342,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// tool_use and tool_result blocks without them). Throws on a refused or broken call.
     /// </summary>
     private async Task<(StreamedAnswer Answer, string? ServedClass)> TurnAsync(string session, string system, List<object> messages,
-        IReadOnlyList<object> definitions, bool final,
+        IReadOnlyList<object> definitions, bool final, int outputBudget,
         CancellationToken deadline)
     {
         using var message = new HttpRequestMessage(HttpMethod.Post, "v1/messages");
@@ -348,7 +354,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
         message.Content = JsonContent.Create(new
         {
             model = ModelClass.RequestModel,
-            max_tokens = MaxTokens,
+            max_tokens = outputBudget,
             system,
             messages,
             tools = definitions,
@@ -426,6 +432,10 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// Why an answer cannot count at all (<see cref="ReviewModels.CallProblem"/>: the router did not say the high class served
     /// it; or the answer ended early), or null when it can.
     /// </summary>
+    private static ReviewFailure FailureFor(string? servedClass, string? stopReason) =>
+        ReviewModels.CallProblem(servedClass) is not null ? ReviewFailure.WrongClass
+        : stopReason == "max_tokens" ? ReviewFailure.OutputTruncated : ReviewFailure.UnusableAnswer;
+
     private static string? ServedProblem(string? servedClass, string? stopReason) =>
         ReviewModels.CallProblem(servedClass) is { } problem ? $"The answer cannot count: {problem}."
         : stopReason is not null and not "end_turn" and not "stop_sequence" ? $"The answer ended early ({stopReason})." : null;
@@ -438,11 +448,11 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// </summary>
     public static RoleReview InterpretReview(string role, string? served, string? servedClass, string? stopReason, string answer)
     {
-        RoleReview Unusable(string why) => new(role, served, servedClass, null, null, [], "", why);
+        RoleReview Unusable(string why) => new(role, served, servedClass, null, null, [], "", why, Failure: ReviewFailure.UnusableAnswer);
 
         if (ServedProblem(servedClass, stopReason) is { } problem)
         {
-            return Unusable(problem);
+            return Unusable(problem) with { Failure = FailureFor(servedClass, stopReason) };
         }
         if (LastJsonLine(answer, "findings") is not { } json || json.GetProperty("findings").ValueKind != JsonValueKind.Array)
         {
@@ -472,11 +482,11 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     {
         if (ServedProblem(servedClass, stopReason) is { } problem)
         {
-            return new Confirmation(Confirmation.Unusable, served, servedClass, null, null, problem);
+            return new Confirmation(Confirmation.Unusable, served, servedClass, null, null, problem, Failure: FailureFor(servedClass, stopReason));
         }
         if (LastJsonLine(answer, "confirmed") is not { } json || json.GetProperty("confirmed").ValueKind is not (JsonValueKind.True or JsonValueKind.False))
         {
-            return new Confirmation(Confirmation.Unusable, served, servedClass, null, null, "The second opinion's answer does not end with a confirmation line.");
+            return new Confirmation(Confirmation.Unusable, served, servedClass, null, null, "The second opinion's answer does not end with a confirmation line.", Failure: ReviewFailure.UnusableAnswer);
         }
         return new Confirmation(json.GetProperty("confirmed").GetBoolean() ? Confirmation.Confirmed : Confirmation.NotConfirmed, served, servedClass,
             null, null, Cut(Text(json, "reason") ?? "", MaxDetail));

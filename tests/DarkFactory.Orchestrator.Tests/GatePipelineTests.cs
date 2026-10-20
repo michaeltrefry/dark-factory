@@ -45,6 +45,7 @@ public class GatePipelineTests
         public string? MergeCommitSha { get; set; }
         public string? PolicyText { get; set; } = Policy;
         public const string BaseSha = "base0";
+        public string CurrentBaseSha { get; set; } = BaseSha;
         /// <summary>GitHub's changed_files for the PR; by default the file count of <see cref="Diff"/> at the head.</summary>
         public int? ChangedFiles { get; set; }
         public Dictionary<string, CiFacts> Ci { get; } = new();
@@ -59,7 +60,7 @@ public class GatePipelineTests
         {
             Calls.Add($"pull {number}");
             OnPullRead?.Invoke(++_reads);
-            return Task.FromResult(new PullFacts(number, PullUrl, Open && !Merged, Merged, Draft, Head, BaseRef, BaseSha, MergeCommitSha,
+            return Task.FromResult(new PullFacts(number, PullUrl, Open && !Merged, Merged, Draft, Head, BaseRef, CurrentBaseSha, MergeCommitSha,
                 ChangedFiles ?? DiffPaths.Parse(Diff(Head)).Files, DefaultBranch, HeadRef, HeadRepo));
         }
 

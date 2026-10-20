@@ -58,13 +58,13 @@ static async Task<int> RunAsync(ItemRef item, bool ignoreScope, CancellationToke
         requireSource: () => sources.Of(item.Naming));
 }
 
-static async Task<int> RecoverAsync(ItemRef item, string head, string expectedBase, CancellationToken ct)
+static async Task<int> RecoverAsync(ItemRef item, string head, string expectedBase, bool retryIncompleteReview, CancellationToken ct)
 {
     var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
     using var sources = new WorkSourceRegistry(options);
     return await FactoryRunner.RunCommandAsync(options,
         async c => await FactoryRunner.CheckHelperAsync(options.WorkerSlots, c, options.WorkerPrepare) ?? await CheckRouterEnrollmentAsync(options, c),
-        c => FactoryRunner.RecoverAsync(options, sources.Of(item.Naming), item.Id, head, expectedBase, $"{Environment.UserName} (cli)", Console.Out, c),
+        c => FactoryRunner.RecoverAsync(options, sources.Of(item.Naming), item.Id, head, expectedBase, $"{Environment.UserName} (cli)", Console.Out, c, retryIncompleteReview),
         Console.Error, ct, requireSource: () => sources.Of(item.Naming));
 }
 

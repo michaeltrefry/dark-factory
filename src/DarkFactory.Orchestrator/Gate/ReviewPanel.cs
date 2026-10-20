@@ -85,7 +85,8 @@ public sealed record Confirmation(
     [property: JsonPropertyName("prompt")] string? Prompt,
     [property: JsonPropertyName("reason")] string Reason,
     [property: JsonPropertyName("tools"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ToolCall>? Tools = null,
-    [property: JsonPropertyName("turns"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ServedTurn>? Turns = null)
+    [property: JsonPropertyName("turns"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ServedTurn>? Turns = null,
+    [property: JsonPropertyName("failure"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ReviewFailure? Failure = null)
 {
     public const string Confirmed = "confirmed";
     public const string NotConfirmed = "not-confirmed";
@@ -123,7 +124,9 @@ public sealed record ServedTurn(
     [property: JsonPropertyName("turn")] int Turn,
     [property: JsonPropertyName("served")] string? ServedModel,
     [property: JsonPropertyName("class")] string? ServedClass,
-    [property: JsonPropertyName("retried"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? Retried = null);
+    [property: JsonPropertyName("retried"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? Retried = null,
+    [property: JsonPropertyName("stop"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? StopReason = null,
+    [property: JsonPropertyName("max_output_tokens"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? MaxOutputTokens = null);
 
 /// <summary>One finding of a panel role. <see cref="Downgraded"/>: it was blocking, and the second opinion did not confirm it.</summary>
 public sealed record Finding(
@@ -152,6 +155,10 @@ public sealed record Finding(
     public override string ToString() => $"{Title}{(File is null ? "" : $" ({File}{(Line is null ? "" : $":{Line}")})")}";
 }
 
+/// <summary>Why a completed answer cannot count; null in historical verdicts.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter<ReviewFailure>))]
+public enum ReviewFailure { OutputTruncated, WrongClass, UnusableAnswer }
+
 /// <summary>
 /// One panel role's review of one head commit: the model and the model class the router said served it (the class is what
 /// counts, <see cref="ReviewModels"/>; the model is for reporting), the router session, the prompt (path and hash), the findings, and <see cref="Error"/> when the answer was unusable (which
@@ -170,7 +177,8 @@ public sealed record RoleReview(
     [property: JsonPropertyName("error")] string? Error = null,
     [property: JsonPropertyName("carried")] string? CarriedFrom = null,
     [property: JsonPropertyName("tools"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ToolCall>? Tools = null,
-    [property: JsonPropertyName("turns"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ServedTurn>? Turns = null)
+    [property: JsonPropertyName("turns"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ServedTurn>? Turns = null,
+    [property: JsonPropertyName("failure"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ReviewFailure? Failure = null)
 {
     [JsonIgnore]
     public bool Clean => Error is null;

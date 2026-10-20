@@ -15,7 +15,7 @@ public static class FactoryCli
         Func<CancellationToken, Task<int>> setDashboardPassword,
         Func<string, string, CancellationToken, Task<int>> control,
         Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null,
-        Func<WorkSources.ItemRef, string, string, CancellationToken, Task<int>>? recover = null)
+        Func<WorkSources.ItemRef, string, string, bool, CancellationToken, Task<int>>? recover = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
@@ -68,12 +68,16 @@ public static class FactoryCli
             Required = true,
             Description = "Owner assertion of the expected base (required for legacy rows); must match the recorded plan base or actual repository default",
         };
+        var retryIncompleteReview = new Option<bool>("--retry-incomplete-review")
+        {
+            Description = "Explicit same-head retry only for a complete failed panel whose sole failure was output truncation; starts a fresh full panel and normal gate",
+        };
         var recoverCommand = new Command("recover", "Adopt an Escalated item's existing repaired open PR, without implementing or pushing; start a fresh full review/gate attempt. Honors scope and every control.")
         {
-            recoveryItem, recoveryHead, recoveryBase,
+            recoveryItem, recoveryHead, recoveryBase, retryIncompleteReview,
         };
         recoverCommand.SetAction((parse, ct) => recover is null ? Task.FromResult(1)
-            : recover(parse.GetValue(recoveryItem)!, parse.GetValue(recoveryHead)!, parse.GetValue(recoveryBase)!, ct));
+            : recover(parse.GetValue(recoveryItem)!, parse.GetValue(recoveryHead)!, parse.GetValue(recoveryBase)!, parse.GetValue(retryIncompleteReview), ct));
 
         var nameOption = new Option<string>("--name")
         {
