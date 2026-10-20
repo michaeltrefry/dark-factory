@@ -172,7 +172,9 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 return TestRunReport.Failed(TestRunStatus.BuildFailed, log.ToString()) with
                 {
                     BuildErrors = ResultFiles(results, spec.Strategy.BuildLogPattern, maxResultFileBytes).Concat(buildOutputs)
-                        .Where(l => l.Content is not null).SelectMany(l => spec.Strategy.ParseBuildErrors(l.Content!, roots)).Distinct().ToList(),
+                        .SelectMany(l => l.Content is null
+                            ? new[] { new BuildError(null, 0, 0, "capture", $"{l.Name}: build diagnostics incomplete (unreadable or larger than {maxResultFileBytes} bytes)") }
+                            : spec.Strategy.ParseBuildErrors(l.Content, roots)).Distinct().ToList(),
                 };
             }
             // Only the reports the test steps ask their runner for (one format per run), so nothing else is read as results.
@@ -232,7 +234,8 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     }
 
     /// <summary>
-    /// Runs one step. <c>Captured</c> is its whole standard output when the step asks for it (<see cref="TestStep.CaptureOutput"/>),
+    /// Runs one step. <c>Captured</c> is its standard output (<see cref="TestStep.CaptureOutput"/>), with stderr only for
+    /// build diagnostics explicitly requesting <see cref="TestStep.CaptureBuildStderr"/> (never test result formats),
     /// null when it does not or the output is larger than the result-file limit.
     /// </summary>
     private async Task<(int ExitCode, string Output, bool TimedOut, string? Captured)> RunStepAsync(string worktree, TestStep step, TimeSpan remaining, CancellationToken ct)
@@ -286,21 +289,24 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     {
         var output = new Tail();
         var capture = step.CaptureOutput is null ? null : new Capture(maxResultFileBytes);
-        var stdout = PumpAsync(process.StandardOutput, output, capture);
-        var stderr = PumpAsync(process.StandardError, output);
+        var errors = step.Phase == TestPhase.Build && step.CaptureBuildStderr && capture is not null ? new Capture(maxResultFileBytes) : null;
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
         bounded.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+        var stdout = PumpAsync(process.StandardOutput, output, capture, bounded.Token);
+        var stderr = PumpAsync(process.StandardError, output, errors, bounded.Token);
         try
         {
             await process.WaitForExitAsync(bounded.Token);
+            await Task.WhenAll(stdout, stderr);
         }
         catch (OperationCanceledException)
         {
             await StopAsync(process);
-            if (ct.IsCancellationRequested)
-            {
-                throw;
-            }
+            // Both drains are bounded too: a child retaining a pipe must not hold the run or its slot forever.
+            bounded.Cancel();
+            try { await Task.WhenAll(stdout, stderr); }
+            catch (OperationCanceledException) { }
+            ct.ThrowIfCancellationRequested();
             return (-1, output.ToString(), true, null);
         }
         finally
@@ -310,24 +316,44 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 WorkerSandbox.Stop(process); // the helper then kills whatever the step left running
             }
         }
-        await Task.WhenAll(stdout, stderr);
-        return (process.ExitCode, output.ToString(), false, capture?.Text);
+        var captured = capture?.Text;
+        if (errors is not null)
+        {
+            // Deterministic stream order, not arrival order: diagnostics never depend on how the two pumps interleave.
+            captured = captured is not null && errors.Text is { } stderrText ? captured + "\n" + stderrText : null;
+            if (captured is not null && Encoding.UTF8.GetByteCount(captured) > maxResultFileBytes)
+            {
+                captured = null;
+            }
+        }
+        return (process.ExitCode, output.ToString(), false, captured);
     }
 
-    /// <summary>A step's whole standard output, up to <paramref name="maxChars"/> characters: past that it is dropped (<see cref="Text"/> null).</summary>
-    private sealed class Capture(long maxChars)
+    /// <summary>Bounded UTF-8 evidence; once oversized none of it can be used as partial proof.</summary>
+    private sealed class Capture(long maxBytes)
     {
         private StringBuilder? _text = new();
+        private readonly Encoder _encoder = Encoding.UTF8.GetEncoder();
+        private long _bytes;
 
-        public string? Text => _text?.ToString();
-
-        public void Add(string line)
+        public string? Text
         {
-            if (_text is not null && _text.Length + line.Length + 1 > maxChars)
+            get
+            {
+                var text = _text?.ToString();
+                return text is not null && Encoding.UTF8.GetByteCount(text) <= maxBytes ? text : null;
+            }
+        }
+
+        public void Add(string text)
+        {
+            if (_text is null) return;
+            _bytes += _encoder.GetByteCount(text.AsSpan(), flush: false);
+            if (_bytes > maxBytes)
             {
                 _text = null;
             }
-            _text?.Append(line).Append('\n');
+            _text?.Append(text);
         }
     }
 
@@ -335,7 +361,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     {
         if (Sandbox is null)
         {
-            process.Kill(entireProcessTree: true);
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None);
+            }
             return;
         }
         WorkerSandbox.Stop(process);
@@ -344,13 +374,27 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         await WorkerSandbox.ExitsWithinAsync(process, StopGrace);
     }
 
-    private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null)
+    private static async Task PumpAsync(StreamReader reader, Tail tail, Capture? capture = null, CancellationToken ct = default)
     {
-        while (await reader.ReadLineAsync() is { } line)
+        var buffer = new char[4096];
+        var line = new StringBuilder();
+        while (await reader.ReadAsync(buffer.AsMemory(), ct) is var count && count > 0)
         {
-            tail.Add(line);
-            capture?.Add(line);
+            capture?.Add(new string(buffer, 0, count));
+            for (var n = 0; n < count; n++)
+            {
+                if (buffer[n] == '\n')
+                {
+                    tail.Add(line.ToString());
+                    line.Clear();
+                }
+                else if (line.Length < 2000)
+                {
+                    line.Append(buffer[n]);
+                }
+            }
         }
+        if (line.Length > 0) tail.Add(line.ToString());
     }
 
     /// <summary>

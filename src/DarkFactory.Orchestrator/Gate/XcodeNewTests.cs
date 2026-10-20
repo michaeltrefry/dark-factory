@@ -969,7 +969,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             var b = Build.From(groups[n].Key);
             var destination = b.Platform == XcodeProject.IOS ? $"platform=iOS Simulator,name={device}" : Destination;
             steps.Add(new TestStep(TestPhase.Build, wrapperPath, [GateMode, "build-for-testing", b.Flag, b.Container, "-scheme", b.Scheme, "-destination", destination, "-quiet"])
-                { CaptureOutput = $"xcode-build-{n}" });
+                { CaptureOutput = $"xcode-build-{n}", CaptureBuildStderr = true });
         }
         foreach (var group in groups.Where(g => Build.From(g.Key).Platform == XcodeProject.MacOS))
         {
@@ -1211,7 +1211,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     private static readonly Regex FailedCommand = new(@"^Command [A-Za-z][A-Za-z0-9]* failed\b", RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// The errors in the build's standard output (<c>factory-xcodebuild --gate build-for-testing … -quiet</c>, kept by
+    /// The errors in the build's bounded standard output and standard error (<c>factory-xcodebuild --gate build-for-testing … -quiet</c>, kept by
     /// <see cref="TestStep.CaptureOutput"/>, the same for macOS and an iOS Simulator destination), read as
     /// <see cref="SwiftNewTests.ParseBuildErrors"/> reads <c>swift build</c>'s: swiftc's <c>/abs/File.swift:3:5: error: …</c>
     /// (Xcode prints the path as it standardizes it, <c>/tmp/…</c> or <c>/var/…</c> for a worktree under <c>/private</c>: the
@@ -1219,9 +1219,9 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// <c>…/App.xcodeproj: AppTests: clang: error: linker command failed …</c>, <c>error: Build input file cannot be found: …</c>,
     /// a signing error — plus xcodebuild's <see cref="FailedCommand"/> lines. What Xcode 26.5 prints and does not: the
     /// <c>Failed frontend command:</c> line and the compiler invocation after it (they say no more than the located errors),
-    /// notes and warnings; <c>** TEST BUILD FAILED **</c>, the list of failed build commands and xcodebuild's own
-    /// <c>xcodebuild: error: …</c> go to standard error, which is not read — a build that failed with nothing on standard output
-    /// names no error, which is unattributable.
+    /// notes and warnings are not errors. Both streams are captured independently and parsed together, without an arrival-order
+    /// assumption. Unlocated failures (including <c>Command Ld failed</c>) remain unattributable even beside located compiler
+    /// errors: coexistence does not prove the linker failure secondary. Oversized or missing capture is never partial proof.
     /// </summary>
     public IReadOnlyList<BuildError> ParseBuildErrors(string log, IReadOnlyList<string> roots) =>
         SwiftErrors.ParseBuildErrors(log, roots)

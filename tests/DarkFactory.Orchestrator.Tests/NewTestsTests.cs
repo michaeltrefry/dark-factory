@@ -1018,6 +1018,89 @@ public class GateCloneTests : IDisposable
         return (new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(1), maxResultFileBytes), sha);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Swift_build_diagnostics_are_complete_on_either_stream_and_an_unlocated_linker_failure_stays_an_error(bool mixed)
+    {
+        var (runner, sha) = await ShRunner();
+        // Sanitized sc-26252 shape: an unlocated stdout summary and located stderr errors in test helpers.
+        var script = "printf '%s\\n' 'Command Ld failed with a nonzero exit code'; "
+            + "printf '%s\\n' \"$PWD/ImageExportTests.swift:90:20: error: cannot find type 'PhotoLibrarySaving' in scope\" >&2; "
+            + "i=0; while [ $i -lt 4000 ]; do echo progress; echo warning >&2; i=$((i+1)); done; "
+            + "printf '%s\\n' \"$PWD/ImageExportTests.swift:91:25: error: cannot find type 'SaveResult' in scope\" " + (mixed ? "" : ">&2") + "; exit 1";
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c", script]) { CaptureOutput = "build", CaptureBuildStderr = true };
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new XcodeNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Equal(TestRunStatus.BuildFailed, report.Status);
+        Assert.Contains(report.BuildErrors, e => e.Path == "ImageExportTests.swift" && e.Message.Contains("PhotoLibrarySaving"));
+        Assert.Contains(report.BuildErrors, e => e.Path == "ImageExportTests.swift" && e.Message.Contains("SaveResult"));
+        Assert.Contains(report.BuildErrors, e => e.Path is null && e.Message.Contains("Command Ld failed"));
+        Assert.Empty(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));
+    }
+
+    [Fact]
+    public async Task Oversized_build_stderr_invalidates_all_evidence_instead_of_accepting_a_partial_compiler_error()
+    {
+        var (runner, sha) = await ShRunner(maxResultFileBytes: 200);
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c", "echo \"$PWD/T.swift:1:1: error: missing type\"; i=0; while [ $i -lt 1000 ]; do echo warning >&2; i=$((i+1)); done; exit 1"])
+            { CaptureOutput = "build", CaptureBuildStderr = true };
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        var error = Assert.Single(report.BuildErrors);
+        Assert.Null(error.Path);
+        Assert.Contains("incomplete", error.Message);
+    }
+
+    [Fact]
+    public async Task A_stderr_only_compiler_error_is_captured_but_cargo_test_stderr_is_not_a_result()
+    {
+        var (runner, sha) = await ShRunner();
+        var build = new TestStep(TestPhase.Build, "/bin/sh", ["-c", "echo \"$PWD/T.swift:1:1: error: cannot find type 'SaveResult' in scope\" >&2; exit 1"])
+            { CaptureOutput = "build", CaptureBuildStderr = true };
+        var failed = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [build], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Equal("T.swift", Assert.Single(failed.BuildErrors).Path);
+
+        const string output = "running 1 test\ntest tests::blank ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        var test = new TestStep(TestPhase.Test, "/bin/sh", ["-c", "printf '%s' \"$1\"; printf '%s' \"$2\" >&2", "sh", output, output.Replace("ok", "FAILED")])
+            { CaptureOutput = "words:lib:tests::blank", CaptureBuildStderr = true }; // ignored outside Build, even if requested
+        var ran = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-head", sha, null, [], [], [test], new CargoNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Equal(TestRunStatus.Ran, ran.Status);
+        Assert.Empty(ran.UnreadableReports);
+        Assert.Equal([new TestCaseResult("tests::blank", "passed")], ran.Results["words:lib:tests::blank"]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Build_capture_counts_utf8_bytes_and_both_streams_without_accepting_a_prefix(bool longLine)
+    {
+        var (runner, sha) = await ShRunner(maxResultFileBytes: 200);
+        var script = longLine ? "i=0; while [ $i -lt 10000 ]; do printf x >&2; i=$((i+1)); done; exit 1"
+            : "printf '%s' \"$1\"; printf '%s' \"$1\" >&2; exit 1";
+        var step = new TestStep(TestPhase.Build, "/bin/sh", ["-c", script, "sh", new string('界', 40)])
+            { CaptureOutput = "build", CaptureBuildStderr = true };
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.Contains("incomplete", Assert.Single(report.BuildErrors).Message);
+        Assert.True(report.Log.Length < 4000);
+    }
+
+    [Fact]
+    public void Failed_build_reasons_keep_only_a_few_bounded_redacted_compiler_diagnostics()
+    {
+        var secret = "secret-value-not-for-ledger";
+        var failed = TestRunReport.Failed(TestRunStatus.BuildFailed, "build failed") with
+        {
+            BuildErrors = Enumerable.Range(1, 10).Select(n => new BuildError("Tests/T.swift", n, 1, "swiftc",
+                "cannot find type 'SaveResult'; pass\0word=" + secret + "; " + new string('x', 1000))).ToList(),
+        };
+        var result = NewTestsCheck.Judge("base", "head", "swift", ["T/test()"], failed, failed);
+        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
+        Assert.Contains("cannot find type 'SaveResult'", result.Reason);
+        Assert.Contains("[redacted]", result.Reason);
+        Assert.DoesNotContain(secret, result.Reason);
+        Assert.DoesNotContain("T.swift(4,", result.Reason);
+        Assert.True(result.Reason.Length < 1100);
+    }
+
     /// <summary>A shell step that writes each (path, content) under the results directory (contents passed as arguments).</summary>
     private static TestStep Writes(string results, params (string Path, string Content)[] files) =>
         new(TestPhase.Test, "/bin/sh", ["-c", string.Join(" && ", files.Select((f, i) =>
@@ -1087,13 +1170,15 @@ public class GateCloneTests : IDisposable
         var buildFailed = await Run(TimeSpan.FromMinutes(1), CancellationToken.None, new TestStep(TestPhase.Build, "/bin/sh", ["-c", "exit 1"]));
         Assert.Equal((TestRunStatus.BuildFailed, 1), (buildFailed.Report!.Status, buildFailed.Cleaned.Length));
 
-        var timedOut = await Run(TimeSpan.FromSeconds(1), CancellationToken.None, new TestStep(TestPhase.Test, "/bin/sh", ["-c", "sleep 30"]));
+        var timedOut = await Run(TimeSpan.FromSeconds(1), CancellationToken.None,
+            new TestStep(TestPhase.Build, "/bin/sh", ["-c", "echo building; echo compiler >&2; sleep 30"]) { CaptureOutput = "build", CaptureBuildStderr = true });
         Assert.Equal((TestRunStatus.TimedOut, 1), (timedOut.Report!.Status, timedOut.Cleaned.Length));
 
         // Cancelled (a Pause or Stop) while its step runs: cancelled only once the step has started, so the worktree exists.
         var started = Path.Combine(_root, "started");
         using var cancel = new CancellationTokenSource();
-        var running = Run(TimeSpan.FromMinutes(1), cancel.Token, new TestStep(TestPhase.Test, "/bin/sh", ["-c", $"touch '{started}'; sleep 30"]));
+        var running = Run(TimeSpan.FromMinutes(1), cancel.Token,
+            new TestStep(TestPhase.Build, "/bin/sh", ["-c", $"touch '{started}'; echo building; echo compiler >&2; sleep 30"]) { CaptureOutput = "build", CaptureBuildStderr = true });
         while (!File.Exists(started) && !running.IsCompleted)
         {
             await Task.Delay(50);

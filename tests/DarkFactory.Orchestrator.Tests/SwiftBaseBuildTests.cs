@@ -125,6 +125,52 @@ public class SwiftBaseBuildTests
         return new BuildError(TestFile, content.AsSpan(0, offset).Count('\n') + 1, Encoding.UTF8.GetByteCount(content.AsSpan(lineStart, offset - lineStart)) + 1, "swiftc", message);
     }
 
+    [Theory]
+    [InlineData(false, NewTestsOutcome.Pass)]
+    [InlineData(true, NewTestsOutcome.Rejected)]
+    public async Task Missing_production_types_in_test_helper_signatures_remove_helpers_then_judge_each_remaining_test(bool blankPasses, string expected)
+    {
+        const string tests = Imports + "@Test func blank() { #expect(count(\"\") == 0) }\n"
+            + "@Test func exports() { #expect(RecordingSaver().save() == .saved) }\n"
+            + "struct RecordingSaver: PhotoLibrarySaving {\n    func save() -> SaveResult { .saved }\n}\n"
+            + "struct ControllableSaver: PhotoLibrarySaving {\n    func save() -> SaveResult { .saved }\n}\n";
+        var runner = Runner(tests);
+        runner.Answer = spec => Stage(spec) switch
+        {
+            "head" => Passing(spec),
+            "base" => FakeTestRunner.NotBuilt(At(spec, tests, "PhotoLibrarySaving", "cannot find type 'PhotoLibrarySaving' in scope"),
+                At(spec, tests, "SaveResult", "cannot find type 'SaveResult' in scope"),
+                At(spec, tests, "struct ControllableSaver", "cannot find type 'PhotoLibrarySaving' in scope")),
+            "base-retry" => FakeTestRunner.NotBuilt(At(spec, tests, "RecordingSaver()", "cannot find 'RecordingSaver' in scope")),
+            _ => blankPasses ? Passing(spec) : Failing(spec),
+        };
+        var result = await Check(runner);
+        Assert.Equal(expected, result.Outcome);
+        var retry = runner.Runs.Single(r => Stage(r) == "base-retry");
+        Assert.DoesNotContain("struct RecordingSaver", retry.Replacements[TestFile]);
+        Assert.DoesNotContain("struct ControllableSaver", retry.Replacements[TestFile]);
+        Assert.Equal(2, FakeTestRunner.Filtered(retry.Steps).Count());
+        var second = runner.Runs.Single(r => Stage(r) == "base-retry-2");
+        Assert.Equal(["WordsTests.blank()"], FakeTestRunner.Filtered(second.Steps));
+        Assert.Equal("not-built", result.Tests.Single(t => t.Test == "WordsTests.exports()").Base);
+        Assert.Equal(blankPasses ? "passed" : "failed", result.Tests.Single(t => t.Test == "WordsTests.blank()").Base);
+    }
+
+    [Fact]
+    public async Task A_companion_unlocated_linker_failure_is_not_discarded_but_the_concrete_compiler_cause_is_reported()
+    {
+        const string tests = Imports + "@Test func blank() { #expect(count(\"\") == 0) }\nstruct RecordingSaver: PhotoLibrarySaving {}\n";
+        var runner = Runner(tests);
+        runner.Answer = spec => Stage(spec) == "head" ? Passing(spec) : FakeTestRunner.NotBuilt(
+            At(spec, tests, "PhotoLibrarySaving", "cannot find type 'PhotoLibrarySaving' in scope"),
+            new BuildError(null, 0, 0, "xcodebuild", "Command Ld failed with a nonzero exit code"));
+        var result = await Check(runner);
+        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
+        Assert.Contains("Command Ld failed", result.Reason);
+        Assert.Contains("cannot find type 'PhotoLibrarySaving'", result.Reason);
+        Assert.Equal(2, runner.Runs.Count);
+    }
+
     [Fact]
     public async Task A_new_test_calling_code_the_base_lacks_is_not_built_and_the_others_get_their_real_results_from_a_retry_without_it()
     {

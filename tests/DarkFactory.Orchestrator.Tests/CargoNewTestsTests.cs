@@ -804,6 +804,7 @@ public class CargoRunOutputTests
         var steps = await Cargo.StepsAsync(new TestSource(new FakeTestRunner(), new RepoRef("a", "b"), "base", "head"), "head", tests, projects, ".factory-test-results-x", CancellationToken.None);
 
         Assert.All(steps, s => Assert.Equal("cargo", s.Program));
+        Assert.All(steps, s => Assert.False(s.CaptureBuildStderr));
         Assert.Equal(
         [
             "Toolchain: --version",

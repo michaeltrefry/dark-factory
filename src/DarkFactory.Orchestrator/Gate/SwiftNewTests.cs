@@ -548,7 +548,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
 
     /// <summary>
     /// The build system every build and test step names (<c>--build-system native</c>), never the toolchain's default.
-    /// <see cref="ParseBuildErrors"/> reads the native build system's output: swiftc's diagnostics on standard output, plain
+    /// <see cref="ParseBuildErrors"/> reads the native build system's output: swiftc's diagnostics on either captured build stream, plain
     /// text. SwiftPM 6.4 made <c>swiftbuild</c> the default, which writes them to standard error, in colour, after its own
     /// <c>error: SwiftCompile … failed …</c> echo — read as it is, every base that does not build would be an
     /// <c>error</c> ("names no compiler error"). Named on both steps so <c>swift test --skip-build</c> finds the build's
@@ -579,7 +579,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             new(TestPhase.Restore, MakeDirectory, ["-p", resultsDirectory]),
         };
         steps.AddRange(byPackage.Select(g => new TestStep(TestPhase.Restore, Swift, ["package", "--package-path", g.Key, "resolve"])));
-        steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-system", BuildSystem, "--build-tests"]) { CaptureOutput = $"swift-build-{n}" }));
+        steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-system", BuildSystem, "--build-tests"]) { CaptureOutput = $"swift-build-{n}", CaptureBuildStderr = true }));
         foreach (var id in byPackage.SelectMany(g => g.Select(id => (Id: id, Package: g.Key))))
         {
             if (IsXCTestId(id.Id))

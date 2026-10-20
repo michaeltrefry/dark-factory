@@ -430,6 +430,7 @@ public class SwiftRunOutputTests
             @$"Test swift test --package-path . --build-system native --skip-build --disable-xctest --filter ^WordsTests\.Spaces\/double\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("WordsTests.Spaces/double()")} --event-stream-output-path .results/{SwiftNewTests.EventsName("WordsTests.Spaces/double()")} --event-stream-version 0",
             @$"Test swift test --package-path ./tools/cli --build-system native --skip-build --disable-xctest --filter ^ToolTests\.runs\(\)(/|$) --xunit-output .results/{SwiftNewTests.ReportName("ToolTests.runs()")} --event-stream-output-path .results/{SwiftNewTests.EventsName("ToolTests.runs()")} --event-stream-version 0",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
+        Assert.All(steps, s => Assert.Equal(s.Phase == TestPhase.Build, s.CaptureBuildStderr));
         Assert.Equal(["swift-build-0", "swift-build-1"], steps.Where(s => s.Phase == TestPhase.Build).Select(s => s.CaptureOutput));
         // Each test step reads exactly its own report and event stream (a pattern of its own hash alone) and keeps its exit code.
         Assert.Equal(new[] { "WordsTests.blank()", "WordsTests.Spaces/double()", "ToolTests.runs()" }.Select(id => ((string?)SwiftNewTests.ResultPattern(id), (string?)SwiftNewTests.OutputName(id))),

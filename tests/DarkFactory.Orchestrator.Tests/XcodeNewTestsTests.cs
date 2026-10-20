@@ -778,6 +778,7 @@ public class XcodeRunTests
             $"Test /usr/bin/xcrun xcresulttool get test-results tests --path .factory-test-results-x/{XcodeNewTests.BundleName("WordsTests/Spaces/empty()")}",
             $"Cleanup {wrapper} clean-derived-data",
         ], steps.Select(s => $"{s.Phase} {s.Program} {string.Join(' ', s.Args)}"));
+        Assert.All(steps, s => Assert.Equal(s.Phase == TestPhase.Build, s.CaptureBuildStderr));
         Assert.Equal(["xcode-build-0", XcodeNewTests.OutputName("WordsTests/blank()"), XcodeNewTests.JsonName("WordsTests/blank()")],
             steps.Skip(3).Take(3).Select(s => s.CaptureOutput));
         // The first step after the toolchain's and the last both delete the worktree's DerivedData (a failed first one fails the run).

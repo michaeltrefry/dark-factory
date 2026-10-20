@@ -68,6 +68,9 @@ public sealed record TestStep(TestPhase Phase, string Program, IReadOnlyList<str
     /// </summary>
     public string? CaptureOutput { get; init; }
 
+    /// <summary>Include stderr in captured build diagnostics only. Never for stdout-only machine result formats.</summary>
+    public bool CaptureBuildStderr { get; init; }
+
     /// <summary>
     /// The exit by which this step says the machine cannot run it for anyone (sc-26132: the iOS simulator's <c>prepare</c> outside
     /// a GUI login session, or with no simulator runtime): the runner then fails the whole run as the factory's failure
@@ -608,7 +611,7 @@ public static class NewTestsCheck
 
         if (headRun.Status != TestRunStatus.Ran)
         {
-            return Result(NewTestsOutcome.Error, $"the head {h} could not be tested ({Status(headRun.Status)}): {Tail(headRun.Log)}");
+            return Result(NewTestsOutcome.Error, $"the head {h} could not be tested ({Status(headRun.Status)}): {Tail(headRun.Log)}{BuildDiagnostics(headRun)}");
         }
         foreach (var (run, label) in new[] { (evidence.Run, "the base"), (evidence.Retry, "the base retry") })
         {
@@ -626,7 +629,7 @@ public static class NewTestsCheck
         if (unattributable.Count > 0)
         {
             return Result(NewTestsOutcome.Error,
-                $"the base {b} does not build with the PR's test files for a reason that says nothing about the new tests (not a compiler error in those files): {string.Join("; ", unattributable.Take(10))}");
+                $"the base {b} does not build with the PR's test files for a reason that says nothing about the new tests (not a compiler error in those files): {string.Join("; ", unattributable.Take(10))}{BuildDiagnostics(baseRun)}");
         }
 
         foreach (var (run, label) in new[] { (evidence.Run, $"the base {b}"), (evidence.Retry, $"the base retry {b}"), (headRun, $"the head {h}") })
@@ -692,6 +695,19 @@ public static class NewTestsCheck
         TestRunStatus.ToolchainMissing => "toolchain-missing",
         _ => status.ToString(),
     };
+
+    /// <summary>Keep concrete compiler causes even when an unlocated companion failure blocks attribution.
+    /// No raw build log is persisted: at most three redacted, single-line, 300-character located diagnostics.</summary>
+    private static string BuildDiagnostics(TestRunReport report)
+    {
+        var diagnostics = report.BuildErrors.Where(e => e.Path is not null).Take(3).Select(e =>
+        {
+            var safe = new string(e.ToString().Where(c => !char.IsControl(c) && char.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.Format).ToArray());
+            safe = CiHeal.Redact(safe);
+            return safe.Length > 300 ? safe[..300] + "…" : safe;
+        }).ToList();
+        return diagnostics.Count == 0 ? "" : "; compiler diagnostics: " + string.Join("; ", diagnostics);
+    }
 
     private static string Tail(string log)
     {
