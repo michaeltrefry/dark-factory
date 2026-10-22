@@ -1074,7 +1074,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 }
                 if (json.ExitCode != 0)
                 {
-                    throw new InvalidDataException($"xcresulttool exited {json.ExitCode}: {json.Content.Trim().Split('\n')[0]}");
+                    throw new InvalidDataException($"xcresulttool exited {json.ExitCode}: {InertCodeSpan(json.Content.Trim().Split('\n')[0], MaxHostMessageChars)}");
                 }
                 var cases = Cases(json.Content, out var hostFailures);
                 if (hostFailures.Count > 0)
@@ -1084,7 +1084,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 }
                 if (cases.FirstOrDefault(c => Hash(c.Name) != hash) is { } stranger)
                 {
-                    throw new InvalidDataException($"it holds {stranger.Name}, which is not the test its step ran");
+                    throw new InvalidDataException($"it holds {InertCodeSpan(stranger.Name, MaxHostNameChars)}, which is not the test its step ran");
                 }
                 var failed = cases.Count(c => c.Outcome == TestCaseResult.Failed);
                 if ((output.ExitCode == 0) != (failed == 0))
@@ -1110,6 +1110,12 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// <summary>At most this many failure messages of one test host's error are reported.</summary>
     public const int MaxHostMessages = 3;
 
+    /// <summary>At most this many host errors of one xcresult report are named.</summary>
+    public const int MaxHostFailures = 3;
+
+    /// <summary>At most this many characters of a host or test-case name from an xcresult report are named.</summary>
+    public const int MaxHostNameChars = 200;
+
     /// <summary>
     /// The pseudo test case xcresulttool records when a test target's host app (its <c>TEST_HOST</c>) fails to launch or
     /// crashes: a <c>Test Case</c> whose node identifier is <c>&lt;Host&gt; encountered an error</c> — no <c>/</c> and no
@@ -1125,21 +1131,23 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// </summary>
     private static string HostFailure(string name, IReadOnlyList<string> messages)
     {
-        static string Message(string text)
-        {
-            var line = UntrustedText.Inert(text);
-            if (line.Length <= MaxHostMessageChars)
-            {
-                return $"`{line}`";
-            }
-            var keep = char.IsHighSurrogate(line[MaxHostMessageChars - 1]) ? MaxHostMessageChars - 1 : MaxHostMessageChars;
-            return $"`{line[..keep]}` [cut: {line.Length} characters, the first {keep} shown]";
-        }
         var said = messages.Count == 0
             ? "xcresult gives no failure message"
-            : string.Join(", ", messages.Take(MaxHostMessages).Select(Message))
+            : string.Join(", ", messages.Take(MaxHostMessages).Select(message => InertCodeSpan(message, MaxHostMessageChars)))
                 + (messages.Count > MaxHostMessages ? $" and {messages.Count - MaxHostMessages} more" : "");
-        return $"{UntrustedText.CodeSpan(name)}: {said}";
+        return $"{InertCodeSpan(name, MaxHostNameChars)}: {said}";
+    }
+
+    /// <summary>Makes untrusted one-line result text inert, bounded, and safe to render in a Markdown code span.</summary>
+    private static string InertCodeSpan(string text, int maxChars)
+    {
+        var line = UntrustedText.Inert(text);
+        if (line.Length <= maxChars)
+        {
+            return $"`{line}`";
+        }
+        var keep = char.IsHighSurrogate(line[maxChars - 1]) && char.IsLowSurrogate(line[maxChars]) ? maxChars - 1 : maxChars;
+        return $"`{line[..keep]}` [cut: {line.Length} characters, the first {keep} shown]";
     }
 
     /// <summary>The test cases of one xcresulttool <c>get test-results tests</c> JSON document; throws <see cref="InvalidDataException"/> when it is not one.</summary>
@@ -1152,6 +1160,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     internal static List<TestCaseResult> Cases(string json, out List<string> hostFailures)
     {
         var hosts = new List<string>();
+        var hostFailureCount = 0;
         hostFailures = hosts;
         JsonElement root;
         try
@@ -1204,7 +1213,11 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                                     && m.TryGetProperty("name", out var mn) && mn.ValueKind == JsonValueKind.String)
                                 .Select(m => m.GetProperty("name").GetString()!)
                                 .ToList();
-                            hosts.Add(HostFailure($"{bundle}/{identifier}", messages));
+                            hostFailureCount++;
+                            if (hosts.Count < MaxHostFailures)
+                            {
+                                hosts.Add(HostFailure($"{bundle}/{identifier}", messages));
+                            }
                             break;
                         }
                         string Outcome(string? value) => value switch
@@ -1254,6 +1267,10 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
             }
         }
         Walk(nodes, null);
+        if (hostFailureCount > MaxHostFailures)
+        {
+            hostFailures = [.. hosts, $"and {hostFailureCount - MaxHostFailures} more"];
+        }
         return cases;
     }
 

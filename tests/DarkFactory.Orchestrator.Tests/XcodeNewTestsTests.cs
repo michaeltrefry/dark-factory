@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.Ledger;
@@ -823,7 +824,7 @@ public class XcodeRunTests
     [Theory]
     [InlineData("WordsTests/WordsTests/notBlank()", 65, "passed.json", 0, "xcodebuild exited 65, which does not agree with its 0 failing case(s)")]
     [InlineData("WordsTests/Outer/Inner/deep()", 0, "failed-nested.json", 0, "xcodebuild exited 0, which does not agree with its 1 failing case(s)")]
-    [InlineData("WordsTests/other()", 0, "passed.json", 0, "it holds WordsTests/WordsTests/notBlank(), which is not the test its step ran")]
+    [InlineData("WordsTests/other()", 0, "passed.json", 0, "it holds `WordsTests/WordsTests/notBlank()`, which is not the test its step ran")]
     [InlineData("WordsTests/WordsTests/notBlank()", 0, "passed.json", 1, "xcresulttool exited 1")]
     public void A_bundle_that_does_not_agree_with_its_step_is_unreadable(string id, int exit, string fixture, int jsonExit, string why)
     {
@@ -876,6 +877,86 @@ public class XcodeRunTests
         }
     }
 
+    private static string HostJson(params (string Name, IReadOnlyList<string> Messages)[] hosts) => JsonSerializer.Serialize(new
+    {
+        testNodes = new[]
+        {
+            new
+            {
+                nodeType = "Unit test bundle",
+                name = "Bundle",
+                children = hosts.Select(host => new
+                {
+                    nodeType = "Test Case",
+                    nodeIdentifier = host.Name,
+                    result = "Failed",
+                    children = host.Messages.Select(message => new { nodeType = "Failure Message", name = message }).ToArray(),
+                }).ToArray(),
+            },
+        },
+    });
+
+    [Fact]
+    public void Host_failure_messages_and_nodes_are_bounded_and_a_surrogate_is_not_split()
+    {
+        var surrogateAtTheCut = new string('x', XcodeNewTests.MaxHostMessageChars - 1) + "😀 tail";
+        var json = HostJson(
+            ("First encountered an error", [surrogateAtTheCut, "two", "three", "four"]),
+            ("Second encountered an error", []),
+            ("Third encountered an error", ["three"]),
+            ("Fourth encountered an error", ["four"]),
+            ("Fifth encountered an error", ["five"]));
+
+        var results = Parse("Bundle/test()", 65, json);
+
+        var why = Assert.Single(results.Unreadable);
+        Assert.Contains("and 1 more", why); // four messages, only three named
+        Assert.Contains("xcresult gives no failure message", why);
+        Assert.Contains("and 2 more", why); // five host nodes, only three named
+        Assert.DoesNotContain("Fourth encountered", why);
+        Assert.DoesNotContain("Fifth encountered", why);
+        Assert.DoesNotContain("four`", why);
+        Assert.DoesNotContain("\ud83d", why);
+        Assert.Contains("the first 299 shown", why);
+    }
+
+    [Fact]
+    public void Host_and_stranger_names_are_inert_bounded_and_do_not_split_a_surrogate()
+    {
+        // "Bundle/" is seven characters, then 192 x's: the emoji's high surrogate is exactly at index 199.
+        var longHost = new string('x', 192) + "😀TAIL encountered an error";
+        var host = Parse("Bundle/test()", 65, HostJson((longHost, ["failure"])));
+        var hostWhy = Assert.Single(host.Unreadable);
+        Assert.DoesNotContain("\ud83d", hostWhy);
+        Assert.DoesNotContain("TAIL", hostWhy);
+        Assert.Contains("the first 199 shown", hostWhy);
+
+        var stranger = "@someone #27 [the docs](https://example.test) <img>";
+        var json = XcodeFixture.Json("passed.json").Replace("WordsTests/notBlank()", stranger);
+        var foreign = Parse("WordsTests/other()", 0, json);
+        var strangerWhy = Assert.Single(foreign.Unreadable);
+        Assert.DoesNotContain("@someone", strangerWhy);
+        Assert.DoesNotContain("#27", strangerWhy);
+        Assert.DoesNotContain("https://", strangerWhy);
+        Assert.DoesNotContain("<img", strangerWhy);
+        Assert.Contains("＠someone ＃27 ［the docs］(https:⁄⁄example.test) ‹img›", strangerWhy);
+    }
+
+    [Fact]
+    public void Xcresulttools_error_line_is_inert_and_bounded()
+    {
+        var line = "@someone #27 [the docs](https://example.test) <img> " + new string('x', XcodeNewTests.MaxHostMessageChars);
+        var results = Parse("WordsTests/a()", 1, line + "\nsecond line", jsonExit: 1);
+
+        var why = Assert.Single(results.Unreadable);
+        Assert.DoesNotContain("@someone", why);
+        Assert.DoesNotContain("#27", why);
+        Assert.DoesNotContain("https://", why);
+        Assert.DoesNotContain("<img", why);
+        Assert.DoesNotContain("second line", why);
+        Assert.Contains("the first 300 shown", why);
+    }
+
     [Fact]
     public void Only_a_host_error_node_is_read_as_one_any_other_foreign_case_is_still_a_stranger()
     {
@@ -885,7 +966,7 @@ public class XcodeRunTests
         var results = Parse("CompositorTests/CompositorTests/composes()", 65, json);
 
         Assert.Empty(results.Cases);
-        Assert.Contains("it holds CompositorTests/Suite/LensWorks encountered an error, which is not the test its step ran", Assert.Single(results.Unreadable));
+        Assert.Contains("it holds `CompositorTests/Suite/LensWorks encountered an error`, which is not the test its step ran", Assert.Single(results.Unreadable));
     }
 
     [Theory]
