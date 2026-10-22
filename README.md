@@ -199,7 +199,7 @@ sandbox/taint rules still hold; recovery is not a gate bypass.
 
 #### Retry a panel truncated by its output budget
 
-`Review:MaxOutputTokens` is a positive integer, default **8192** for compatibility. Set it
+`Review:MaxOutputTokens` is a positive integer, default **32768**. Set it
 with configuration or `Review__MaxOutputTokens` in the environment. Every review and
 confirmation request uses it, including tool turns, the final-answer turn and transient
 resends. The panel still streams on the router's `high` class, with the existing deadlines;

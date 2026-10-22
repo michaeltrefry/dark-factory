@@ -534,7 +534,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         ? list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
         : null;
 
-    /// <summary><c>Review:MaxOutputTokens</c> (positive integer, default 8192): requested output limit of every panel turn.</summary>
+    /// <summary><c>Review:MaxOutputTokens</c> (positive integer, default 32768): requested output limit of every panel turn.</summary>
     public int ReviewMaxOutputTokens => AtLeast("Review:MaxOutputTokens", Gate.RouterReviewer.DefaultMaxOutputTokens, 1);
 
     /// <summary><c>Review:TimeoutMinutes</c> (&gt; 0, default 10): the longest one reviewer call may take.</summary>

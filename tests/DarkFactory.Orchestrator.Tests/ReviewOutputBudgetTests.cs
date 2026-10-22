@@ -9,7 +9,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class ReviewOutputBudgetTests
 {
     [Theory]
-    [InlineData(null, 8192)]
+    [InlineData(null, 32768)]
     [InlineData("24576", 24576)]
     [InlineData("1", 1)]
     public void Budget_defaults_and_positive_integers(string? value, int expected)
@@ -77,7 +77,7 @@ public class ReviewOutputBudgetTests
         });
     }
     [Theory]
-    [InlineData(null, null, 8192)]
+    [InlineData(null, null, 32768)]
     [InlineData(32768, null, 32768)]
     [InlineData(49152, 32768, 32768)]
     public async Task Default_configured_and_durably_pinned_budget_reach_the_wire(int? configured, int? pinned, int expected)
