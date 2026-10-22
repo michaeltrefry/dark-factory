@@ -133,7 +133,7 @@ public sealed class RouterReviewer(HttpClient http, string routerKey, TimeSpan? 
     /// <summary>At most this many of the base's file paths go into a prompt (the prompt says when the list is cut).</summary>
     public const int MaxFilePaths = 5_000;
 
-    public const int DefaultMaxOutputTokens = 8192;
+    public const int DefaultMaxOutputTokens = 32768;
     public int MaxOutputTokens { get; } = RequireBudget(maxOutputTokens);
     private static int RequireBudget(int value) => value > 0 ? value : throw new ArgumentOutOfRangeException(nameof(value), "Review:MaxOutputTokens must be a positive integer.");
     private const int MaxTitle = 300;
