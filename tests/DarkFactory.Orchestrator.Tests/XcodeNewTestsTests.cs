@@ -833,6 +833,61 @@ public class XcodeRunTests
         Assert.Contains(why, Assert.Single(results.Unreadable));
     }
 
+    /// <summary>
+    /// A test host (an app-hosted target's TEST_HOST) that crashed or never launched leaves a pseudo case
+    /// <c>CompositorTests/LensWorks encountered an error</c> (LensWorks PR #27): an unreadable report that says the host failed
+    /// and why — its failure messages inert and cut — so the check is an error on either commit, never a failure or a pass.
+    /// </summary>
+    [Theory]
+    [InlineData(65)]
+    [InlineData(0)]
+    public void A_test_host_that_failed_is_an_unreadable_report_naming_its_bounded_inert_failure_messages(int exit)
+    {
+        var results = Parse("CompositorTests/CompositorTests/composes()", exit, XcodeFixture.Json("host-error.json"));
+
+        Assert.Empty(results.Cases);
+        var why = Assert.Single(results.Unreadable);
+        Assert.StartsWith(XcodeNewTests.JsonName("CompositorTests/CompositorTests/composes()") + ": the test host of its step's test failed before the test ran: `CompositorTests/LensWorks encountered an error`: `Test crashed with signal kill", why);
+        Assert.DoesNotContain("which is not the test its step ran", why);
+        // Each message is inert (no mention, reference, link, HTML or code span survives) and cut at the bound with a marker.
+        Assert.DoesNotContain("@someone", why);
+        Assert.DoesNotContain("#27", why);
+        Assert.DoesNotContain("https://", why);
+        Assert.DoesNotContain("<img", why);
+        Assert.DoesNotContain("[the docs]", why);
+        Assert.DoesNotContain("TAILMARKER", why);
+        Assert.Matches(@"\[cut: \d+ characters, the first 300 shown\]", why);
+        Assert.Contains("`LensWorks (12345) encountered an error (Early unexpected exit, operation never finished bootstrapping)`", why);
+        Assert.Equal(6, why.Count(c => c == '`')); // the node's span and the two messages': no backtick of the tests' own
+        Assert.True(why.Length < 1_000, why);
+
+        var unreadable = new TestRunReport(TestRunStatus.Ran, results.Cases, "log") { UnreadableReports = results.Unreadable };
+        // A passing report of the same test is read as before.
+        var passing = Parse("CompositorTests/CompositorTests/composes()", 0,
+            XcodeFixture.Json("passed.json").Replace("\"WordsTests\"", "\"CompositorTests\"").Replace("\"WordsTests/notBlank()\"", "\"CompositorTests/composes()\""));
+        Assert.Empty(passing.Unreadable);
+        Assert.Equal([new TestCaseResult("CompositorTests/CompositorTests/composes()", TestCaseResult.Passed)], passing.Cases["CompositorTests/CompositorTests/composes()"]);
+        var good = new TestRunReport(TestRunStatus.Ran, passing.Cases, "log");
+        foreach (var (onBase, onHead) in new[] { (unreadable, good), (good, unreadable) })
+        {
+            var judged = NewTestsCheck.Judge("base0", "head1", "xcode-swift-testing", ["CompositorTests/CompositorTests/composes()"], onBase, onHead);
+            Assert.Equal(NewTestsOutcome.Error, judged.Outcome);
+            Assert.Contains("the test host of its step's test failed before the test ran", judged.Reason);
+        }
+    }
+
+    [Fact]
+    public void Only_a_host_error_node_is_read_as_one_any_other_foreign_case_is_still_a_stranger()
+    {
+        // A case named like a host error but with a test's shape (a path or a call) is a foreign case as before.
+        var json = XcodeFixture.Json("host-error.json").Replace("\"nodeIdentifier\" : \"LensWorks encountered an error\"", "\"nodeIdentifier\" : \"Suite/LensWorks encountered an error\"");
+
+        var results = Parse("CompositorTests/CompositorTests/composes()", 65, json);
+
+        Assert.Empty(results.Cases);
+        Assert.Contains("it holds CompositorTests/Suite/LensWorks encountered an error, which is not the test its step ran", Assert.Single(results.Unreadable));
+    }
+
     [Theory]
     [InlineData("not json", "it is not JSON")]
     [InlineData("{}", "no testNodes")]

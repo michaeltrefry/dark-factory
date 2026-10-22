@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Worker;
+using DarkFactory.Orchestrator.WorkSources;
 
 namespace DarkFactory.Orchestrator.Gate;
 
@@ -1075,7 +1076,12 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 {
                     throw new InvalidDataException($"xcresulttool exited {json.ExitCode}: {json.Content.Trim().Split('\n')[0]}");
                 }
-                var cases = Cases(json.Content);
+                var cases = Cases(json.Content, out var hostFailures);
+                if (hostFailures.Count > 0)
+                {
+                    // The test host never ran the test (LensWorks PR #27): no evidence either way, but say why.
+                    throw new InvalidDataException($"the test host of its step's test failed before the test ran: {string.Join("; ", hostFailures)}");
+                }
                 if (cases.FirstOrDefault(c => Hash(c.Name) != hash) is { } stranger)
                 {
                     throw new InvalidDataException($"it holds {stranger.Name}, which is not the test its step ran");
@@ -1098,9 +1104,55 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         return new TestResults(results.ToDictionary(kv => kv.Key, kv => (IReadOnlyList<TestCaseResult>)kv.Value, StringComparer.Ordinal), unreadable);
     }
 
-    /// <summary>The test cases of one xcresulttool <c>get test-results tests</c> JSON document; throws <see cref="InvalidDataException"/> when it is not one.</summary>
-    internal static List<TestCaseResult> Cases(string json)
+    /// <summary>At most this many characters of each failure message of a test host's error are reported (<see cref="HostFailure"/>).</summary>
+    public const int MaxHostMessageChars = 300;
+
+    /// <summary>At most this many failure messages of one test host's error are reported.</summary>
+    public const int MaxHostMessages = 3;
+
+    /// <summary>
+    /// The pseudo test case xcresulttool records when a test target's host app (its <c>TEST_HOST</c>) fails to launch or
+    /// crashes: a <c>Test Case</c> whose node identifier is <c>&lt;Host&gt; encountered an error</c> — no <c>/</c> and no
+    /// <c>(</c>, which every real test's identifier has — with <c>Failure Message</c> children saying why.
+    /// </summary>
+    private static bool IsHostError(string identifier) =>
+        identifier.EndsWith(" encountered an error", StringComparison.Ordinal) && !identifier.Contains('/') && !identifier.Contains('(');
+
+    /// <summary>
+    /// A test host's error in words for the <c>new-tests</c> row and the reports: the node's name and its first
+    /// <see cref="MaxHostMessages"/> failure messages, each made inert (<see cref="UntrustedText.Inert"/> in a code span: the
+    /// tests wrote them) and cut at <see cref="MaxHostMessageChars"/> with a marker.
+    /// </summary>
+    private static string HostFailure(string name, IReadOnlyList<string> messages)
     {
+        static string Message(string text)
+        {
+            var line = UntrustedText.Inert(text);
+            if (line.Length <= MaxHostMessageChars)
+            {
+                return $"`{line}`";
+            }
+            var keep = char.IsHighSurrogate(line[MaxHostMessageChars - 1]) ? MaxHostMessageChars - 1 : MaxHostMessageChars;
+            return $"`{line[..keep]}` [cut: {line.Length} characters, the first {keep} shown]";
+        }
+        var said = messages.Count == 0
+            ? "xcresult gives no failure message"
+            : string.Join(", ", messages.Take(MaxHostMessages).Select(Message))
+                + (messages.Count > MaxHostMessages ? $" and {messages.Count - MaxHostMessages} more" : "");
+        return $"{UntrustedText.CodeSpan(name)}: {said}";
+    }
+
+    /// <summary>The test cases of one xcresulttool <c>get test-results tests</c> JSON document; throws <see cref="InvalidDataException"/> when it is not one.</summary>
+    internal static List<TestCaseResult> Cases(string json) => Cases(json, out _);
+
+    /// <summary>
+    /// As <see cref="Cases(string)"/>, with each test host error node (<see cref="IsHostError"/>) set apart in words
+    /// (<see cref="HostFailure"/>), never read as a case.
+    /// </summary>
+    internal static List<TestCaseResult> Cases(string json, out List<string> hostFailures)
+    {
+        var hosts = new List<string>();
+        hostFailures = hosts;
         JsonElement root;
         try
         {
@@ -1143,6 +1195,17 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                         if (string.IsNullOrEmpty(identifier))
                         {
                             throw new InvalidDataException("a test case has no nodeIdentifier");
+                        }
+                        if (IsHostError(identifier))
+                        {
+                            var messages = children.ValueKind != JsonValueKind.Array ? [] : children.EnumerateArray()
+                                .Where(m => m.ValueKind == JsonValueKind.Object
+                                    && m.TryGetProperty("nodeType", out var t) && t.ValueKind == JsonValueKind.String && t.GetString() == "Failure Message"
+                                    && m.TryGetProperty("name", out var mn) && mn.ValueKind == JsonValueKind.String)
+                                .Select(m => m.GetProperty("name").GetString()!)
+                                .ToList();
+                            hosts.Add(HostFailure($"{bundle}/{identifier}", messages));
+                            break;
                         }
                         string Outcome(string? value) => value switch
                         {
