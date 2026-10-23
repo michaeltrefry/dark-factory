@@ -216,6 +216,7 @@ public static class FactoryCli
             : recoveryReassess(parse.GetValue(reassessRepo)!, ct));
         return new RootCommand("Dark Factory orchestrator")
         {
+            IosNewTestsCli.Build(),
             runCommand,
             recoverCommand,
             new Command("recovery", "Repository hot-file recovery: read-only status, and the human re-arm of an escalated incident")
