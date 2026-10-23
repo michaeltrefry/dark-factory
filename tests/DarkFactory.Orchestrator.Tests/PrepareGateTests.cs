@@ -336,6 +336,31 @@ public sealed class PrepareGateTests : IDisposable
     }
 
     [Fact]
+    public async Task A_prepared_ios_target_transports_only_its_declared_hash_pinned_inputs_not_the_owners_cache()
+    {
+        var zip = ArtifactFetchTests.Zip(("Generated.swift", "public let generated = 1", 0x81A4));
+        _server.Serve("https://files.example/gen.zip", zip);
+        var recipe = $"version: 1\nartifacts: [{{name: gen, url: 'https://files.example/gen.zip', sha256: {ArtifactFetchTests.Sha256(zip)}, max_bytes: 100000, unpack: zip}}]\n"
+            + "steps: [{name: copy, argv: [/bin/cp, '${artifact:gen}/Generated.swift', '${worktree}/Tally/Generated.swift']}]\n";
+        var runner = WithRecipes(RemoteIosGateTests.Sources(), recipe, recipe);
+        var prepared = await Stage().ForCommitsAsync(runner, Repo, RemoteIosGateTests.Base, RemoteIosGateTests.Head, null, CancellationToken.None);
+        var dispatch = new RemoteIosGateTests.Dispatch();
+        var result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(true), Repo,
+            RemoteIosGateTests.Base, RemoteIosGateTests.Head, "gate-sc-1", null, CancellationToken.None, prepared,
+            new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero, MaxPolls = 1 });
+        Assert.True(result.Passed, result.Reason);
+        Assert.Empty(runner.Runs);
+        Assert.Equal(2, dispatch.Requests.Count);
+        Assert.All(dispatch.Requests, request => {
+            Assert.DoesNotContain(_root, request.Execution!);
+            using var json = System.Text.Json.JsonDocument.Parse(request.Execution!);
+            var declared = json.RootElement.GetProperty("prepare");
+            Assert.Equal(ArtifactFetchTests.Sha256(zip), declared.GetProperty("artifacts")[0].GetProperty("sha256").GetString());
+            Assert.Equal("${artifact:gen}/Generated.swift", declared.GetProperty("steps")[0].GetProperty("argv")[1].GetString());
+        });
+    }
+
+    [Fact]
     public async Task A_steps_directory_must_be_a_directory_inside_the_worktree_once_every_link_is_resolved()
     {
         var worktree = Directory.CreateDirectory(Path.Combine(_root, "wt")).FullName;

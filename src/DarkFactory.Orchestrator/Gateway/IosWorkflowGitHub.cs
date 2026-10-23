@@ -1,6 +1,5 @@
 using System.IO.Compression;
 using System.Net;
-using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using DarkFactory.Orchestrator.Gate;
@@ -19,7 +18,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
     public static readonly IReadOnlyDictionary<string, string> DispatchPermissions = new Dictionary<string, string>
         { ["actions"] = "write" };
     private const int MaxApiBytes = 512 * 1024;
-    private const int MaxArchiveBytes = 2 * 1024 * 1024;
+    private const int MaxArchiveBytes = 3 * 1024 * 1024;
     private static string Root(RepoRef repo) => $"repos/{Uri.EscapeDataString(repo.Owner)}/{Uri.EscapeDataString(repo.Name)}";
 
     public async Task<IosSealedWorkflow?> ReadDefaultWorkflowAsync(RepoRef repo, CancellationToken ct)
@@ -44,16 +43,23 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
     public async Task DispatchAsync(RepoRef repo, IosSealedWorkflow workflow, IosNewTestsRequest input, string correlation, CancellationToken ct)
     {
         if (!RemoteIosWorkflow.Trusted(workflow)) throw new InvalidDataException("Unsealed dispatch.");
-        // Obtain only Actions-write, scoped by GitHubApp to this repository, before the sole external write. An App
-        // still installed with Actions-read refuses at token creation; never fall back to the owner's credential.
+        var inputs = new Dictionary<string, string> { ["nonce"] = correlation, ["base"] = input.Base,
+            ["head"] = input.Head, ["tests"] = JsonSerializer.Serialize(input.Tests) };
+        if (input.Execution is { } execution)
+        {
+            if (Encoding.UTF8.GetByteCount(execution) > RemoteIosNewTests.MaxExecutionBytes) throw new InvalidDataException("Oversized execution descriptor.");
+            inputs["execution"] = execution;
+        }
+        var payload = JsonSerializer.Serialize(new { @ref = workflow.DefaultBranch, inputs });
+        // GitHub limits the complete workflow_dispatch input payload, not just the execution field. Count UTF-8
+        // after JSON escaping (test ids and replacements may be non-ASCII); reject before minting a write token.
+        if (Encoding.UTF8.GetByteCount(payload) > 65535) throw new InvalidDataException("Oversized workflow dispatch inputs.");
+        // Only Actions-write, scoped to this repository; never fall back to the owner's credential. The ref is ONLY
+        // the authenticated default branch. A movement is rejected by the exact sealed-commit run provenance check.
         var token = await gateApp.CreateInstallationTokenAsync(repo, ct, DispatchPermissions);
         using var request = GitHubApp.Request(HttpMethod.Post,
             $"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(RemoteIosWorkflow.Path)}/dispatches", "Bearer", token.Token);
-        // GitHub's workflow_dispatch ref is a branch/tag, not a PR SHA. It comes ONLY from the authenticated
-        // default-branch read. The caller accepts results only from the exact default commit it verified; a branch
-        // movement (including an owner replacing the workflow) invalidates the run, never adopts another definition.
-        request.Content = JsonContent.Create(new { @ref = workflow.DefaultBranch, inputs = new {
-            nonce = correlation, @base = input.Base, head = input.Head, tests = JsonSerializer.Serialize(input.Tests) } });
+        request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
         using var response = await http.SendAsync(request, ct);
         await Success(response, ct);
     }
@@ -82,6 +88,15 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
             throw new InvalidDataException("Different side environments.");
         if (b.GetProperty("base").GetString() != h.GetProperty("base").GetString() || b.GetProperty("head").GetString() != h.GetProperty("head").GetString())
             throw new InvalidDataException("Different side commits.");
+        if (b.TryGetProperty("execution", out var baseExecution) || h.TryGetProperty("execution", out _))
+        {
+            var headExecution = h.GetProperty("execution");
+            var baseUnused = baseExecution.GetProperty("status").GetString() == "unused";
+            var headUnused = headExecution.GetProperty("status").GetString() == "unused";
+            if (baseUnused == headUnused || b.GetProperty("executionHash").GetString() != h.GetProperty("executionHash").GetString())
+                throw new InvalidDataException("Different or ambiguous side execution plans.");
+            return (baseUnused ? h : b).GetRawText();
+        }
         var baseRows = b.GetProperty("tests").EnumerateArray().ToArray();
         var headRows = h.GetProperty("tests").EnumerateArray().ToArray();
         if (baseRows.Length != headRows.Length) throw new InvalidDataException("Different side test sets.");

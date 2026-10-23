@@ -383,7 +383,7 @@ public static class FactoryRunner
         using var artifactHttp = OutboundHttp.ArtifactDownload(DnsArtifactResolver.Instance);
         var artifacts = new Prepare.ArtifactFetcher(artifactHttp, DnsArtifactResolver.Instance,
             new Prepare.ArtifactCache(Prepare.ArtifactCache.RootOf(options.WorkRoot)));
-        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph, artifacts);
+        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph, artifacts, new RemoteIosNewTests(new IosWorkflowGitHub(githubHttp, gateApp)) { Timeout = options.TestTimeout });
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
@@ -499,12 +499,12 @@ public static class FactoryRunner
     /// (sc-25709; without a CodeGraph token there is none, and the check fails wherever a tier requires it).
     /// </summary>
     internal static GateStage CreateGate(FactoryOptions options, IGateGitHub github, IReviewer reviewer, GitWorkspace workspaces,
-        WorkerSlots? slots, ICodeGraphOverlays? codeGraph = null, Prepare.ArtifactFetcher? artifacts = null) =>
+        WorkerSlots? slots, ICodeGraphOverlays? codeGraph = null, Prepare.ArtifactFetcher? artifacts = null, RemoteIosNewTests? remoteIos = null) =>
         new(github, reviewer, options.CiPollInterval, options.CiTimeout, Tests: new SandboxTestRunner(workspaces, slots, options.TestTimeout),
             Overlays: new ReviewOverlays(codeGraph, options.CodeGraphOverlayTimeout),
             Risk: codeGraph is ICodeGraphRisk risk ? new CodeGraphRiskReader(risk, options.CodeGraphOverlayTimeout) : null,
             // Each commit's prepare recipe (sc-26232): its artifacts fetched owner-side (bounded by Gate:TestTimeoutMinutes), its steps run before the build.
-            Prepare: artifacts is null ? null : new Prepare.PrepareStage(artifacts, options.TestTimeout));
+            Prepare: artifacts is null ? null : new Prepare.PrepareStage(artifacts, options.TestTimeout), RemoteIos: remoteIos);
 
     /// <summary>
     /// The sandbox readiness probe of the slot the calling flow holds (<see cref="WorkerSlots.EnsureReadyAsync"/>; a failure names

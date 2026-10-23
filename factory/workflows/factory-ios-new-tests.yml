@@ -17,6 +17,9 @@ on:
       tests:
         required: true
         type: string
+      execution:
+        default: ''
+        type: string
 permissions: {}
 jobs:
   sources:
@@ -79,7 +82,7 @@ jobs:
       matrix:
         side: [base, head]
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 35
     permissions: {}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -97,6 +100,7 @@ jobs:
           BASE: ${{ inputs.base }}
           HEAD: ${{ inputs.head }}
           TESTS: ${{ inputs.tests }}
+          EXECUTION: ${{ inputs.execution }}
         run: |
           # FACTORY_RUNNER
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

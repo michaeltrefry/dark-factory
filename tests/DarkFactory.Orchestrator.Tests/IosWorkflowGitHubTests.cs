@@ -124,6 +124,56 @@ public sealed class IosWorkflowGitHubTests
         }), side == value ? corrupt : null);
     }
 
+    [Theory]
+    [InlineData("base", false)]
+    [InlineData("head", false)]
+    [InlineData("base", true)]
+    [InlineData("head", true)]
+    public async Task Execution_transport_binds_both_independent_vm_artifacts_to_one_plan(string active, bool wrongHash)
+    {
+        var api = Api()
+            .On("GET " + Root + "/actions/runs/12/artifacts", HttpStatusCode.OK,
+                """{"total_count":2,"artifacts":[{"id":8,"name":"factory-ios-result-abc-base","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}},{"id":9,"name":"factory-ios-result-abc-head","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}}]}""")
+            .On("GET " + Root + "/actions/artifacts/8/zip", _ => Zip(Side("base")))
+            .On("GET " + Root + "/actions/artifacts/9/zip", _ => Zip(Side("head")));
+        var read = Client(api).ResultAsync(Repo, new(12, "", Commit, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success"), "abc", CancellationToken.None);
+        if (wrongHash) await Assert.ThrowsAsync<InvalidDataException>(() => read);
+        else {
+            using var result = JsonDocument.Parse(await read);
+            Assert.Equal(active, result.RootElement.GetProperty("side").GetString());
+            Assert.Equal("ran", result.RootElement.GetProperty("execution").GetProperty("status").GetString());
+        }
+        string Side(string side) => RemoteIosNewTestsTests.WithEnvironment(JsonSerializer.Serialize(new {
+            version = 1, nonce = "abc", @base = Base, head = Head, side,
+            executionHash = wrongHash && side == "head" ? "different" : new string('a', 64),
+            execution = new { status = side == active ? "ran" : "unused", commit = active == "base" ? Base : Head,
+                root = side == active ? "/tmp/factory-ios-test/" + side : null, log = "", files = Array.Empty<object>() }
+        }));
+    }
+
+    [Fact]
+    public async Task Execution_dispatch_sends_the_exact_bounded_plan_and_no_owner_credentials()
+    {
+        var execution = "{\"side\":\"base\",\"prepare\":null}";
+        var api = Api().On("POST " + Root + "/actions/workflows/factory-ios-new-tests.yml/dispatches", request => {
+            using var body = JsonDocument.Parse(request.Body!);
+            Assert.Equal(execution, body.RootElement.GetProperty("inputs").GetProperty("execution").GetString());
+            Assert.DoesNotContain("gate-token", request.Body!);
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        });
+        await Client(api).DispatchAsync(Repo, new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["OtherTests/newTest()"])
+            { Execution = execution }, "abc", CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidDataException>(() => Client(api).DispatchAsync(Repo,
+            new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["OtherTests/newTest()"])
+                { Execution = new string('x', RemoteIosNewTests.MaxExecutionBytes + 1) }, "abc", CancellationToken.None));
+        // The descriptor fits its own bound, but the repeated ids and JSON escaping make the total payload too big.
+        await Assert.ThrowsAsync<InvalidDataException>(() => Client(api).DispatchAsync(Repo,
+            new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, Enumerable.Repeat(new string('界', 200), 100).ToArray())
+                { Execution = new string('x', 1000) }, "abc", CancellationToken.None));
+        Assert.Single(api.Requests, r => r.PathAndQuery.EndsWith("/dispatches", StringComparison.Ordinal));
+        Assert.Single(api.Requests, r => r.PathAndQuery == "/app/installations/5/access_tokens");
+    }
+
     private static FakeApi Api() => new FakeApi()
         .On("GET " + Root + "/installation", HttpStatusCode.OK, """{"id":5}""")
         .On("POST /app/installations/5/access_tokens", HttpStatusCode.Created, $$$"""{"token":"gate-token","expires_at":"{{{Now.AddMinutes(30):O}}}"}""");

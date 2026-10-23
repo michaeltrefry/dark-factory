@@ -441,9 +441,9 @@ public static class NewTestsCheck
     /// is added to the result's reason.
     /// </param>
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
-        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null)
+        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null, RemoteIosNewTests? remoteIos = null)
     {
-        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared);
+        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared, remoteIos);
         return prepared?.Note is { } note ? result with { Reason = $"{result.Reason}; {note}" } : result;
     }
 
@@ -455,7 +455,7 @@ public static class NewTestsCheck
         path.StartsWith(Prepare.PrepareRecipe.Directory + "/", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<NewTestsResult> RunCoreAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
-        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared)
+        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared, RemoteIosNewTests? remoteIos)
     {
         var changes = prepared?.Changes ?? await runner.ChangesAsync(repo, baseSha, headSha, ct);
         var source = new TestSource(runner, repo, baseSha, headSha);
@@ -465,7 +465,14 @@ public static class NewTestsCheck
             var set = await strategy.IdentifyAsync(source, changes, ct);
             if (set.TestFiles.Count > 0 || set.Tests.Count > 0 || set.Unisolable.Count > 0)
             {
-                found.Add((strategy, set));
+                if (remoteIos is not null && strategy is XcodeNewTests && set.Tests.Count > 0)
+                {
+                    // A PR may contain both platforms. Partition only the test ids, preserving the complete code-written
+                    // base overlay and Swift location metadata for attribution and retries; no iOS test is sent locally.
+                    foreach (var group in set.Tests.GroupBy(t => XcodeNewTests.Build.From(set.Projects[t]).Platform))
+                        found.Add((strategy, set with { Tests = group.ToArray() }));
+                }
+                else found.Add((strategy, set));
             }
         }
         var claimed = found.SelectMany(f => f.Set.TestFiles).SelectMany(f => f.Paths).ToHashSet(StringComparer.Ordinal);
@@ -511,9 +518,18 @@ public static class NewTestsCheck
                     Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : baseReplacements,
                 };
             }
+            var ios = remoteIos is not null && strategy is XcodeNewTests && XcodeNewTests.Build.From(set.Projects[set.Tests[0]]).Platform == XcodeProject.IOS;
+            async Task<TestRunReport> Run(TestRunSpec spec, IReadOnlyList<string> tests)
+            {
+                if (!ios) return await runner.RunAsync(repo, spec, ct);
+                var recipe = prepared?.Recipes.GetValueOrDefault(spec.Commit);
+                if (recipe is null && prepared?.StepsFor(spec.Commit).Count > 0)
+                    return TestRunReport.Failed(TestRunStatus.NoResults, "The declared prepare recipe is missing; private owner-cache steps are never transported.");
+                return await remoteIos!.RunExecutionAsync(repo, baseSha, headSha, spec, tests, set.Projects, recipe, ct);
+            }
             var baseSpec = await Spec($"{runName}-base", baseSha, headSha, set.Tests);
-            var baseRun = await runner.RunAsync(repo, baseSpec, ct);
-            var headRun = await runner.RunAsync(repo, await Spec($"{runName}-head", headSha, null, set.Tests), ct);
+            var baseRun = await Run(baseSpec, set.Tests);
+            var headRun = await Run(await Spec($"{runName}-head", headSha, null, set.Tests), set.Tests);
             var evidence = new BaseEvidence(baseRun);
             if (baseRun.Status == TestRunStatus.BuildFailed && headRun.Status == TestRunStatus.Ran)
             {
@@ -549,7 +565,7 @@ public static class NewTestsCheck
                     // The retry's files: the base run's replacements, and over them the files without what did not compile.
                     var replaced = rewritten.ToDictionary(p => p, p => stripped[p], StringComparer.Ordinal);
                     var retrySpec = await Spec($"{runName}-base-retry{(attempt == 1 ? "" : $"-{attempt}")}", baseSha, headSha, remaining) with { Replacements = replaced };
-                    var retry = await runner.RunAsync(repo, retrySpec, ct);
+                    var retry = await Run(retrySpec, remaining);
                     evidence = evidence with { Retry = retry };
                     if (retry.Status != TestRunStatus.BuildFailed)
                     {
