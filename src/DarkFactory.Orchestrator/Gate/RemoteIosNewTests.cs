@@ -98,6 +98,28 @@ public sealed class RemoteIosNewTests(IIosWorkflowGitHub github)
         }
     }
 
+    // The hosted runner selects these explicit simulator identifiers; never accept an available/latest fallback.
+    public const string SimulatorRuntime = "com.apple.CoreSimulator.SimRuntime.iOS-18-5";
+    public const string SimulatorDeviceType = "com.apple.CoreSimulator.SimDeviceType.iPhone-16";
+
+    internal sealed record EnvironmentIdentity(
+        [property: JsonPropertyName("runtime")] string Runtime,
+        [property: JsonPropertyName("deviceType")] string DeviceType,
+        [property: JsonPropertyName("xcode")] string Xcode,
+        [property: JsonPropertyName("build")] string Build);
+
+    internal static EnvironmentIdentity EnvironmentOf(JsonElement root)
+    {
+        var environment = root.GetProperty("environment");
+        var identity = new EnvironmentIdentity(environment.GetProperty("runtime").GetString()!,
+            environment.GetProperty("deviceType").GetString()!, environment.GetProperty("xcode").GetString()!,
+            environment.GetProperty("build").GetString()!);
+        if (identity.Runtime != SimulatorRuntime || identity.DeviceType != SimulatorDeviceType
+            || string.IsNullOrWhiteSpace(identity.Xcode) || string.IsNullOrWhiteSpace(identity.Build))
+            throw new InvalidDataException("Unproven iOS environment identity.");
+        return identity;
+    }
+
     private static NewTestsResult Parse(string text, string nonce, IosNewTestsRequest request)
     {
         if (Encoding.UTF8.GetByteCount(text) > MaxResultBytes) throw new InvalidDataException("Oversized iOS result.");
@@ -107,6 +129,7 @@ public sealed class RemoteIosNewTests(IIosWorkflowGitHub github)
         if (root.GetProperty("version").GetInt32() != 1 || root.GetProperty("nonce").GetString() != nonce
             || root.GetProperty("base").GetString() != request.Base || root.GetProperty("head").GetString() != request.Head)
             throw new InvalidDataException("Wrong result identity.");
+        EnvironmentOf(root);
         var rows = root.GetProperty("tests").EnumerateArray().ToArray();
         if (rows.Length != request.Tests.Count) throw new InvalidDataException("Incomplete result.");
         var results = new List<NewTestResult>();

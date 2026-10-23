@@ -77,6 +77,9 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
         using var headResult = await SideResult("head");
         var b = baseResult.RootElement;
         var h = headResult.RootElement;
+        var environment = RemoteIosNewTests.EnvironmentOf(b);
+        if (environment != RemoteIosNewTests.EnvironmentOf(h))
+            throw new InvalidDataException("Different side environments.");
         if (b.GetProperty("base").GetString() != h.GetProperty("base").GetString() || b.GetProperty("head").GetString() != h.GetProperty("head").GetString())
             throw new InvalidDataException("Different side commits.");
         var baseRows = b.GetProperty("tests").EnumerateArray().ToArray();
@@ -89,7 +92,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
                 head = pair.Second.GetProperty("head").GetString() };
         }).ToArray();
         return JsonSerializer.Serialize(new { version = 1, nonce = correlation, @base = b.GetProperty("base").GetString(),
-            head = b.GetProperty("head").GetString(), tests = rows });
+            head = b.GetProperty("head").GetString(), environment, tests = rows });
 
         async Task<JsonDocument> SideResult(string side)
         {

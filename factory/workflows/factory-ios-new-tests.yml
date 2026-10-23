@@ -86,8 +86,11 @@ jobs:
         with:
           name: factory-ios-sources
           path: sources
+      # The embedded collector creates a fresh, non-admin build principal on
+      # this disposable VM. Source runs only there, beneath deny-by-default
+      # Seatbelt; the Actions runner retains collection/publication authority.
       - name: Run new tests separately on base and head
-        shell: python
+        shell: /usr/bin/python3 -I {0}
         env:
           SIDE: ${{ matrix.side }}
           NONCE: ${{ inputs.nonce }}

@@ -42,8 +42,8 @@ public sealed class IosWorkflowGitHubTests
                 FakeApi.Json(HttpStatusCode.OK, $$$"""{"workflow_runs":[{"id":12,"display_title":"factory-ios-{{{nonce}}}","head_sha":"{{{Commit}}}","event":"workflow_dispatch","path":"{{{RemoteIosWorkflow.Path}}}","run_attempt":1,"status":"completed","conclusion":"success"}]}"""))
             .On("GET " + Root + "/actions/runs/12/artifacts", _ => FakeApi.Json(HttpStatusCode.OK,
                 $$$"""{"total_count":2,"artifacts":[{"id":8,"name":"factory-ios-result-{{{nonce}}}-base","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}},{"id":9,"name":"factory-ios-result-{{{nonce}}}-head","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}}]}"""))
-            .On("GET " + Root + "/actions/artifacts/8/zip", _ => Zip($$$"""{"version":1,"nonce":"{{{nonce}}}","base":"{{{Base}}}","head":"{{{Head}}}","side":"base","tests":[{"test":"TallyTests/TallyTests/testNew","base":"failed"}]}"""))
-            .On("GET " + Root + "/actions/artifacts/9/zip", _ => Zip($$$"""{"version":1,"nonce":"{{{nonce}}}","base":"{{{Base}}}","head":"{{{(wrongSideCommit ? Base : Head)}}}","side":"head","tests":[{"test":"TallyTests/TallyTests/testNew","head":"passed"}]}"""));
+            .On("GET " + Root + "/actions/artifacts/8/zip", _ => Zip(RemoteIosNewTestsTests.WithEnvironment($$$"""{"version":1,"nonce":"{{{nonce}}}","base":"{{{Base}}}","head":"{{{Head}}}","side":"base","tests":[{"test":"TallyTests/TallyTests/testNew","base":"failed"}]}""")))
+            .On("GET " + Root + "/actions/artifacts/9/zip", _ => Zip(RemoteIosNewTestsTests.WithEnvironment($$$"""{"version":1,"nonce":"{{{nonce}}}","base":"{{{Base}}}","head":"{{{(wrongSideCommit ? Base : Head)}}}","side":"head","tests":[{"test":"TallyTests/TallyTests/testNew","head":"passed"}]}""")));
         var client = Client(api);
         var result = await new RemoteIosNewTests(client) { PollInterval = TimeSpan.Zero }.RunAsync(Repo,
             new(Base, Head, ["TallyTests/TallyTests/testNew"]), CancellationToken.None);
@@ -93,6 +93,35 @@ public sealed class IosWorkflowGitHubTests
                 """{"total_count":1,"artifacts":[{"id":8,"name":"factory-ios-result-abc-base","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}}]}""")
             .On("GET " + Root + "/actions/artifacts/8/zip", _ => Zip(oversized ? new string('x', RemoteIosNewTests.MaxResultBytes + 1) : "{}", name, count));
         await Assert.ThrowsAsync<InvalidDataException>(() => Client(api).ResultAsync(Repo, new(12, "", Commit, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success"), "abc", CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("base", "missing")]
+    [InlineData("head", "missing")]
+    [InlineData("base", "runtime")]
+    [InlineData("head", "runtime")]
+    [InlineData("base", "deviceType")]
+    [InlineData("head", "deviceType")]
+    [InlineData("base", "xcode")]
+    [InlineData("head", "xcode")]
+    [InlineData("base", "build")]
+    [InlineData("head", "build")]
+    [InlineData("head", "different-xcode")]
+    [InlineData("head", "different-build")]
+    public async Task Artifacts_require_validated_identical_explicit_environments(string side, string corrupt)
+    {
+        var api = Api()
+            .On("GET " + Root + "/actions/runs/12/artifacts", HttpStatusCode.OK,
+                """{"total_count":2,"artifacts":[{"id":8,"name":"factory-ios-result-abc-base","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}},{"id":9,"name":"factory-ios-result-abc-head","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}}]}""")
+            .On("GET " + Root + "/actions/artifacts/8/zip", _ => Zip(Side("base")))
+            .On("GET " + Root + "/actions/artifacts/9/zip", _ => Zip(Side("head")));
+        await Assert.ThrowsAnyAsync<Exception>(() => Client(api).ResultAsync(Repo,
+            new(12, "", Commit, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success"), "abc", CancellationToken.None));
+
+        string Side(string value) => RemoteIosNewTestsTests.WithEnvironment(JsonSerializer.Serialize(new {
+            version = 1, nonce = "abc", @base = Base, head = Head, side = value,
+            tests = new[] { new { test = "TallyTests/TallyTests/testNew", @base = "failed", head = "passed" } }
+        }), side == value ? corrupt : null);
     }
 
     private static FakeApi Api() => new FakeApi()

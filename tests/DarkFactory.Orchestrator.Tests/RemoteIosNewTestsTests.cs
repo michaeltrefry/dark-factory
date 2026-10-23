@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator;
 using DarkFactory.Orchestrator.Gate;
 
@@ -87,9 +88,44 @@ public sealed class RemoteIosNewTestsTests
         Assert.Equal(0, github.ResultReads);
     }
 
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("null")]
+    [InlineData("array")]
+    [InlineData("runtime")]
+    [InlineData("deviceType")]
+    [InlineData("xcode")]
+    [InlineData("build")]
+    [InlineData("missing-build")]
+    [InlineData("numeric-xcode")]
+    public async Task An_unvalidated_environment_is_not_executed_evidence(string corrupt)
+    {
+        var github = new FakeWorkflow { EnvironmentCorrupt = corrupt };
+        var result = await new RemoteIosNewTests(github) { PollInterval = TimeSpan.Zero }.RunAsync(Repo, Request, CancellationToken.None);
+        Assert.Equal("error", result.Outcome);
+    }
+
+    internal const string EnvironmentJson = """{"runtime":"com.apple.CoreSimulator.SimRuntime.iOS-18-5","deviceType":"com.apple.CoreSimulator.SimDeviceType.iPhone-16","xcode":"16.4","build":"16F6"}""";
+
+    internal static string WithEnvironment(string json, string? corrupt = null)
+    {
+        var result = JsonNode.Parse(json)!.AsObject();
+        var environment = JsonNode.Parse(EnvironmentJson)!.AsObject();
+        if (corrupt is "runtime" or "deviceType") environment[corrupt] = "available-fallback";
+        if (corrupt is "xcode" or "build") environment[corrupt] = " ";
+        if (corrupt == "different-xcode") environment["xcode"] = "16.3";
+        if (corrupt == "different-build") environment["build"] = "16F7";
+        if (corrupt == "missing-build") environment.Remove("build");
+        if (corrupt == "numeric-xcode") environment["xcode"] = 16;
+        if (corrupt != "missing") result["environment"] = corrupt switch {
+            "null" => null, "array" => new JsonArray(), _ => environment
+        };
+        return result.ToJsonString();
+    }
+
     internal sealed class FakeWorkflow : IIosWorkflowGitHub
     {
-        public string? Invalid, Corrupt;
+        public string? Invalid, Corrupt, EnvironmentCorrupt;
         public bool Authorized = true;
         public string BaseOutcome = "failed", HeadOutcome = "passed";
         public int Dispatches, ResultReads;
@@ -124,12 +160,12 @@ public sealed class RemoteIosNewTestsTests
         public Task<string> ResultAsync(RepoRef repo, IosWorkflowRun run, string correlation, CancellationToken ct)
         {
             ResultReads++;
-            return Task.FromResult(JsonSerializer.Serialize(new {
+            return Task.FromResult(WithEnvironment(JsonSerializer.Serialize(new {
                 version = 1, nonce = Corrupt == "nonce" ? "other" : nonce,
                 @base = Corrupt == "base" ? Head : Base, head = Head,
                 tests = new[] { new { test = Corrupt == "tests" ? "Other/test" : Request.Tests[0],
                     @base = Corrupt == "outcome" ? "invented" : BaseOutcome, head = HeadOutcome } }
-            }));
+            }), EnvironmentCorrupt));
         }
     }
 }
