@@ -89,9 +89,13 @@ def attributable_not_built(log, source, test, path):
     diagnostics = [line for line in log.splitlines() if 'error:' in line]
     if not diagnostics:
         return False
+    def diagnostic_path(value):
+        # Xcode canonicalizes macOS's /private/var and /private/tmp aliases in
+        # diagnostics differently from Python's temporary-directory spelling.
+        return value[8:] if value.startswith(('/private/var/', '/private/tmp/')) else value
     for line in diagnostics:
-        match = re.fullmatch(re.escape(str(path)) + r':([0-9]+):[0-9]+: error: .+', line)
-        if not match or not start + 1 <= int(match[1]) <= end + 1:
+        match = re.fullmatch(r'(.+):([0-9]+):[0-9]+: error: .+', line)
+        if not match or diagnostic_path(match[1]) != diagnostic_path(str(path)) or not start + 1 <= int(match[2]) <= end + 1:
             return False
         if re.search(r'ambiguous|invalid redeclaration|\([A-Za-z_][A-Za-z0-9_]*\)$', line):
             return False

@@ -49,7 +49,7 @@ public sealed class IosWorkflowRunnerTests
             await process.WaitForExitAsync();
             var output = await stdout + await stderr;
             Assert.True(process.ExitCode == 0, output);
-            Assert.Contains("Ran 11 tests", output);
+            Assert.Contains("Ran 12 tests", output);
         }
         finally { Directory.Delete(directory, true); }
     }

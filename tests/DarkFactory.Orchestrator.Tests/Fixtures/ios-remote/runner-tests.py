@@ -47,6 +47,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual('None\nNone\n', output)
 
+    def test_xcode_private_temporary_path_alias_is_the_same_file(self):
+        attribute = globals_['attributable_not_built']
+        self.assertTrue(attribute('/var/tmp/fixture/TallyTests.swift:5:1: error: no member', SOURCE, IDENTIFIER, pathlib.Path('/private/var/tmp/fixture/TallyTests.swift')))
+        self.assertFalse(attribute('/var/tmp/other/TallyTests.swift:5:1: error: no member', SOURCE, IDENTIFIER, pathlib.Path('/private/var/tmp/fixture/TallyTests.swift')))
+
     def test_existing_test_is_not_new(self):
         with self.assertRaises(ValueError):
             self.exercise(existing=True)
