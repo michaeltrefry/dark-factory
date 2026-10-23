@@ -347,7 +347,7 @@ public sealed class PrepareGateTests : IDisposable
         var dispatch = new RemoteIosGateTests.Dispatch();
         var result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(true), Repo,
             RemoteIosGateTests.Base, RemoteIosGateTests.Head, "gate-sc-1", null, CancellationToken.None, prepared,
-            new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero, MaxPolls = 1 });
+            new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero });
         Assert.True(result.Passed, result.Reason);
         Assert.Empty(runner.Runs);
         Assert.Equal(2, dispatch.Requests.Count);

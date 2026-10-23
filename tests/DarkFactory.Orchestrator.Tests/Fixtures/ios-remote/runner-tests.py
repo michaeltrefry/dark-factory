@@ -49,7 +49,22 @@ def tree(result):
     return {'testNodes': [{'nodeType': 'Test Case', 'nodeIdentifierURL': 'test://com.apple.xcode/Tally/' + IDENTIFIER, 'result': result}]}
 
 
+def owned_group_stop(pid, sig, records, stop):
+    # This seam never invokes a native signal, even for a valid own-tree request.
+    record = records.read_text().splitlines()[0]
+    if pid != int(record.split('|', 1)[0]) or sig != globals_['signal'].SIGKILL:
+        raise AssertionError('foreign signal refused by owned process seam')
+    stop()
+
+
 class RunnerTests(unittest.TestCase):
+    def setUp(self):
+        # Production now tears down every command group, including a completed
+        # collector command. Unit fixtures never deliver a host signal.
+        signals = mock.patch.object(globals_['os'], 'killpg')
+        signals.start()
+        self.addCleanup(signals.stop)
+
     def test_base_fails_head_passes_and_only_test_file_is_overlaid(self):
         self.exercise()
 
@@ -229,7 +244,7 @@ class RunnerTests(unittest.TestCase):
             globals_['command'] = lambda args, cwd: (1, '')
             try:
                 os.chdir(workspace)
-                with mock.patch.dict(os.environ, HOME=str(owner), SIDE='base'):
+                with mock.patch.dict(os.environ, HOME=str(owner), SIDE='base'), mock.patch.object(globals_['Principal'], 'darwin_directories', return_value=[]):
                     globals_['Principal'](root)
                 self.assertIn(['/bin/chmod', '-N', str(owner.resolve()), str(workspace.resolve()), str(root)], calls)
                 self.assertEqual((0o700, 0o700, 0o755), tuple(stat.S_IMODE(path.stat().st_mode) for path in (owner, workspace, root)))
@@ -250,7 +265,7 @@ class RunnerTests(unittest.TestCase):
             events = []
             principal.sweep = lambda: events.append('quiescent')
             previous = globals_['admin']
-            globals_['admin'] = lambda args: events.append(args)
+            globals_['admin'] = lambda args, **kwargs: events.append(args)
             saved = root.with_name(root.name + '-saved')
             try:
                 principal.close()
@@ -301,6 +316,15 @@ class RunnerTests(unittest.TestCase):
             self.exercise(cleanup_failure=True)
 
     def test_successful_source_command_still_quiesces_before_returning(self):
+        # Exercise refusal before any process integration. A foreign pid cannot
+        # even request the OwnProcess handshake, much less reach a native sink.
+        with tempfile.TemporaryDirectory() as d:
+            records = pathlib.Path(d) / 'owned'
+            records.write_text('43210|fixture start\n')
+            stopped = mock.Mock()
+            with self.assertRaisesRegex(AssertionError, 'foreign signal'):
+                owned_group_stop(43211, globals_['signal'].SIGKILL, records, stopped)
+            self.assertFalse(stopped.called)
         stopped = []
         code, output = globals_['command'](['/bin/echo', 'finished'], '/', stop=lambda: stopped.append(True))
         self.assertEqual((0, 'finished\n', [True]), (code, output, stopped))
@@ -311,7 +335,7 @@ class RunnerTests(unittest.TestCase):
         old_command = globals_['command']
         for survives in (False, True):
             calls = []
-            def fake(args, cwd):
+            def fake(args, cwd, **kwargs):
                 if args[0] == '/bin/ps':
                     return 0, '501 R\n' + ('550 R\n550 S\n' if survives or not calls else '550 Z\n')
                 calls.append(args)
@@ -376,6 +400,7 @@ class RunnerTests(unittest.TestCase):
     def exercise(self, build_failure=False, foreign_error=False, existing=False, mixed=None, cleanup_failure=False):
         with tempfile.TemporaryDirectory() as d:
             before = pathlib.Path.cwd()
+            workspaces = []
             os.chdir(d)
             try:
                 pathlib.Path('sources').mkdir()
@@ -421,7 +446,8 @@ class RunnerTests(unittest.TestCase):
                     return 0, json.dumps(tree('Failed' if side == 'base' else 'Passed'))
                 class FakePrincipal:
                     def __init__(self, root):
-                        pass
+                        self.root = root
+                        workspaces.append(root)
                     def share(self, path):
                         pass
                     def run(self, args, cwd):
@@ -430,6 +456,7 @@ class RunnerTests(unittest.TestCase):
                         calls.append(['principal-close'])
                         if cleanup_failure:
                             raise ValueError('cleanup refused')
+                        tempfile.TemporaryDirectory._rmtree(self.root)
                 originals = globals_['command'], globals_['Principal']
                 globals_['command'], globals_['Principal'] = command, FakePrincipal
                 try:
@@ -454,14 +481,17 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(2, calls.count(['principal-close']))
             finally:
                 os.chdir(before)
+                # No real principal/process ran in exercise(): explicit cleanup
+                # of these known fixture trees is safe even after fake refusal.
+                for path in workspaces:
+                    if path.exists():
+                        tempfile.TemporaryDirectory._rmtree(path)
 
 
 if len(sys.argv) > 2 and sys.argv[2] == '--process':
     directory, script, mode = pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5]
     globals_['OUTPUT_LIMIT'] = 4096
-    def forbidden_signal(*args):
-        raise AssertionError('raw signal refused: only the OwnProcess host may stop this fixture')
-    setattr(globals_['os'], 'killpg', forbidden_signal)
+    setattr(globals_['os'], 'killpg', lambda pid, sig: owned_group_stop(pid, sig, directory / 'owned', stop_owned_tree))
     def stop_owned_tree():
         (directory / 'stop').write_text('stop requested')
         for _ in range(1000):

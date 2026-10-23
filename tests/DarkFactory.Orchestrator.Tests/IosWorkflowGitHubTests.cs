@@ -76,8 +76,9 @@ public sealed class IosWorkflowGitHubTests
         var api = new FakeApi()
             .On("GET " + Root + "/installation", HttpStatusCode.OK, """{"id":5}""")
             .On("POST /app/installations/5/access_tokens", HttpStatusCode.Forbidden, """{"message":"Actions write not granted"}""");
-        await Assert.ThrowsAsync<InvalidOperationException>(() => Client(api).DispatchAsync(Repo,
+        var error = await Assert.ThrowsAsync<IosWorkflowNotSentException>(() => Client(api).DispatchAsync(Repo,
             new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["TallyTests/TallyTests/testNew"]), new string('a', 32), CancellationToken.None));
+        Assert.Equal("remote-dispatch-not-sent: The gate App could not obtain repository Actions write authorization. Check its installation and permissions; no workflow was sent.", error.Message);
         Assert.DoesNotContain(api.Requests, r => r.PathAndQuery.Contains("/dispatches"));
         Assert.All(api.Requests.Where(r => r.Method != HttpMethod.Get), r => Assert.Equal("/app/installations/5/access_tokens", r.PathAndQuery));
     }
@@ -163,15 +164,115 @@ public sealed class IosWorkflowGitHubTests
         });
         await Client(api).DispatchAsync(Repo, new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["OtherTests/newTest()"])
             { Execution = execution }, "abc", CancellationToken.None);
-        await Assert.ThrowsAsync<InvalidDataException>(() => Client(api).DispatchAsync(Repo,
+        await Assert.ThrowsAsync<IosWorkflowNotSentException>(() => Client(api).DispatchAsync(Repo,
             new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["OtherTests/newTest()"])
                 { Execution = new string('x', RemoteIosNewTests.MaxExecutionBytes + 1) }, "abc", CancellationToken.None));
         // The descriptor fits its own bound, but the repeated ids and JSON escaping make the total payload too big.
-        await Assert.ThrowsAsync<InvalidDataException>(() => Client(api).DispatchAsync(Repo,
+        await Assert.ThrowsAsync<IosWorkflowNotSentException>(() => Client(api).DispatchAsync(Repo,
             new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, Enumerable.Repeat(new string('界', 200), 100).ToArray())
                 { Execution = new string('x', 1000) }, "abc", CancellationToken.None));
         Assert.Single(api.Requests, r => r.PathAndQuery.EndsWith("/dispatches", StringComparison.Ordinal));
         Assert.Single(api.Requests, r => r.PathAndQuery == "/app/installations/5/access_tokens");
+    }
+
+    [Theory]
+    [InlineData("base")]
+    [InlineData("head")]
+    public async Task Single_side_execution_needs_only_the_VM_that_was_requested(string side)
+    {
+        var api = SingleSide(side, true);
+        var error = await Record.ExceptionAsync(() => Client(api).ResultAsync(Repo,
+            new(12, "", Commit, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success"), "abc", CancellationToken.None));
+        Assert.Null(error);
+    }
+
+    [Fact]
+    public async Task A_single_fixture_artifact_is_not_a_complete_two_side_test_result()
+    {
+        var error = await Record.ExceptionAsync(() => Client(SingleSide("base", false)).ResultAsync(Repo,
+            new(12, "", Commit, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success"), "abc", CancellationToken.None));
+        Assert.IsType<InvalidDataException>(error);
+    }
+
+    private static FakeApi SingleSide(string side, bool execution) => Api()
+        .On("GET " + Root + "/actions/runs/12/artifacts", HttpStatusCode.OK,
+            $$$"""{"total_count":1,"artifacts":[{"id":8,"name":"factory-ios-result-abc-{{{side}}}","size_in_bytes":300,"expired":false,"workflow_run":{"id":12}}]}""")
+        .On("GET " + Root + "/actions/artifacts/8/zip", _ => Zip(RemoteIosNewTestsTests.WithEnvironment(
+            JsonSerializer.Serialize(new { version = 1, nonce = "abc", @base = Base, head = Head, side,
+                execution = execution ? new { status = "ran", files = Array.Empty<object>() } : null }))));
+
+    [Fact]
+    public async Task Dispatch_transports_the_absolute_deadline_so_queueing_spends_the_budget()
+    {
+        var before = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+        double deadline = 0;
+        var api = Api().On("POST " + Root + "/actions/workflows/factory-ios-new-tests.yml/dispatches", request => {
+            var inputs = JsonDocument.Parse(request.Body!).RootElement.GetProperty("inputs");
+            if (inputs.TryGetProperty("execution_deadline_unix_seconds", out var value))
+                deadline = double.Parse(value.GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        });
+        await Client(api).DispatchAsync(Repo, new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["TallyTests/TallyTests/testNew"])
+            { ExecutionBudgetSeconds = 90 }, new string('a', 32), CancellationToken.None);
+        Assert.InRange(deadline, before + 90, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 90);
+    }
+
+    [Fact]
+    public async Task A_POST_transport_failure_is_not_marked_definitely_unsent()
+    {
+        var api = Api().On("POST " + Root + "/actions/workflows/factory-ios-new-tests.yml/dispatches", _ => throw new HttpRequestException("lost answer"));
+        var error = await Record.ExceptionAsync(() => Client(api).DispatchAsync(Repo,
+            new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["TallyTests/TallyTests/testNew"]), new string('a', 32), CancellationToken.None));
+        Assert.IsType<HttpRequestException>(error);
+    }
+
+    [Fact]
+    public async Task Cancellation_after_token_mint_but_before_POST_is_definitely_unsent()
+    {
+        using var stop = new CancellationTokenSource();
+        var api = new FakeApi()
+            .On("GET " + Root + "/installation", HttpStatusCode.OK, """{"id":5}""")
+            .On("POST /app/installations/5/access_tokens", _ => {
+                stop.Cancel();
+                return FakeApi.Json(HttpStatusCode.Created, $$$"""{"token":"gate-token","expires_at":"{{{Now.AddMinutes(30):O}}}"}""");
+            });
+        var error = await Record.ExceptionAsync(() => Client(api).DispatchAsync(Repo,
+            new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["TallyTests/TallyTests/testNew"]), new string('a', 32), stop.Token));
+        Assert.True(error is IosWorkflowNotSentException { Cancelled: true });
+    }
+
+    [Fact]
+    public async Task Cancellation_targets_the_correlated_run_with_actions_write_only()
+    {
+        var api = Api().On("POST " + Root + "/actions/runs/42/cancel", HttpStatusCode.Accepted, "");
+        await Client(api).CancelAsync(Repo, new(42, "factory-ios-" + new string('a', 32), Commit,
+            "workflow_dispatch", RemoteIosWorkflow.Path, 1, "in_progress", null), CancellationToken.None);
+        Assert.Equal("{\"actions\":\"write\"}", JsonDocument.Parse(api.Requests.Single(r => r.PathAndQuery.EndsWith("/access_tokens")).Body!)
+            .RootElement.GetProperty("permissions").GetRawText());
+    }
+
+    [Fact]
+    public async Task Dispatch_transports_a_positive_remaining_execution_budget()
+    {
+        double budget = 0;
+        var api = Api().On("POST " + Root + "/actions/workflows/factory-ios-new-tests.yml/dispatches", request => {
+            var inputs = JsonDocument.Parse(request.Body!).RootElement.GetProperty("inputs");
+            if (inputs.TryGetProperty("execution_budget_seconds", out var value))
+                budget = double.Parse(value.GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        });
+        await Client(api).DispatchAsync(Repo, new("main", Commit, RemoteIosWorkflow.Text), new(Base, Head, ["TallyTests/TallyTests/testNew"])
+            { ExecutionBudgetSeconds = 90 }, new string('a', 32), CancellationToken.None);
+        Assert.InRange(budget, 1, 90);
+    }
+
+    [Fact]
+    public async Task Transport_failure_diagnostics_never_include_the_raw_response_body()
+    {
+        var api = Api().On("POST " + Root + "/actions/runs/42/cancel", HttpStatusCode.Forbidden, "SECRET arbitrary transport body");
+        var error = await Record.ExceptionAsync(() => Client(api).CancelAsync(Repo,
+            new(42, "factory-ios-" + new string('a', 32), Commit, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "in_progress", null), CancellationToken.None));
+        Assert.Equal("remote-github-http: GitHub rejected the iOS workflow request (HTTP 403). Check the gate App installation and its repository Actions permissions; no usable executed evidence.", error?.Message);
     }
 
     private static FakeApi Api() => new FakeApi()

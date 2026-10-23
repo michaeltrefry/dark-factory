@@ -40,6 +40,7 @@ public class RemoteIosGateTests
             if (Wait) await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return Never ? [] : [new(42, "factory-ios-" + Correlation, Workflow, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success")];
         }
+        public Task CancelAsync(RepoRef repo, IosWorkflowRun run, CancellationToken ct) => Task.CompletedTask;
         public Task<string> ResultAsync(RepoRef repo, IosWorkflowRun run, string correlation, CancellationToken ct)
         {
             if (Corrupt == "json") return Task.FromResult("not json");
@@ -68,9 +69,9 @@ public class RemoteIosGateTests
         }
     }
 
-    private static Task<NewTestsResult> Run(FakeTestRunner source, Dispatch dispatch, int polls = 1, TimeSpan? timeout = null) =>
+    private static Task<NewTestsResult> Run(FakeTestRunner source, Dispatch dispatch, TimeSpan? timeout = null) =>
         NewTestsCheck.RunAsync(source, NewTestsCheck.StrategiesFor(true), Repo, Base, Head, "gate-sc-1", null, CancellationToken.None,
-            remoteIos: new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero, MaxPolls = polls, Timeout = timeout ?? TimeSpan.FromMinutes(1) });
+            remoteIos: new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero, CleanupTimeout = TimeSpan.FromMilliseconds(20), Timeout = timeout ?? (dispatch.Never ? TimeSpan.FromMilliseconds(20) : TimeSpan.FromMinutes(1)) });
 
     [Fact]
     public async Task All_discovered_ios_unit_and_ui_tests_run_remotely_with_the_exact_test_overlay()
@@ -179,7 +180,7 @@ public class RemoteIosGateTests
     {
         var dispatch = new Dispatch();
         var h = new GatePipelineTests.Harness { Swift = true,
-            RemoteIos = new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero, MaxPolls = 1 } };
+            RemoteIos = new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero } };
         var source = Sources();
         h.TestRunner.BaseFiles.Clear();
         foreach (var pair in source.BaseFiles) h.TestRunner.BaseFiles.Add(pair.Key, pair.Value);

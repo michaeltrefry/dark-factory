@@ -16,6 +16,7 @@ public sealed partial class RemoteIosNewTests
     public async Task<TestRunReport> RunExecutionAsync(RepoRef repo, string baseSha, string headSha, TestRunSpec spec,
         IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects, PrepareRecipe? prepare, CancellationToken ct)
     {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(Timeout);
         try
@@ -44,19 +45,19 @@ public sealed partial class RemoteIosNewTests
                 overlayPaths = spec.OverlayPaths, deletePaths = spec.DeletePaths, replacements = spec.Replacements, builds, prepare = recipe });
             if (Encoding.UTF8.GetByteCount(descriptor) > MaxExecutionBytes) throw new InvalidDataException("Oversized iOS execution descriptor.");
             var request = new IosNewTestsRequest(baseSha, headSha, tests) { Execution = descriptor };
-            var (text, nonce) = await InvokeAsync(repo, request, deadline.Token);
-            return ParseExecution(text, nonce, request, spec.Strategy, side, spec.Commit);
+            var (text, nonce) = await InvokeAsync(repo, request, () => Timeout - elapsed.Elapsed, deadline.Token);
+            return ParseExecution(text, nonce, request, spec.Strategy, side, spec.Commit, prepare);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             // Neither transport bodies nor arbitrary exception text (which may include secrets) become evidence.
             return TestRunReport.Failed(ex is OperationCanceledException or TimeoutException ? TestRunStatus.TimedOut : TestRunStatus.NoResults,
-                "iOS remote execution failed (" + ex.GetType().Name + "); no usable executed evidence.");
+                Failure(ex));
         }
     }
 
-    private static TestRunReport ParseExecution(string text, string nonce, IosNewTestsRequest request, INewTestStrategy strategy, string side, string commit)
+    private static TestRunReport ParseExecution(string text, string nonce, IosNewTestsRequest request, INewTestStrategy strategy, string side, string commit, PrepareRecipe? prepare)
     {
         if (Encoding.UTF8.GetByteCount(text) > MaxResultBytes) throw new InvalidDataException("Oversized execution result.");
         using var doc = JsonDocument.Parse(text, new JsonDocumentOptions { MaxDepth = 64 });
@@ -77,6 +78,35 @@ public sealed partial class RemoteIosNewTests
         var log = execution.GetProperty("log").GetString()!;
         var files = execution.GetProperty("files").Deserialize<ResultFile[]>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new InvalidDataException("Missing reports.");
         var status = execution.GetProperty("status").GetString();
+        if (status == "prepare-failed")
+        {
+            if (files.Length != 0 || log.Length != 0) throw new InvalidDataException("Unexpected prepare evidence.");
+            var failure = execution.GetProperty("failure");
+            var code = failure.GetProperty("code").GetString();
+            var step = failure.GetProperty("step");
+            var reason = code switch
+            {
+                "prepare-step-failed" => "A declared prepare step exited unsuccessfully. Check its declared command, inputs and dependencies.",
+                "prepare-step-timeout" => "A declared prepare step exceeded its execution budget. Reduce its work or increase the configured test timeout.",
+                "artifact-fetch-failed" => "A declared artifact could not be downloaded, verified or unpacked. Check its URL, digest and size limits.",
+                "package-hydration-failed" => "Package hydration failed on the hosted runner. Check dependency declarations and package availability.",
+                "package-ipc-unavailable" => "The hosted runner cannot provide the exact isolated package endpoints. Check loopback binding and sandbox support; no broader network access is permitted.",
+                "package-storage-unavailable" => "The hosted runner cannot verify isolated temporary and cache directories owned by its fresh source role. Check the role's Darwin directory setup; owner directories are never granted.",
+                "package-signature-refused" => "Native SwiftPM refused a package signature or its supplied trust policy. Check the package signing evidence and registry trust configuration; validation is never bypassed.",
+                "package-auth-required" => "A package requires credentials unavailable to the hosted runner. Use an anonymously accessible pinned dependency or a declared prepared artifact; owner credentials are never forwarded.",
+                "package-unavailable" => "A package was not found or requires credentials unavailable to the hosted runner. Check its URL and anonymous availability; owner credentials are never forwarded.",
+                _ => throw new InvalidDataException("Unknown prepare failure.")
+            };
+            var stepFailure = code is "prepare-step-failed" or "prepare-step-timeout";
+            if (stepFailure)
+            {
+                var index = step.GetInt32();
+                if (prepare is null || index < 0 || index >= prepare.Steps.Count) throw new InvalidDataException("Unknown prepare step.");
+                reason = $"Prepare step {index + 1}: " + reason;
+            }
+            else if (step.ValueKind != JsonValueKind.Null) throw new InvalidDataException("Unexpected prepare step.");
+            return TestRunReport.Failed(TestRunStatus.NoResults, "remote-" + code + ": " + reason);
+        }
         if (status == "build-failed")
         {
             if (files.Length != 0) throw new InvalidDataException("Reports from a failed build.");

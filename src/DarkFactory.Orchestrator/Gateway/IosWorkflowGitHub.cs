@@ -42,26 +42,74 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
 
     public async Task DispatchAsync(RepoRef repo, IosSealedWorkflow workflow, IosNewTestsRequest input, string correlation, CancellationToken ct)
     {
-        if (!RemoteIosWorkflow.Trusted(workflow)) throw new InvalidDataException("Unsealed dispatch.");
-        var inputs = new Dictionary<string, string> { ["nonce"] = correlation, ["base"] = input.Base,
-            ["head"] = input.Head, ["tests"] = JsonSerializer.Serialize(input.Tests) };
-        if (input.Execution is { } execution)
+        var mayHaveSent = false;
+        var phase = "validation";
+        try
         {
-            if (Encoding.UTF8.GetByteCount(execution) > RemoteIosNewTests.MaxExecutionBytes) throw new InvalidDataException("Oversized execution descriptor.");
-            inputs["execution"] = execution;
+            if (!RemoteIosWorkflow.Trusted(workflow)) throw new InvalidDataException("Unsealed dispatch.");
+            var inputs = new Dictionary<string, string> { ["nonce"] = correlation, ["base"] = input.Base,
+                ["head"] = input.Head, ["tests"] = JsonSerializer.Serialize(input.Tests) };
+            if (input.Execution is { } execution)
+            {
+                if (Encoding.UTF8.GetByteCount(execution) > RemoteIosNewTests.MaxExecutionBytes) throw new InvalidDataException("Oversized execution descriptor.");
+                inputs["execution"] = execution;
+            }
+            if (!double.IsFinite(input.ExecutionBudgetSeconds) || input.ExecutionBudgetSeconds < 0)
+                throw new InvalidDataException("Invalid iOS execution budget.");
+            if (input.ExecutionBudgetSeconds > 0)
+            {
+                inputs["execution_budget_seconds"] = input.ExecutionBudgetSeconds.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+                inputs["execution_deadline_unix_seconds"] = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 + input.ExecutionBudgetSeconds)
+                    .ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+            }
+            var payload = JsonSerializer.Serialize(new { @ref = workflow.DefaultBranch, inputs });
+            // GitHub limits the complete workflow_dispatch input payload, not just the execution field. Count UTF-8
+            // after JSON escaping (test ids and replacements may be non-ASCII); reject before minting a write token.
+            if (Encoding.UTF8.GetByteCount(payload) > 65535) throw new InvalidDataException("Oversized workflow dispatch inputs.");
+            // Only Actions-write, scoped to this repository; never fall back to the owner's credential. The ref is ONLY
+            // the authenticated default branch. A movement is rejected by the exact sealed-commit run provenance check.
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            phase = "authorization";
+            var token = await gateApp.CreateInstallationTokenAsync(repo, ct, DispatchPermissions);
+            phase = "preparation";
+            if (input.ExecutionBudgetSeconds > 0)
+            {
+                var remaining = input.ExecutionBudgetSeconds - elapsed.Elapsed.TotalSeconds;
+                if (remaining <= 0) throw new OperationCanceledException(ct);
+                inputs["execution_budget_seconds"] = remaining.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+                payload = JsonSerializer.Serialize(new { @ref = workflow.DefaultBranch, inputs });
+                if (Encoding.UTF8.GetByteCount(payload) > 65535) throw new InvalidDataException("Oversized workflow dispatch inputs.");
+            }
+            using var request = GitHubApp.Request(HttpMethod.Post,
+                $"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(RemoteIosWorkflow.Path)}/dispatches", "Bearer", token.Token);
+            request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+            ct.ThrowIfCancellationRequested();
+            mayHaveSent = true; // From this exact boundary onward, a lost answer never proves an unsent dispatch.
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            await Success(response, ct);
         }
-        var payload = JsonSerializer.Serialize(new { @ref = workflow.DefaultBranch, inputs });
-        // GitHub limits the complete workflow_dispatch input payload, not just the execution field. Count UTF-8
-        // after JSON escaping (test ids and replacements may be non-ASCII); reject before minting a write token.
-        if (Encoding.UTF8.GetByteCount(payload) > 65535) throw new InvalidDataException("Oversized workflow dispatch inputs.");
-        // Only Actions-write, scoped to this repository; never fall back to the owner's credential. The ref is ONLY
-        // the authenticated default branch. A movement is rejected by the exact sealed-commit run provenance check.
+        catch (Exception ex) when (!mayHaveSent && ex is not OutOfMemoryException)
+        {
+            var cancelled = ex is OperationCanceledException;
+            var reason = cancelled ? "The iOS dispatch was cancelled before the workflow POST; no workflow was sent."
+                : phase == "validation" ? "The iOS workflow dispatch inputs failed local validation. Check the sealed workflow, execution descriptor and payload limits; no workflow was sent."
+                : phase == "authorization" ? "The gate App could not obtain repository Actions write authorization. Check its installation and permissions; no workflow was sent."
+                : "The iOS workflow POST could not be prepared. Check the execution budget and dispatch inputs; no workflow was sent.";
+            // Neither arbitrary exception messages nor GitHub token-mint response bodies escape this boundary.
+            throw new IosWorkflowNotSentException(reason, cancelled);
+        }
+    }
+
+    public async Task CancelAsync(RepoRef repo, IosWorkflowRun run, CancellationToken ct)
+    {
+        if (run.Id <= 0 || run.Event != "workflow_dispatch" || run.Path != RemoteIosWorkflow.Path || run.Attempt != 1
+            || !RemoteIosWorkflow.Sha(run.HeadSha) || !System.Text.RegularExpressions.Regex.IsMatch(run.Title, "^factory-ios-[0-9a-f]{32}$"))
+            throw new InvalidDataException("Uncorrelated iOS cancellation.");
         var token = await gateApp.CreateInstallationTokenAsync(repo, ct, DispatchPermissions);
-        using var request = GitHubApp.Request(HttpMethod.Post,
-            $"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(RemoteIosWorkflow.Path)}/dispatches", "Bearer", token.Token);
-        request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
-        using var response = await http.SendAsync(request, ct);
-        await Success(response, ct);
+        using var request = GitHubApp.Request(HttpMethod.Post, $"{Root(repo)}/actions/runs/{run.Id}/cancel", "Bearer", token.Token);
+        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        // A completion racing cancellation is reconciled by the caller's subsequent terminal read, never assumed here.
+        if (response.StatusCode != HttpStatusCode.Conflict) await Success(response, ct);
     }
 
     public async Task<IReadOnlyList<IosWorkflowRun>> RunsAsync(RepoRef repo, CancellationToken ct)
@@ -79,6 +127,22 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
         var root = json.RootElement;
         var artifacts = root.GetProperty("artifacts").EnumerateArray().ToArray();
         if (root.GetProperty("total_count").GetInt32() != artifacts.Length) throw new InvalidDataException("Incomplete artifacts listing.");
+        // General execution dispatches schedule only the requested side's VM. Its one artifact still has the
+        // ordinary side provenance checks; ParseExecution additionally binds its side and hash to the original plan.
+        if (artifacts.Length == 1)
+        {
+            var name = artifacts[0].GetProperty("name").GetString();
+            var side = name == "factory-ios-result-" + correlation + "-base" ? "base"
+                : name == "factory-ios-result-" + correlation + "-head" ? "head"
+                : throw new InvalidDataException("Unexpected single-side artifact.");
+            using var single = await SideResult(side);
+            var result = single.RootElement;
+            RemoteIosNewTests.EnvironmentOf(result);
+            if (!result.TryGetProperty("execution", out var execution) || execution.ValueKind != JsonValueKind.Object || execution.GetProperty("status").GetString() == "unused")
+                throw new InvalidDataException("Missing executed side evidence.");
+            return result.GetRawText();
+        }
+        if (artifacts.Length != 2) throw new InvalidDataException("Unexpected result artifact count.");
         using var baseResult = await SideResult("base");
         using var headResult = await SideResult("head");
         var b = baseResult.RootElement;
@@ -154,7 +218,8 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
     private static Task Success(HttpResponseMessage response, CancellationToken ct)
     {
         // Do not put GitHub's arbitrary response text, or a token embedded in it, into a step error.
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"GitHub iOS workflow request failed: {(int)response.StatusCode}.");
+        if (!response.IsSuccessStatusCode) throw new IosWorkflowException("remote-github-http",
+            $"GitHub rejected the iOS workflow request (HTTP {(int)response.StatusCode}). Check the gate App installation and its repository Actions permissions; no usable executed evidence.");
         return Task.CompletedTask;
     }
     private static async Task<byte[]> Bounded(HttpContent content, int limit, CancellationToken ct)

@@ -440,10 +440,15 @@ public static class NewTestsCheck
     /// already read (one fetch per check); its <see cref="Prepare.PreparedCommits.Note"/> (the base prepared with the head's recipe)
     /// is added to the result's reason.
     /// </param>
+    /// <param name="localExecution">
+    /// The pipeline's worker-phase boundary for a local stack/platform group (base, head and retries). Discovery and hosted iOS
+    /// groups do not use it; callers without a sandbox phase may omit it, retaining the ordinary direct-run contract.
+    /// </param>
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
-        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null, RemoteIosNewTests? remoteIos = null)
+        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null, RemoteIosNewTests? remoteIos = null,
+        Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution = null)
     {
-        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared, remoteIos);
+        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared, remoteIos, localExecution);
         return prepared?.Note is { } note ? result with { Reason = $"{result.Reason}; {note}" } : result;
     }
 
@@ -455,7 +460,8 @@ public static class NewTestsCheck
         path.StartsWith(Prepare.PrepareRecipe.Directory + "/", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<NewTestsResult> RunCoreAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
-        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared, RemoteIosNewTests? remoteIos)
+        string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared, RemoteIosNewTests? remoteIos,
+        Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution)
     {
         var changes = prepared?.Changes ?? await runner.ChangesAsync(repo, baseSha, headSha, ct);
         var source = new TestSource(runner, repo, baseSha, headSha);
@@ -527,57 +533,63 @@ public static class NewTestsCheck
                     return TestRunReport.Failed(TestRunStatus.NoResults, "The declared prepare recipe is missing; private owner-cache steps are never transported.");
                 return await remoteIos!.RunExecutionAsync(repo, baseSha, headSha, spec, tests, set.Projects, recipe, ct);
             }
-            var baseSpec = await Spec($"{runName}-base", baseSha, headSha, set.Tests);
-            var baseRun = await Run(baseSpec, set.Tests);
-            var headRun = await Run(await Spec($"{runName}-head", headSha, null, set.Tests), set.Tests);
-            var evidence = new BaseEvidence(baseRun);
-            if (baseRun.Status == TestRunStatus.BuildFailed && headRun.Status == TestRunStatus.Ran)
+            // Discovery and remote groups need no local sandbox user. A local group's base, head and retries
+            // retain one worker phase, so its helper/worktree lifecycle stays protected as before.
+            async Task<NewTestsResult> ExecuteGroup()
             {
-                // Which new tests the compiler says cannot build on the base; the others get one retry without whatever
-                // did not compile, so a test that passes there cannot hide behind another one's compile error.
-                var applied = new Dictionary<string, string>(StringComparer.Ordinal);
-                foreach (var path in overlay)
+                var baseSpec = await Spec($"{runName}-base", baseSha, headSha, set.Tests);
+                var baseRun = await Run(baseSpec, set.Tests);
+                var headRun = await Run(await Spec($"{runName}-head", headSha, null, set.Tests), set.Tests);
+                var evidence = new BaseEvidence(baseRun);
+                if (baseRun.Status == TestRunStatus.BuildFailed && headRun.Status == TestRunStatus.Ran)
                 {
-                    if ((baseReplacements.TryGetValue(path, out var grafted) ? grafted : await source.ReadAsync(headSha, path, ct)) is { } text)
+                    // Which new tests the compiler says cannot build on the base; the others get one retry without whatever
+                    // did not compile, so a test that passes there cannot hide behind another one's compile error.
+                    var applied = new Dictionary<string, string>(StringComparer.Ordinal);
+                    foreach (var path in overlay)
                     {
-                        applied[path] = text;
+                        if ((baseReplacements.TryGetValue(path, out var grafted) ? grafted : await source.ReadAsync(headSha, path, ct)) is { } text)
+                        {
+                            applied[path] = text;
+                        }
+                    }
+                    var failure = strategy.ExplainBuildFailure(set, applied, baseRun.BuildErrors, set.Tests);
+                    evidence = evidence with { First = failure };
+                    var remaining = set.Tests.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
+                    var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
+                    var rewritten = baseReplacements.Keys.ToHashSet(StringComparer.Ordinal);
+                    for (var attempt = 1; attempt <= Math.Max(strategy.BaseRetries, 1) && failure.Unattributable.Count == 0 && failure.Unremovable.Count == 0
+                        && remaining.Count > 0 && failure.Replacements.Count > 0; attempt++)
+                    {
+                        log?.Invoke($"{strategy.Name}: the base does not build with the PR's test files; retrying it without {string.Join(", ", failure.Removed)}");
+                        foreach (var (path, text) in failure.Replacements)
+                        {
+                            stripped[path] = text;
+                            rewritten.Add(path);
+                        }
+                        if (evidence.RetryFailure is { } earlier)
+                        {
+                            // A further retry: what the one before it found is kept with the base run's.
+                            evidence = evidence with { First = evidence.First!.With(earlier), RetryFailure = null };
+                        }
+                        // The retry's files: the base run's replacements, and over them the files without what did not compile.
+                        var replaced = rewritten.ToDictionary(p => p, p => stripped[p], StringComparer.Ordinal);
+                        var retrySpec = await Spec($"{runName}-base-retry{(attempt == 1 ? "" : $"-{attempt}")}", baseSha, headSha, remaining) with { Replacements = replaced };
+                        var retry = await Run(retrySpec, remaining);
+                        evidence = evidence with { Retry = retry };
+                        if (retry.Status != TestRunStatus.BuildFailed)
+                        {
+                            break;
+                        }
+                        failure = strategy.ExplainBuildFailure(set, stripped, retry.BuildErrors, remaining);
+                        evidence = evidence with { RetryFailure = failure };
+                        remaining = remaining.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
                     }
                 }
-                var failure = strategy.ExplainBuildFailure(set, applied, baseRun.BuildErrors, set.Tests);
-                evidence = evidence with { First = failure };
-                var remaining = set.Tests.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
-                var stripped = new Dictionary<string, string>(applied, StringComparer.Ordinal);
-                var rewritten = baseReplacements.Keys.ToHashSet(StringComparer.Ordinal);
-                for (var attempt = 1; attempt <= Math.Max(strategy.BaseRetries, 1) && failure.Unattributable.Count == 0 && failure.Unremovable.Count == 0
-                    && remaining.Count > 0 && failure.Replacements.Count > 0; attempt++)
-                {
-                    log?.Invoke($"{strategy.Name}: the base does not build with the PR's test files; retrying it without {string.Join(", ", failure.Removed)}");
-                    foreach (var (path, text) in failure.Replacements)
-                    {
-                        stripped[path] = text;
-                        rewritten.Add(path);
-                    }
-                    if (evidence.RetryFailure is { } earlier)
-                    {
-                        // A further retry: what the one before it found is kept with the base run's.
-                        evidence = evidence with { First = evidence.First!.With(earlier), RetryFailure = null };
-                    }
-                    // The retry's files: the base run's replacements, and over them the files without what did not compile.
-                    var replaced = rewritten.ToDictionary(p => p, p => stripped[p], StringComparer.Ordinal);
-                    var retrySpec = await Spec($"{runName}-base-retry{(attempt == 1 ? "" : $"-{attempt}")}", baseSha, headSha, remaining) with { Replacements = replaced };
-                    var retry = await Run(retrySpec, remaining);
-                    evidence = evidence with { Retry = retry };
-                    if (retry.Status != TestRunStatus.BuildFailed)
-                    {
-                        break;
-                    }
-                    failure = strategy.ExplainBuildFailure(set, stripped, retry.BuildErrors, remaining);
-                    evidence = evidence with { RetryFailure = failure };
-                    remaining = remaining.Except(failure.NotBuilt, StringComparer.Ordinal).ToList();
-                }
+                var judged = Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun);
+                return set.Notes.Count == 0 ? judged : judged with { Reason = SafeExcerpt($"{judged.Reason} ({string.Join("; ", set.Notes)})", 4000) };
             }
-            var judged = Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun);
-            results.Add(set.Notes.Count == 0 ? judged : judged with { Reason = SafeExcerpt($"{judged.Reason} ({string.Join("; ", set.Notes)})", 4000) });
+            results.Add(!ios && localExecution is not null ? await localExecution(ExecuteGroup) : await ExecuteGroup());
         }
         return results.FirstOrDefault(r => !r.Passed) ?? results[0] with
         {

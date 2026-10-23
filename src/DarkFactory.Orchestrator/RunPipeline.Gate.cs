@@ -1248,9 +1248,9 @@ public sealed partial class RunPipeline
         else
         {
             var (prepared, failed) = await PrepareCommitsAsync(run, pull, runner, ct);
-            // The runs are the sandbox user's (their worktrees, every step, the worktrees' deletion): one worker phase (sc-25988),
-            // waited for while another run's worker has the sandbox user, the merge gate's other facts read without it.
-            result = failed ?? await InWorkerPhaseAsync(run.Item, "run the new tests", () => RunNewTestsAsync(run, pull, runner, prepared, ct), ct);
+            // Discovery and hosted iOS executions hold no local worker slot. Each local stack/platform group
+            // takes its phase only for its base, head and retries (including worktree cleanup).
+            result = failed ?? await RunNewTestsAsync(run, pull, runner, prepared, ct);
         }
         await ledger.CheckpointAsync(run.Item, Steps.NewTests, null, result.ToDetail(), ct);
         log.WriteLine($"[gate] new tests ({result.Outcome}): {result.Reason}");
@@ -1308,7 +1308,7 @@ public sealed partial class RunPipeline
         }
     }
 
-    /// <summary>The sandboxed runs of <see cref="NewTestsAsync"/>, watched for a Pause or Stop; the caller holds the sandbox user's lock.</summary>
+    /// <summary>The new-test groups, watched for a Pause or Stop; only local groups hold a worker slot.</summary>
     private async Task<NewTestsResult> RunNewTestsAsync(Run run, PullFacts pull, IGateTestRunner runner, Prepare.PreparedCommits? prepared, CancellationToken ct)
     {
         NewTestsResult result;
@@ -1318,7 +1318,8 @@ public sealed partial class RunPipeline
         try
         {
             result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(swift), run.Repo, pull.BaseSha, pull.HeadSha,
-                NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token, prepared, Gate.RemoteIos);
+                NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token, prepared, Gate.RemoteIos,
+                localExecution: execute => InWorkerPhaseAsync(run.Item, "run the new tests", execute, watch.Token));
         }
         catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
         {

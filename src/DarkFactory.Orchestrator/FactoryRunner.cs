@@ -383,7 +383,7 @@ public static class FactoryRunner
         using var artifactHttp = OutboundHttp.ArtifactDownload(DnsArtifactResolver.Instance);
         var artifacts = new Prepare.ArtifactFetcher(artifactHttp, DnsArtifactResolver.Instance,
             new Prepare.ArtifactCache(Prepare.ArtifactCache.RootOf(options.WorkRoot)));
-        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph, artifacts, new RemoteIosNewTests(new IosWorkflowGitHub(githubHttp, gateApp)) { Timeout = options.TestTimeout });
+        var gate = CreateGate(options, gateGitHub, reviewer, workspaces, slots, upstreams.CodeGraph, artifacts, new RemoteIosNewTests(new IosWorkflowGitHub(githubHttp, gateApp), Path.Combine(options.WorkRoot, "ios-dispatches")) { Timeout = options.TestTimeout });
         if (adjustGate is not null)
         {
             gate = adjustGate(gate);
