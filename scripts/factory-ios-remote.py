@@ -117,6 +117,10 @@ class Principal:
 
     def __init__(self, root):
         self.root = root
+        self.collector_uid = os.getuid()
+        self.root_identity = self.identity(root, self.collector_uid)
+        parent = root.parent.stat()
+        self.parent_identity = (parent.st_dev, parent.st_ino, parent.st_uid)
         self.home = root / 'home'
         code, _ = command(['/usr/bin/id', self.user], '/')
         if code == 0:
@@ -144,6 +148,9 @@ class Principal:
         workspace = pathlib.Path.cwd().resolve()
         if owner == pathlib.Path('/') or not workspace.is_relative_to(owner):
             raise ValueError('hosted workspace is outside owner home')
+        # Remove inherited ACL grants as well as group/other mode rights.
+        # All three are collector-owned, never directories a source user made.
+        admin(['/bin/chmod', '-N', str(owner), str(workspace), str(root)])
         owner.chmod(0o700)
         workspace.chmod(0o700)
         root.chmod(0o755)
@@ -179,6 +186,33 @@ class Principal:
                         *[k + '=' + v for k, v in self.env.items()],
                         '/usr/bin/sandbox-exec', '-f', str(self.profile), *args],
                        cwd, env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}, stop=self.sweep)
+
+    @staticmethod
+    def identity(path, owner):
+        node = path.lstat()  # never follow a swapped workspace symlink
+        if not stat.S_ISDIR(node.st_mode) or node.st_uid != owner or node.st_mode & 0o022:
+            raise ValueError('refusing cleanup: workspace is not collector-owned and closed to writers')
+        return node.st_dev, node.st_ino, node.st_uid
+
+    def verify_workspace(self):
+        if (self.root.parent.resolve() != pathlib.Path('/tmp').resolve()
+                or not self.root.name.startswith('factory-ios-')):
+            raise ValueError('refusing cleanup outside the remote workspace')
+        parent = self.root.parent.stat()
+        if ((parent.st_dev, parent.st_ino, parent.st_uid) != self.parent_identity
+                or parent.st_uid != 0 or not parent.st_mode & stat.S_ISVTX
+                or self.identity(self.root, self.collector_uid) != self.root_identity):
+            raise ValueError('refusing cleanup: workspace identity or sticky parent changed')
+
+    def close(self):
+        # No collector-side traversal of worker-owned content. A remote root rm
+        # removes exactly the fresh workspace, physically (no symlink following),
+        # only after quiescence and a second identity/ownership check. The build
+        # uid cannot replace its root entry in root-owned sticky /tmp.
+        self.verify_workspace()
+        self.sweep()
+        self.verify_workspace()
+        admin(['/bin/rm', '-rf', '--', str(self.root)])
 
     def share(self, path):
         admin(['/usr/sbin/chown', '-R', self.user + ':staff', str(path)])
@@ -320,45 +354,49 @@ def main():
             fixture_membership(json.loads(data))
         (root / 'base' / relative).write_text(source)
         principal = Principal(root)
-        principal.share(root / request['SIDE'])
-        derived = root / ('derived-' + request['SIDE'])
-        derived.mkdir()
-        principal.share(derived)
-        code, version = principal.run(['/usr/bin/xcodebuild', '-version'], root)
-        if code or version.strip() != 'Xcode ' + ENVIRONMENT['xcode'] + '\nBuild version ' + ENVIRONMENT['build']:
-            raise ValueError('pinned Xcode version unavailable')
-        code, devices = principal.run(['/usr/bin/xcrun', 'simctl', 'list', '-j'], root)
-        if code:
-            raise ValueError('simulator unavailable')
-        device_type, runtime = simulator(json.loads(devices))
-        code, device = principal.run(['/usr/bin/xcrun', 'simctl', 'create', 'factory-' + request['NONCE'], device_type, runtime], root)
-        device = device.strip()
-        if code or not re.fullmatch('[0-9A-Fa-f-]{36}', device):
-            raise ValueError('simulator creation failed')
-        rows = [{'test': test} for test in tests]
-        # Each side runs on its own fresh hosted VM. Base repo code cannot
-        # alter the head's sources, helper, derived data or results (or vice versa).
-        for side in (request['SIDE'],):
-            cwd = root / side / 'e2e-ios'
-            common = ['/usr/bin/xcodebuild', '-project', 'Tally.xcodeproj', '-scheme', 'Tally', '-destination', 'platform=iOS Simulator,id=' + device,
-                      '-derivedDataPath', str(root / ('derived-' + side)), 'CODE_SIGNING_ALLOWED=NO']
-            code, log = principal.run(common + ['build-for-testing'], cwd)
+        try:
+            principal.share(root / request['SIDE'])
+            derived = root / ('derived-' + request['SIDE'])
+            derived.mkdir()
+            principal.share(derived)
+            code, version = principal.run(['/usr/bin/xcodebuild', '-version'], root)
+            if code or version.strip() != 'Xcode ' + ENVIRONMENT['xcode'] + '\nBuild version ' + ENVIRONMENT['build']:
+                raise ValueError('pinned Xcode version unavailable')
+            code, devices = principal.run(['/usr/bin/xcrun', 'simctl', 'list', '-j'], root)
             if code:
-                if side != 'base' or code != 65:
-                    raise ValueError('head build or infrastructure failed')
-                for row in rows:
-                    if not attributable_not_built(log, source, row['test'], root / side / relative):
-                        raise ValueError('base compile error not attributable to each new test')
-                    row[side] = 'not-built'
-                continue
-            for index, row in enumerate(rows):
-                bundle = derived / (side + '-' + str(index) + '.xcresult')
-                code, _ = principal.run(common + ['test-without-building', '-only-testing:' + row['test'], '-parallel-testing-enabled', 'NO', '-resultBundlePath', str(bundle)], cwd)
-                report_code, report = command(['/usr/bin/xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path', str(bundle)], root)
-                if report_code:
-                    raise ValueError('unreadable xcresult')
-                row[side] = case_result(json.loads(report), row['test'], code)
-        pathlib.Path('result.json').write_text(json.dumps({'version': 1, 'nonce': request['NONCE'], 'base': request['BASE'], 'head': request['HEAD'], 'side': request['SIDE'], 'environment': ENVIRONMENT, 'tests': rows}))
+                raise ValueError('simulator unavailable')
+            device_type, runtime = simulator(json.loads(devices))
+            code, device = principal.run(['/usr/bin/xcrun', 'simctl', 'create', 'factory-' + request['NONCE'], device_type, runtime], root)
+            device = device.strip()
+            if code or not re.fullmatch('[0-9A-Fa-f-]{36}', device):
+                raise ValueError('simulator creation failed')
+            rows = [{'test': test} for test in tests]
+            # Each side runs on its own fresh hosted VM. Base repo code cannot
+            # alter the head's sources, helper, derived data or results (or vice versa).
+            for side in (request['SIDE'],):
+                cwd = root / side / 'e2e-ios'
+                common = ['/usr/bin/xcodebuild', '-project', 'Tally.xcodeproj', '-scheme', 'Tally', '-destination', 'platform=iOS Simulator,id=' + device,
+                          '-derivedDataPath', str(root / ('derived-' + side)), 'CODE_SIGNING_ALLOWED=NO']
+                code, log = principal.run(common + ['build-for-testing'], cwd)
+                if code:
+                    if side != 'base' or code != 65:
+                        raise ValueError('head build or infrastructure failed')
+                    for row in rows:
+                        if not attributable_not_built(log, source, row['test'], root / side / relative):
+                            raise ValueError('base compile error not attributable to each new test')
+                        row[side] = 'not-built'
+                    continue
+                for index, row in enumerate(rows):
+                    bundle = derived / (side + '-' + str(index) + '.xcresult')
+                    code, _ = principal.run(common + ['test-without-building', '-only-testing:' + row['test'], '-parallel-testing-enabled', 'NO', '-resultBundlePath', str(bundle)], cwd)
+                    report_code, report = command(['/usr/bin/xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path', str(bundle)], root)
+                    if report_code:
+                        raise ValueError('unreadable xcresult')
+                    row[side] = case_result(json.loads(report), row['test'], code)
+            payload = {'version': 1, 'nonce': request['NONCE'], 'base': request['BASE'], 'head': request['HEAD'], 'side': request['SIDE'], 'environment': ENVIRONMENT, 'tests': rows}
+        finally:
+            principal.close()
+        pathlib.Path('result.json').write_text(json.dumps(payload))
 
 
 if __name__ == '__main__':

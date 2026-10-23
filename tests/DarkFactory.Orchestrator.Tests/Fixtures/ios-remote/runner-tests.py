@@ -211,6 +211,95 @@ class RunnerTests(unittest.TestCase):
                 result = subprocess.run(['/usr/bin/sandbox-exec', '-f', str(profile), executable, '--version'], capture_output=True, cwd=source)
                 self.assertIn(b'Operation not permitted', result.stderr)
 
+    def test_successful_bootstrap_closes_collector_paths_without_host_administration(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory(prefix='factory-ios-', dir='/tmp') as r:
+            owner, root = pathlib.Path(d), pathlib.Path(r)
+            owner.chmod(0o755)
+            workspace = owner / 'workspace'
+            workspace.mkdir(mode=0o755)
+            previous_cwd = pathlib.Path.cwd()
+            old_command, old_admin = globals_['command'], globals_['admin']
+            calls = []
+            def admin(args):
+                calls.append(args)
+                if '-list' in args:
+                    return 'root 0\nrunner ' + str(os.getuid())
+                return 'staff' if args[0] == '/usr/bin/id' else ''
+            globals_['admin'] = admin
+            globals_['command'] = lambda args, cwd: (1, '')
+            try:
+                os.chdir(workspace)
+                with mock.patch.dict(os.environ, HOME=str(owner), SIDE='base'):
+                    globals_['Principal'](root)
+                self.assertIn(['/bin/chmod', '-N', str(owner.resolve()), str(workspace.resolve()), str(root)], calls)
+                self.assertEqual((0o700, 0o700, 0o755), tuple(stat.S_IMODE(path.stat().st_mode) for path in (owner, workspace, root)))
+            finally:
+                globals_['command'], globals_['admin'] = old_command, old_admin
+                os.chdir(previous_cwd)
+
+    def test_cleanup_quiesces_before_removing_only_its_remote_workspace(self):
+        # Every path is freshly allocated by this test; admin remains a fake.
+        with tempfile.TemporaryDirectory(prefix='factory-ios-', dir='/tmp') as d:
+            root = pathlib.Path(d)
+            principal = globals_['Principal'].__new__(globals_['Principal'])
+            principal.root = root
+            principal.collector_uid = os.getuid()
+            principal.root_identity = principal.identity(root, principal.collector_uid)
+            parent = root.parent.stat()
+            principal.parent_identity = parent.st_dev, parent.st_ino, parent.st_uid
+            events = []
+            principal.sweep = lambda: events.append('quiescent')
+            previous = globals_['admin']
+            globals_['admin'] = lambda args: events.append(args)
+            saved = root.with_name(root.name + '-saved')
+            try:
+                principal.close()
+                self.assertEqual(['quiescent', ['/bin/rm', '-rf', '--', str(root)]], events)
+                for unsafe in ('/', '/tmp', '/tmp/not-a-factory-workspace'):
+                    principal.root = pathlib.Path(unsafe)
+                    events.clear()
+                    with self.subTest(unsafe=unsafe), self.assertRaisesRegex(ValueError, 'refusing cleanup'):
+                        principal.close()
+                    self.assertEqual([], events)
+                principal.root = root
+                for changed in ('swapped-directory', 'symlink', 'writable', 'wrong-owner', 'during-sweep'):
+                    events.clear()
+                    if changed in ('swapped-directory', 'symlink'):
+                        root.rename(saved)
+                        if changed == 'symlink':
+                            root.symlink_to(saved, target_is_directory=True)
+                        else:
+                            root.mkdir()
+                    elif changed == 'writable':
+                        root.chmod(0o777)
+                    elif changed == 'wrong-owner':
+                        principal.collector_uid = -1
+                    else:
+                        def swap():
+                            root.rename(saved)
+                            root.mkdir()
+                        principal.sweep = swap
+                    try:
+                        with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'refusing cleanup'):
+                            principal.close()
+                        self.assertEqual([], events)
+                    finally:
+                        principal.collector_uid = os.getuid()
+                        principal.sweep = lambda: events.append('quiescent')
+                        if root.is_symlink():
+                            root.unlink()
+                        elif saved.exists():
+                            root.rmdir()
+                        if saved.exists():
+                            saved.rename(root)
+                        root.chmod(0o700)
+            finally:
+                globals_['admin'] = previous
+
+    def test_failed_cleanup_publishes_no_evidence(self):
+        with self.assertRaisesRegex(ValueError, 'cleanup refused'):
+            self.exercise(cleanup_failure=True)
+
     def test_successful_source_command_still_quiesces_before_returning(self):
         stopped = []
         code, output = globals_['command'](['/bin/echo', 'finished'], '/', stop=lambda: stopped.append(True))
@@ -284,7 +373,7 @@ class RunnerTests(unittest.TestCase):
             globals_['command'] = before
         self.assertEqual([True], stopped)
 
-    def exercise(self, build_failure=False, foreign_error=False, existing=False, mixed=None):
+    def exercise(self, build_failure=False, foreign_error=False, existing=False, mixed=None, cleanup_failure=False):
         with tempfile.TemporaryDirectory() as d:
             before = pathlib.Path.cwd()
             os.chdir(d)
@@ -337,10 +426,19 @@ class RunnerTests(unittest.TestCase):
                         pass
                     def run(self, args, cwd):
                         return command(args, cwd)
+                    def close(self):
+                        calls.append(['principal-close'])
+                        if cleanup_failure:
+                            raise ValueError('cleanup refused')
                 originals = globals_['command'], globals_['Principal']
                 globals_['command'], globals_['Principal'] = command, FakePrincipal
                 try:
-                    main()
+                    try:
+                        main()
+                    except ValueError:
+                        if cleanup_failure:
+                            self.assertFalse(pathlib.Path('result.json').exists())
+                        raise
                     base_result = json.loads(pathlib.Path('result.json').read_text())
                     os.environ['SIDE'] = 'head'
                     main()
@@ -353,6 +451,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual('passed', result['tests'][0]['head'])
                 self.assertEqual(2, sum('build-for-testing' in c for c in calls))
                 self.assertEqual(globals_['ENVIRONMENT'], result['environment'])
+                self.assertEqual(2, calls.count(['principal-close']))
             finally:
                 os.chdir(before)
 
