@@ -1,0 +1,107 @@
+# Install the rendered RemoteIosWorkflow.Text, not this source template. The factory
+# expands FACTORY_RUNNER from its embedded helper, and requires an exact match.
+name: Factory iOS new tests
+run-name: factory-ios-${{ inputs.nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        required: true
+        type: string
+      base:
+        required: true
+        type: string
+      head:
+        required: true
+        type: string
+      tests:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  sources:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # No checkout and no repository code in the credentialed job. Only immutable
+      # source archives cross into the execution job; the gate token never does.
+      - name: Acquire source archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ inputs.base }}
+          HEAD: ${{ inputs.head }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re, urllib.request
+          os.mkdir('sources')
+          for name in ('base', 'head'):
+              sha = os.environ[name.upper()]
+              if not re.fullmatch('[0-9a-f]{40}', sha):
+                  raise ValueError('invalid commit')
+              url = os.environ['API'] + '/repos/' + os.environ['REPO'] + '/zipball/' + sha
+              request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+              # urllib would forward Authorization across redirects. Follow the
+              # authenticated API's redirect ourselves, with no credential.
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      return None
+              try:
+                  response = urllib.request.build_opener(NoRedirect).open(request, timeout=60)
+              except urllib.error.HTTPError as error:
+                  if error.code != 302:
+                      raise
+                  location = error.headers['Location']
+                  if not location.startswith('https://codeload.' + 'github.com/'):
+                      raise ValueError('unexpected archive redirect')
+                  response = urllib.request.urlopen(location, timeout=60)
+              with response, open('sources/' + name + '.zip', 'xb') as output:
+                  size = 0
+                  while chunk := response.read(65536):
+                      size += len(chunk)
+                      if size > 100 * 1024 * 1024:
+                          raise ValueError('source archive too large')
+                      output.write(chunk)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: factory-ios-sources
+          path: sources/*.zip
+          retention-days: 1
+          if-no-files-found: error
+  check:
+    needs: sources
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, head]
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: factory-ios-sources
+          path: sources
+      # The embedded collector creates a fresh, non-admin build principal on
+      # this disposable VM. Source runs only there, beneath deny-by-default
+      # Seatbelt; the Actions runner retains collection/publication authority.
+      - name: Run new tests separately on base and head
+        shell: /usr/bin/python3 -I {0}
+        env:
+          SIDE: ${{ matrix.side }}
+          NONCE: ${{ inputs.nonce }}
+          BASE: ${{ inputs.base }}
+          HEAD: ${{ inputs.head }}
+          TESTS: ${{ inputs.tests }}
+        run: |
+          # FACTORY_RUNNER
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: factory-ios-result-${{ inputs.nonce }}-${{ matrix.side }}
+          path: result.json
+          retention-days: 1
+          if-no-files-found: error

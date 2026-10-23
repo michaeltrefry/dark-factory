@@ -27,6 +27,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="../../factory/workflows/factory-ios-new-tests.yml" LogicalName="factory-ios-new-tests.yml" />
+    <EmbeddedResource Include="../../scripts/factory-ios-remote.py" LogicalName="factory-ios-remote.py" />
     <EmbeddedResource Include="GitHub/app-manifest.json" LogicalName="app-manifest.json" />
     <EmbeddedResource Include="GitHub/gate-app-manifest.json" LogicalName="gate-app-manifest.json" />
     <!-- The review panel's prompts (sealed: the factory's own repo, compiled in; never read from a target repo or disk). -->

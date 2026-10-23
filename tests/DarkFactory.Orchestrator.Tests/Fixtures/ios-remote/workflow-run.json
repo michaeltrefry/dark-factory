@@ -1,0 +1,11 @@
+{
+  "id": 39685884154,
+  "display_title": "Merge pull request #97 from michaeltrefry/factory/sc-26658",
+  "head_sha": "f40efbc38f48806354e8ed17d4380c57d95a699f",
+  "event": "push",
+  "path": ".github/workflows/ci.yml",
+  "run_attempt": 1,
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.com/michaeltrefry/dark-factory-sandbox/actions/runs/39685884154"
+}
