@@ -174,7 +174,9 @@ public class GitHubAppTests
     [Fact]
     public async Task Pull_request_is_opened_with_installation_token()
     {
-        var api = GitHubWithInstallation().On("POST /repos/michaeltrefry/dark-factory-sandbox/pulls", HttpStatusCode.Created,
+        var api = GitHubWithInstallation()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/pulls", HttpStatusCode.OK, "[]")
+            .On("POST /repos/michaeltrefry/dark-factory-sandbox/pulls", HttpStatusCode.Created,
             """{"html_url":"https://github.com/michaeltrefry/dark-factory-sandbox/pull/1"}""");
         var prs = new GitHubPullRequests(api.Client("https://api.github.com/"), App(api));
 
@@ -187,6 +189,24 @@ public class GitHubAppTests
         Assert.Equal("factory/sc-7", body.GetProperty("head").GetString());
         Assert.Equal("main", body.GetProperty("base").GetString());
         Assert.Equal("body links story", body.GetProperty("body").GetString());
+    }
+
+    [Theory]
+    [InlineData(400)]
+    [InlineData(401)]
+    [InlineData(403)]
+    [InlineData(404)]
+    public async Task Permanent_PR_creation_refusals_are_not_uncertain_gateway_writes(int status)
+    {
+        var api = GitHubWithInstallation()
+            .On("GET /repos/michaeltrefry/dark-factory-sandbox/pulls", HttpStatusCode.OK, "[]")
+            .On("POST /repos/michaeltrefry/dark-factory-sandbox/pulls", (HttpStatusCode)status, "{}");
+        var prs = new GitHubPullRequests(api.Client("https://api.github.com/"), App(api));
+        var error = await Record.ExceptionAsync(() => prs.OpenAsync(Sandbox, "factory/rc-1", "main", "repair", "body", default));
+        var refusal = Assert.IsAssignableFrom<InvalidOperationException>(error);
+        Assert.IsNotType<GitHubGatewayException>(error);
+        Assert.Contains(status.ToString(), refusal.Message);
+        Assert.Single(api.Requests, r => r.Method == HttpMethod.Post && r.PathAndQuery.EndsWith("/pulls"));
     }
 
     [Fact]
@@ -202,6 +222,7 @@ public class GitHubAppTests
         var url = await prs.OpenAsync(Sandbox, "factory/sc-7", "main", "t", "b", CancellationToken.None);
 
         Assert.Equal("https://github.com/michaeltrefry/dark-factory-sandbox/pull/3", url);
+        Assert.DoesNotContain(api.Requests, r => r.PathAndQuery.EndsWith("/pulls") && r.Method == HttpMethod.Post);
         Assert.Contains("head=michaeltrefry%3Afactory%2Fsc-7", api.Requests.Last().PathAndQuery);
     }
 

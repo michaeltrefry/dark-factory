@@ -68,7 +68,7 @@ public sealed partial class RunPipeline
 
     private async Task<(List<LedgerEntry> History, PullFacts Pull)> ReadPullAsync(Run run, CancellationToken ct)
     {
-        var history = await ledger.HistoryAsync(run.Item, ct);
+        var history = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct));
         var url = LinkedPullRequestUrl(history) ?? throw new InvalidOperationException($"{run.Item.ExternalId} has no pull request in its ledger.");
         var (linked, number) = GitHubGate.ParsePullUrl(url);
         // An item's pull request is in the item's repository (sc-25873). The number alone names a different pull request in any
@@ -81,6 +81,8 @@ public sealed partial class RunPipeline
         }
         var pull = await Gate.GitHub.GetPullAsync(run.Repo, number, ct);
         EnsureRecoveryPull(history, run, pull);
+        if (Naming == ItemNaming.Recovery && history.LastOrDefault(e => e.Step == RecoveryPushedHead)?.Detail != pull.HeadSha)
+            throw new GateBlockedException("Correction head no longer matches the authorized worker push.");
         return (history, pull);
     }
 
@@ -135,7 +137,7 @@ public sealed partial class RunPipeline
     /// </summary>
     private static void EnsureBase(Run run, PullFacts pull)
     {
-        var expected = run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
+        var expected = run.RequiredBase ?? run.BaseBranch ?? run.Changeset?.Base ?? pull.DefaultBranch;
         if (expected is not null && !string.Equals(pull.BaseRef, expected, StringComparison.Ordinal))
         {
             throw new InvalidOperationException($"{pull.HtmlUrl} targets {pull.BaseRef}, not {expected}.");
@@ -555,7 +557,7 @@ public sealed partial class RunPipeline
         var diff = await Gate.GitHub.GetDiffAsync(run.Repo, pull.BaseSha, pull.HeadSha, ct);
         var files = await Gate.GitHub.GetFilesAsync(run.Repo, pull.BaseSha, ct);
         var risky = policy.SecurityReviewReasons(policy.Classify(diff));
-        var recovery = Recovery.Of(await ledger.HistoryAsync(run.Item, ct));
+        var recovery = OwnerRecovery.Of(await ledger.HistoryAsync(run.Item, ct));
         // An incomplete panel is not an approval. This boundary always starts all roles, security included.
         var roles = ReviewRoles.Required(risky.Count > 0 || recovery?.Kind == "incomplete-review");
         var carried = previous is null ? []
@@ -625,7 +627,7 @@ public sealed partial class RunPipeline
         bool requestAgain = false, CancellationToken? wait = null)
     {
         await ThrowIfControlledAsync(run.Item, ct);
-        var row = (await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
+        var row = SinceRecoveryRestart(await ledger.HistoryAsync(run.Item, ct)).LastOrDefault(e => e.Step == Steps.CodeGraphOverlay
             && CodeGraphOverlay.FromDetail(e.Detail)?.HeadSha == pull.HeadSha);
         if (!requestAgain && CodeGraphOverlay.FromDetail(row?.Detail) is { IsReady: true } recorded)
         {
@@ -785,7 +787,7 @@ public sealed partial class RunPipeline
         }
 
         var pushed = attempt.LastOrDefault(e => e.Step == Steps.Pushed)?.Detail;
-        var recovery = Recovery.Of(history);
+        var recovery = OwnerRecovery.Of(history);
         if (recovery is not null && pushed is null)
         {
             var (_, current) = await ReadPullAsync(run, ct);
@@ -797,7 +799,7 @@ public sealed partial class RunPipeline
                 // sessions identify that publication; no second session or push is needed, and its head still needs review.
                 foreach (var id in attempt.Where(e => e.Step == Steps.Session).Select(e => e.ClaudeSessionId).OfType<string>().Distinct())
                     await ledger.ReplayTaintsAsync(item, id, ct);
-                _ = await GrantPushAsync(item, session, ct);
+                _ = await GrantPushAsync(run, session, ct);
                 await ledger.CheckpointAsync(item, Steps.Pushed, session, published, ct);
                 pushed = published;
             }
@@ -852,7 +854,7 @@ public sealed partial class RunPipeline
                 }
             }
             await ThrowIfControlledAsync(item, ct);
-            var grant = await GrantPushAsync(item, session, ct);
+            var grant = await GrantPushAsync(run, session, ct);
             if (recovery is not null) grant = grant.WithExpectedRemoteHead(fixedHead, async (to, c) =>
             {
                 await ledger.CheckpointAsync(item, Steps.RecoveryPushIntent, session,
@@ -866,6 +868,7 @@ public sealed partial class RunPipeline
             {
                 log.WriteLine($"[fix] {name}: the fixer changed nothing; the head stays {Ci.Short(pushed)}");
             }
+            await RecordCorrectionPushAsync(run, ct);
             await ledger.CheckpointAsync(item, Steps.Pushed, session, pushed, ct);
         }
         else
@@ -1053,7 +1056,7 @@ public sealed partial class RunPipeline
         var prompt = ReviewPrompts.Confirm;
         var session = await NameReviewSessionAsync(run, pull, $"confirm-{review.Role}", prompt, ct);
         var story = await ReviewStoryAsync(run, ct);
-        var recovery = Recovery.Of(await ledger.HistoryAsync(run.Item, ct));
+        var recovery = OwnerRecovery.Of(await ledger.HistoryAsync(run.Item, ct));
         var confirmation = await RouterCallAsync(() => Gate.Reviewer.ConfirmAsync(
             new ConfirmRequest(story, run.Repo.FullName, pull, diff, files, review.Role, finding, prompt, session, overlay, recovery?.MaxOutputTokens), ct), ct);
         log.WriteLine($"[review] {review.Role} finding '{finding.Title}': {confirmation.Outcome} by {confirmation.ServedName} ({confirmation.ServedClass ?? "no class named"})");
@@ -1417,7 +1420,7 @@ public sealed partial class RunPipeline
     /// (<see cref="Plans.Changeset.CurrentPass"/>): the gate passing an earlier repository's changeset says nothing about this one.
     /// </summary>
     internal static string? GatePassedAt(IReadOnlyList<LedgerEntry> history, PullFacts pull) =>
-        pull.Merged && Plans.Changeset.CurrentPass(history).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
+        pull.Merged && Plans.Changeset.CurrentPass(SinceRecoveryRestart(history)).Any(e => e.Step == Steps.GatePassed && e.Detail == pull.HeadSha) ? pull.MergeCommitSha : null;
 
     /// <summary>
     /// After a merge call failed: re-reads the PR and returns its merge commit when GitHub merged it at the gated head;
@@ -1428,7 +1431,8 @@ public sealed partial class RunPipeline
         try
         {
             var after = await Gate.GitHub.GetPullAsync(run.Repo, gated.Number, ct);
-            return after.Merged && after.HeadSha == gated.HeadSha ? after.MergeCommitSha : null;
+            return after.Merged && after.HeadSha == gated.HeadSha && after.BaseRef == gated.BaseRef
+                && await CorrectionMergeWasAuthorizedAsync(run.Repo, await ledger.HistoryAsync(run.Item, ct), after, ct) ? after.MergeCommitSha : null;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -1455,6 +1459,7 @@ public sealed partial class RunPipeline
         var entered = history.FindLastIndex(e => e.Step is null);
         var commit = history[entered].Detail;
         var done = history.Skip(entered + 1).Select(e => e.Step).ToHashSet();
+        await RecordCorrectionDeliveryAsync(run, commit, ct);
         if (run.Changeset is { } changeset && Plans.Changeset.Ordered(history, run.Repo) is { Count: > 1 } changesets)
         {
             var delivered = Plans.Changeset.Delivered(history).Select(d => d.Repo).ToHashSet(StringComparer.OrdinalIgnoreCase);

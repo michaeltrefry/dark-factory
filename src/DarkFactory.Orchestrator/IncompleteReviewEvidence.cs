@@ -96,7 +96,7 @@ internal static class IncompleteReviewEvidence
         Check(after.Skip(1).All(e => e.Step == RunPipeline.Steps.EscalationComment));
         foreach (var consumed in history.Where(e => e.Step is null && e.State == WorkState.Recovering && e.Detail != "unpaused"))
         {
-            var recovery = JsonSerializer.Deserialize<RunPipeline.Recovery>(consumed.Detail ?? "");
+            var recovery = JsonSerializer.Deserialize<RunPipeline.OwnerRecovery>(consumed.Detail ?? "");
             Check(recovery is not null && recovery.SourceVerdictId != row.Id && recovery.SourceEscalationId != escalation.Id);
         }
         return new(row.Id, escalation.Id);

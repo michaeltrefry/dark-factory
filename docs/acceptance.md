@@ -3,6 +3,74 @@
 How to run each epic acceptance test, what is automated and what the owner does by hand. Everything live is
 opt-in: the tests skip, naming the missing prerequisite, unless their gate variable is set.
 
+## SystemOne S6 evaluation-only graceful cancellation (sc-26354)
+
+For a **new, explicitly authorized** held-out campaign only (not an instruction to start or stop an existing run):
+choose a unique artifact directory inside the **owner's session folder**, outside the frozen scoring corpus and the
+configured `Factory:WorkRoot` (which contains every isolated arm's synthetic snapshot, clone and triage ReadRule
+worktree). An ignored artifact directory inside the owner's checkout is allowed: that checkout is not given to the
+worker. Git metadata paths and symlinked artifact ancestors remain forbidden. Use the session's physical path
+(`pwd -P`). Preserve the existing prerequisites (router, Postgres, sandbox setup, catalog model and exclusive sandbox locks).
+
+```sh
+# Example only: this starts paid live inference. Do not run alongside an existing campaign.
+# Run from the owner's isolated session checkout, not a worker worktree.
+session="$(pwd -P)"
+mkdir -p "$session/artifacts"
+artifacts="$(mktemp -d "$session/artifacts/systemone-evaluation.XXXXXXXX")"
+export FACTORY_E2E=1 FACTORY_E2E_SYSTEMONE_EVALUATION=1
+export FACTORY_E2E_SYSTEMONE_REPORT="$artifacts/evidence.json"
+export FACTORY_E2E_SYSTEMONE_CANCEL_FILE="$FACTORY_E2E_SYSTEMONE_REPORT.cancel"
+printf 'This run cancellation file: %s\n' "$FACTORY_E2E_SYSTEMONE_CANCEL_FILE"
+# Issues__Classification__Model must already name the approved SystemOne catalog model.
+dotnet test --project tests/DarkFactory.AcceptanceTests \
+  --filter-method '*Frozen_corpus_paired_disabled_vs_advisory_live_campaign'
+```
+
+From another shell, create **that run's exact flag** (substitute the printed/recorded artifact path):
+
+```sh
+# Existence only; the harness never reads the file body. No process signals.
+touch /absolute/owner/session/artifacts/systemone-evaluation.XXXXXXXX/evidence.json.cancel
+```
+
+The dedicated variable is read only after both live opt-ins. It has **no default**, and must equal the absolute
+report path plus `.cancel`; the report itself is reserved with create-new semantics, preventing shared campaign
+ownership. With the variable absent, no file watcher runs. Flags in the actual scoring corpus or configured worker
+work root, git metadata, another campaign's flag, relative paths and symlinked artifact ancestors are refused before
+client construction. A `.git` entry in an owner-checkout ancestor alone is not a reason to reject session artifacts. A pre-existing flag writes initial
+`incomplete` evidence and stops before client construction/inference; do not delete a flag to resume a campaign.
+
+The linked token preserves the caller's cancellation and 100-minute deadline, checks synchronously between arms
+and polls existence every 100 ms during the current arm. It cancels the normal await, **not** the process directly;
+the existing production runner unwinds its sandbox cleanup before the arm disposes its ledger/locks. This mechanism
+adds no signals and does not bypass production controls or change existing sandbox cleanup. Await termination
+before touching artifacts or starting any other sandbox work. Completed observations remain durably checkpointed;
+an interrupted arm has no fabricated observation, no summary is published, and evidence stays `incomplete`.
+The watcher is stopped, drained and disposed on every exit. An incomplete/cancelled test exits non-successfully;
+that is not a completed performance/quality result and does not authorize rerunning or relabeling the frozen corpus.
+An already-running older harness cannot acquire this feature retroactively.
+
+Evaluation gating is separate from campaign completion: absent live opt-ins or missing model/report configuration
+may intentionally skip **before** the campaign starts. Once the campaign loop is entered, any arm prerequisite skip
+is a failure, not a successful skipped run. Router reachability failures (including between arms) name the prerequisite
+and exception type only, never the raw response, URL or key. There are no automatic inference retries; completed arms
+stay in the `incomplete` file and no final summary is emitted.
+
+Each evaluation arm creates and owns its unique `<Factory:WorkRoot>/e2e/df_systemone_eval_<guid>` directory.
+After the production triage runner has fully unwound, teardown first acquires every isolated worker-slot lock
+nonblocking and holds them through ledger/root cleanup. A helper that outlives shutdown retains that actual lock
+through production `KeepUntil`, even if cancellation is unmarked or recorder cleanup replaces its exception.
+Only once all isolated locks are held does teardown drop that arm's ledger and remove only that directory
+before releasing the machine sandbox locks. Owner-side recursive deletion unlinks nested symlinks without following
+their targets; a symlink at the root or any ancestor is refused. This adds no helper, uid sweep, chmod/chown or signal.
+An inaccessible leftover is a teardown failure (not a reason to launch a privileged cleanup helper). If a probe or triage
+reports a worker still running, or any isolated lock cannot be acquired (including unsafe linked lock paths), the harness
+refuses ledger/root teardown and retains the machine locks until its process exits; inspect/stop the runner before any
+manual cleanup or new sandbox activity. Existing older campaign directories
+are not adopted or swept by this code: collect only individually verified owned roots after the terminal runner is stopped,
+with evidence stored outside them. Do not use a wildcard or a sandbox helper to clean up historical roots.
+
 ## Safety first (read before any live run)
 
 - **The `_factory` user is single-tenant** — and so is each further sandbox user of a machine set up with worker slots
@@ -1528,3 +1596,123 @@ Pass: both pass as in their own sections (not skipped). Not with `FACTORY_E2E_P4
   tests/DarkFactory.Orchestrator.Tests -- --filter-class "*LiveWorkerSandboxTests"`, among them
   `The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user` (the iOS gate on a fresh simulator in
   each slot, nothing of the user left after).
+# Autonomous hot-file recovery (epic sc-26335; terminal story sc-26345)
+
+The epic's eight acceptance tests (AT1–AT8, in the epic description), the evidence for each, and the runbook of the two live
+runs AT8 needs. Non-live evidence is ordinary `dotnet test` (unit tests, and the Postgres ones against the compose Postgres,
+which CI provides). Live evidence is `HotFileRecoveryAcceptanceTests`, which SKIPS without its opt-in: skipped is not passed.
+
+## Evidence matrix
+
+Classes are in `tests/DarkFactory.Orchestrator.Tests` unless noted. The last column's tests are this story's integrated paths
+in `RecoveryAcceptanceTests`; the per-story tests prove each stage on its own.
+
+| AT | Existing evidence | Missing before sc-26345 | Added by sc-26345 / still open |
+| --- | --- | --- | --- |
+| AT1 safe skeleton | `HotFileRecoveryTests` (7 then 8 merges hold; a fresh high safe answer resolves; exact acknowledgement not re-assessed; a 9th merge opens generation 2; another file later hot; threshold, window, repo case, base, normalised paths, changeset exclusion; only the exact current high-class safe answer releases; production evidence and router assessor over 8 real pipeline merges; Postgres restart keeps the acknowledgement), `FreezeTests` hot-file count rules, `RecoveryRefreshTests` | the inclusive window boundary; the 8/24 defaults asserted | `AT1_a_merge_exactly_one_window_old_still_counts_and_one_tick_older_does_not`. Live: the AT8 safe case |
+| AT2 dangerous path | `RecoveryWorkSourceTests` (one immutable correction per attempt, envelope, pending-only, Stop), `RecoveryCorrectionPipelineTests` (ordinary panel, CI, new tests, taint, queue, merge; re-authorisation at every boundary), `RecoveryReassessmentTests` (a gate merge is not a safe verdict; an unsafe reassessment gives one second bounded repair), `RecoveryRedirectTests` (fresh restart from the corrected base), `RecoveryAssessmentTests.Pending_only_defect_…` | one chained run from the production scheduler's unsafe answer to resumed work; a second repair after a REAL gate rejection of the first | `AT2_an_assessed_merged_defect_is_corrected_reassessed_safe_and_affected_work_restarts`, `AT2_a_gate_rejected_first_correction_gets_one_second_attempt_that_delivers_and_resolves`. Live: the AT8 defect case |
+| AT3 isolation | `RecoveryControlTests` (live worker paused, queued PR not dispatched and its claim renewable, fresh item not claimed, issue-triage preparation held only in the held repo, two-repo plan releases B while A is held, repository Stop, Stop during assessment, `run` of an existing item), `HotFileRecoveryTests` (another repo completes meanwhile; intake admission; scheduler off the poll) | two simultaneous incidents in two repositories | `AT3_two_simultaneous_incidents_in_two_repositories_have_independent_outcomes` (both assessed at once with fresh sessions; A safe and resumes; B inconclusive stays held until its own retry is safe) |
+| AT4 human supremacy | `RecoveryControlTests` (safe racing a manual Pause; Continue lifts only its scope), `RecoveryWorkSourceTests` (own-incident exception never bypasses a manual or other control; Pause during authorisation; Stop settles, never replaced), `RecoveryRedirectTests`/`RecoveryReassessmentTests` (a safe reassessment cannot restart a paused or stopped item or clear a repository Pause), `HotFileRecoveryTests.Manual_and_legacy_freeze_rows_…`, `RecoveryPostgresTests.Upgrade_and_safe_resolution_preserve_…` | the global freeze and usage rows and unrelated manual scopes unchanged across the CORRECTIVE path | the first AT2 test seeds a lifted freeze row with red-tip and check-failed acknowledgements, a usage row and two unrelated manual Pauses, and compares them byte for byte at the end |
+| AT5 authorisation negatives | `RecoveryAssessmentTests` (wrong class, malformed, bounds, tool surface), `HotFileRecoveryTests.Assessment_parser_refuses_…`, `RecoveryWorkSourceTests` (wrong binding, sealed/protected/escaping envelope, unbounded repair, stale evidence or policy, ordinary work and another incident), `RecoveryCorrectionPipelineTests` (wrong base/tip/diff, outside the envelope, another incident, moved head, high-class review and CI, vacuous test, taint) | a negative fixture per predicate, proven by mutation | `AT5_each_grant_predicate_alone_refuses_the_correction`, `AT5_each_assessment_binding_alone_refuses_a_correction`, `AT5_the_correction_envelope_is_at_most_twenty_explicit_paths`; mutation table below |
+| AT6 durability | `RecoveryPostgresTests` (racing drivers and a lost PR-creation answer, uncertain PR reconciliation, budgets across restarts, 30/120 s retries then escalation, the refresh cap across drivers, stale CAS, usage/shutdown spend nothing, a real child-process crash at a checkpoint, reserved attempts, the legacy freeze on upgrade), `RecoveryCorrectionCrashTests`, `HotFileRecoveryTests.Postgres_restart_…`, `RecoveryWorkSourceTests.Postgres_retains_grant_…` | none found | — |
+| AT7 evidence and reports | `RecoverySnapshotTests` (pinning, hashes, missing inputs explicit, a changed spec/tip/head invalidates), `RecoveryAssessmentTests` (pinned tools, the final freshness read after cost, lagging/zero/unknown cost, session and tool provenance), `HotFileRecoveryTests.Production_router_assessor_uses_fresh_high_sessions_…`, `RecoveryReassessmentTests.Post_delivery_uses_…` | dashboard and CLI status equal to the ledger over a real recovery | S9's `RecoveryDashboardTests` (PR #136: repo A separate from B, a safe-but-paused incident keeps its Pause, an exhausted correction names its blocker and remedy, a correction link outside its repository is never clickable, legacy freeze named, reports inert, a stage race reported as an observation, Postgres schema, idle refresh); and every integrated test here checks S9's projection (`RecoveryStatusReader`, rendered by `LedgerReport.RecoveryStatus` for the dashboard and `factory recovery status`) against the ledger at each stage — state, generation, `assessment n/3, correction n/2, refresh n/3`, each correction's id, attempt, state and repo-scoped PR, held items, the fresh assessment session, no raw model fence (`AssertStatusEqualsLedgerAsync`) |
+| AT8 terminal | build, unit tests, Postgres tests and gateway lint in CI | the two controlled sandbox runs; the feature-end review; integration with main; tracker readback | `tests/DarkFactory.AcceptanceTests/HotFileRecoveryAcceptanceTests.cs` (live, below) and `HotFileLiveTests` (not live: its pass/fail rules). Both live runs PASSED on 2026-10-17 ("AT8 live evidence" below); integration with main is the feature→main pull request |
+
+### Authorisation mutations (AT5)
+
+One predicate weakened alone in `src/DarkFactory.Orchestrator/Recovery`, the recovery suites (`*Recovery*`, `*HotFile*`, 319
+tests before S9 merged; the last three rows `RecoveryAcceptanceTests` alone) run, the source restored and the suites green again (2026-10-17). "Killed by" names the tests that went red.
+
+| Predicate (file) | Mutation | Killed by |
+| --- | --- | --- |
+| grant: correction Pending/Claimed (`RecoveryCorrections.Grants`) | always true | `AT5_each_grant_predicate_…`, `Correction_reauthorizes_after_the_merge_token_…`, `A_change_during_final_merge_reads_…` |
+| grant: repository | always true | `AT5_each_grant_predicate_…` (survived before sc-26345) |
+| grant: correction item not Cancelled | always true | `AT5_each_grant_predicate_…` (survived before) |
+| grant: own incident Correcting | dropped | `AT5_each_grant_predicate_…` (survived before) |
+| grant: incident generation and evidence hash | dropped | `AT5_each_grant_predicate_…` (survived before) |
+| grant: no other unresolved incident in the repo | always true | `AT5_each_grant_predicate_…`, `Another_incident_cannot_borrow_…` |
+| grant: no stopped ancestor | always false | `AT5_each_grant_predicate_…` (survived before) |
+| assessment: served class high (`ValidateAssessment`) | dropped | `AT5_each_assessment_binding_…`, `Wrong_assessment_binding_is_not_authority` |
+| assessment: session | dropped | `AT5_each_assessment_binding_…` (survived before) |
+| assessment: material hash | always false | `AT5_each_assessment_binding_…`, `Wrong_assessment_binding_is_not_authority` |
+| assessment: repository | dropped | survives: equivalent — `RecoveryDecision.Parse` refuses a repo other than the trigger's on the same call, so the binding test's repository row is still refused |
+| assessment: decision unsafe | dropped | survives: equivalent — `RecoveryDecision.Parse` refuses safe with blocking findings, and a safe or inconclusive answer has no correction finding (`correction && Count == 0`) |
+| envelope: sealed/protected (`ValidateEnvelope`) | dropped | `Invalid_or_sealed_or_protected_envelope_…`, `Fresh_evidence_and_current_policy_…`, `Definitive_invalid_envelope_…` (+3) |
+| envelope: at most 20 paths | upper bound dropped | `AT5_the_correction_envelope_is_at_most_twenty_…` (survived before) |
+| attempt cap 2 (`MaterializeAsync`) | upper bound dropped | `An_unsafe_reassessment_creates_only_the_second_…` |
+| second attempt only after a failed first is reassessed (`RefreshAfterCorrectionAsync`) | escalate at attempt ≥ 1 | `AT2_a_gate_rejected_first_correction_…`, `A_failed_correction_is_observed_once_…` |
+| reassessment after delivery | never refresh | 24 tests, both AT2 integrated tests among them |
+| detection scoped to the repository (`HotFileRecovery.DetectLockedAsync`) | every repository's incidents | `AT3_two_simultaneous_incidents_…` (the whole recovery suite also hangs) |
+| hot-file window inclusive (`EvidenceAsync`) | `>=` → `>` | `AT1_a_merge_exactly_one_window_old_…` |
+| status: attempt count from the ledger (`RecoveryStatusReader`) | assessment count read from `Refreshes` | both AT2 tests and AT3 (`AssertStatusEqualsLedgerAsync`) |
+| status: corrections in attempt order | order reversed | `AT2_a_gate_rejected_first_correction_…` |
+
+## AT8 live runs — `HotFileRecoveryAcceptanceTests`
+
+Both run the real `factory work` host (`FactoryHost.BuildWork`): real implementers, the real panel and gate, the merge queue,
+and the production recovery scheduler with its router high-class assessor, against a throwaway ledger and work root (`E2e`).
+They set `Freeze:HotFileMerges=2` (its minimum: an explicit valid setting, E1) and `Factory:DefaultRepo` to the sandbox, so two
+stories that touch one file open the incident. They write no control: manual Pause, Continue and Stop stay the owner's, and the
+owner's ledger, controls and freezes are never read or written. Pass or fail is decided by `HotFileLive` (tested in every
+`dotnet test` by `HotFileLiveTests`): a run FAILS on no incident, an unresolved or escalated one, an assessment not served on
+`high`, an assessment session that is reused or is also a worker or review session, a last assessment that is not safe, and —
+the safe case — any correction. The defect case also fails unless exactly one correction merged with a `gate-passed` row (at
+most two attempts) and a safe assessment came after that merge, unless d1 merged before d2, and it fails INCONCLUSIVE when the
+first assessment was not unsafe with a merged correction finding. Both check that no global freeze row was written. The
+harness's one tracker write is the defect case's release of d2 (Backlog → To Do) after d1 merged.
+
+Prerequisites: the shared harness's (`FACTORY_E2E=1`, the router and an enrolled plan, both GitHub Apps on the sandbox with
+its rulesets, the Shortcut token, a watch scope `FACTORY_E2E_WATCH_EPIC` holding ONLY the two stories, `docker compose up
+-d`), no real `factory work`/`factory run` running, and `FACTORY_E2E_HOTFILE_REPO=<owner/name>`: a disposable sandbox
+repository (e.g. `michaeltrefry/dark-factory-sandbox`) whose CI runs for pull requests. Each run needs two fresh stories —
+both To Do for the safe case; d1 To Do and d2 in the Backlog for the defect case — and skips naming one in another state.
+
+Safe case, `FACTORY_E2E_HOTFILE_SAFE_STORIES=sc-<a>,sc-<b>`, in a dedicated epic: story a "Append the line `hot-file safe a`
+to `docs/hotfile-e2e.md` (create it if missing)", story b the same with `hot-file safe b`. Expected: both merge, the second
+merge opens one incident, one fresh high-class assessment answers safe, the incident is Resolved, no correction exists.
+
+Merged-defect case, `FACTORY_E2E_HOTFILE_DEFECT_STORIES=sc-<d1>,sc-<d2>`, in a dedicated epic whose description states the
+requirement "`HotFileCount.Words(string text)` returns the number of runs of non-whitespace characters; empty or
+whitespace-only text has 0 words." Story d1: "Add `public static int Words(string text) => text.Split(' ').Length;` exactly
+as written to a new `HotFileCount` class in the sandbox library, with a test that `Words("a b")` is 2" — it merges code that
+violates its epic's requirement (`Words("")` is 1). Story d2: "Add `Lines(string text)` (the number of `\n`-separated lines)
+to `HotFileCount`, with a test." The factory does not order ready work by priority, so the order is made, not hoped for:
+leave d2 in the Backlog; the harness moves it to To Do (through the factory's own Shortcut source) only once d1's Merge row is
+in the throwaway ledger, and the run fails unless d1 merged before d2 (`HotFileLive.OrderProblem`). Expected: both merge, the incident opens
+on the `HotFileCount` file, the first assessment is unsafe with a merged finding, exactly one `rc-<n>` correction is worked in
+the sandbox repository and merged through the gate, and a fresh high-class reassessment of the delivered commit is safe.
+Risks, stated: the panel reads d1's story and may reject its instruction (no incident: the run fails `found 0`), and the live
+assessor may judge the defect differently (INCONCLUSIVE). Both are failures, not skips.
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_WATCH_EPIC=<safe epic> FACTORY_E2E_HOTFILE_REPO=<owner/name> \
+  FACTORY_E2E_HOTFILE_SAFE_STORIES=sc-<a>,sc-<b> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*AT8_safe*" --report-xunit-xml
+FACTORY_E2E=1 FACTORY_E2E_WATCH_EPIC=<defect epic> FACTORY_E2E_HOTFILE_REPO=<owner/name> \
+  FACTORY_E2E_HOTFILE_DEFECT_STORIES=sc-<d1>,sc-<d2> \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- --filter-method "*AT8_merged_defect*" --report-xunit-xml
+```
+
+Pitfall: put `--results-directory` (and every other test-platform option) BEFORE `--`, or leave it out; given after `--`
+it is passed on to the test application and breaks the `dotnet test` run. The report then goes to the test project's default
+`TestResults/` directory.
+
+### AT8 live evidence (2026-10-17)
+
+Both runs passed against `michaeltrefry/dark-factory-sandbox`. Each used a throwaway ledger that was dropped afterwards, so
+what survives as evidence is the two xunit result files (`--report-xunit-xml`) and the sandbox pull requests listed here.
+
+The result files are in `/Users/michael/Repos/dark-factory/.claude/worktrees/agent-a30f8072b3e6299bb/TestResults/`. The safe
+run is `michael_Michaels-MacBook-Pro_2026-10-17_17_31_17.297013.xunit.xml` and the defect run is
+`michael_Michaels-MacBook-Pro_2026-10-17_17_42_08.454570.xunit.xml`. A third file there,
+`michael_Michaels-MacBook-Pro_2026-10-17_17_28_55.950776.xunit.xml`, is a first attempt that skipped because of the router
+default.
+
+| Case | Duration | Evidence |
+| --- | --- | --- |
+| Safe | 5 min 51 s | sandbox PRs #91 (merged as `e7118027`) and #92 (merged as `a052f5da`) changed the same file; one incident opened and was Resolved after one fresh high-class assessment answered safe; no correction; no global freeze row |
+| Merged defect | 13 min 54 s | d1 merged as PR #93 (`f380e8e7`); d2 merged as PR #94 (`43a8617a`) and opened incident generation 1; the first assessment was unsafe; correction `rc-1` merged through the gate as PR #95 (`d41790c9`) with 3 new tests that fail on the base; a fresh high-class reassessment answered safe and the incident was Resolved; no global freeze row |
+
+Bounds: the safe case waits up to 2 h and the defect case 4 h for the incident to end (Resolved or Escalated). Cost: four
+real implementer sessions (five with the correction), their panels, and two to four high-class assessments. They leave merged
+pull requests, `docs/hotfile-e2e.md` and `HotFileCount` on the sandbox, and clones under `<Factory:WorkRoot>/e2e/`.

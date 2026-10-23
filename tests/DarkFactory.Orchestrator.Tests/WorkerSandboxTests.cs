@@ -920,7 +920,14 @@ public class WorkerSandboxTests
         Assert.True(SafeHelper.SourceContains(BeforeTheWait + "#"));
         var helper = SafeHelper.Create(_dir, new SafeHelperOptions { Mutate = copy => copy.Replace(BeforeTheWait, "\n/bin/sleep 0.3" + BeforeTheWait) });
         var file = Path.Combine(_dir, "too-big");
-        var psi = new ProcessStartInfo(helper.Path, ["/bin/sh", "-c", stopped ? "exec /bin/sleep 600" : $"ulimit -f 0; echo x >'{file}'; echo survived >&2"])
+        // A signal ignored when a process starts stays ignored across exec, and a POSIX shell cannot reset it (`trap - XFSZ`
+        // does nothing then): run under a parent tree that ignores SIGXFSZ, the worker's write would fail with EFBIG and the
+        // shell go on ("write error: File too large", exit 0) instead of dying by the signal. So the self-signalling worker
+        // first puts SIGXFSZ back to its default (perl can, unlike sh) and only then execs the shell (sc-26344).
+        string[] worker = stopped
+            ? ["/bin/sh", "-c", "exec /bin/sleep 600"]
+            : ["/usr/bin/perl", "-e", "$SIG{XFSZ} = 'DEFAULT'; exec('/bin/sh', '-c', shift) or exit 99", $"ulimit -f 0; echo x >'{file}'; echo survived >&2"];
+        var psi = new ProcessStartInfo(helper.Path, worker)
         {
             RedirectStandardInput = true,
             RedirectStandardError = true,
@@ -937,6 +944,8 @@ public class WorkerSandboxTests
         await p.WaitForExitAsync(cts.Token);
         p.StandardInput.Close();
 
+        Assert.True(stopped || p.ExitCode == 128 + 25,
+            $"the worker did not end by SIGXFSZ (exit {p.ExitCode}, stderr '{stderr}'): is SIGXFSZ ignored and not reset for it?");
         Assert.Equal((exit, ""), (p.ExitCode, stderr));
     }
 

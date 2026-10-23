@@ -267,7 +267,22 @@ public static class FactoryRunner
         var http = OutboundHttp.GitHubApi();
         var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
         return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp),
-            options.ConfiguredRepos, FreezeCheckFailures.Process);
+            options.ConfiguredRepos, FreezeCheckFailures.Process, CreateRecovery(options), scheduleRecovery: true);
+    }
+
+    private static Recovery.HotFileRecovery CreateRecovery(FactoryOptions options)
+    {
+        var http = OutboundHttp.GitHubApi();
+        var router = ReviewerHttp(options);
+        var sources = new WorkSourceRegistry(options);
+        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        var evidence = new Recovery.HotFileEvidence(Contexts(options), new GitHubGate(http, app), naming => sources.Of(naming));
+        IReviewFiles files = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
+            async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c, GitHubGate.ReadPermissions)).Token, protectCloneLocks: true);
+        return new Recovery.HotFileRecovery(Contexts(options), new PostgresRunLocks(options.LedgerConnectionString), options.Freeze,
+            TimeProvider.System, new Recovery.RouterHotFileAssessor(new RouterReviewer(router, options.RouterKey), evidence.CaptureAsync,
+                new RouterClient(router, options.RouterKey), files, costSettleDelay: options.CostSettleDelay), [http, router, sources],
+            evidence.CaptureAsync, new GitHubGate(http, app).GetPolicyAsync);
     }
 
     private static LedgerDbContextFactory Contexts(FactoryOptions options) =>
@@ -280,9 +295,11 @@ public static class FactoryRunner
     public static async Task PollIssuesAsync(FactoryOptions options, IntakeStatus status, TextWriter log, CancellationToken ct)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
+        using var classifierHttp = ClassifierHttp(options);
+        var classifier = Issues.IssueClassifier.Create(options, classifierHttp, () => options.RouterKey);
         var intake = new Issues.IssueIntake(WorkSourceRegistry.Issues(options, githubHttp), options.WatchedIssueRepos, Contexts(options),
             new PostgresRunLocks(options.LedgerConnectionString), Controls(options), new SandboxTriageRunner(options, log), status,
-            options.MaxItemFailures, TimeProvider.System, log);
+            options.MaxItemFailures, TimeProvider.System, log, classifier);
         await intake.PollAsync(ct);
     }
 
@@ -296,7 +313,7 @@ public static class FactoryRunner
         RunAsync(options, source, storyId, false, log, ct, null, recoveryHead: head, recoveryOwner: owner, recoveryBase: expectedBase, retryIncompleteReview: retryIncompleteReview);
 
     internal static async Task<RunOutcome> RunAsync(FactoryOptions options, IWorkSource source, int storyId, bool ignoreScope, TextWriter log,
-        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null,
+        CancellationToken ct, Func<GateStage, GateStage>? adjustGate, WorkerSandbox? testSandbox = null, Recovery.HotFileRecovery? sharedRecovery = null,
         string? recoveryHead = null, string? recoveryOwner = null, string? recoveryBase = null, bool retryIncompleteReview = false)
     {
         // Resolve every credential before touching the ledger so a missing one fails fast.
@@ -372,6 +389,8 @@ public static class FactoryRunner
             gate = adjustGate(gate);
         }
         var controls = Controls(options);
+        await using var ownedRecovery = sharedRecovery is null ? CreateRecovery(options) : null;
+        var recovery = sharedRecovery ?? ownedRecovery!;
         var pipeline = new RunPipeline(
             source,
             ledger,
@@ -393,7 +412,8 @@ public static class FactoryRunner
             // Before every dispatch (sc-25387): a frozen factory defers the run.
             // Failed checks are counted per process (FreezeCheckFailures.Process), across runs and the intake loop's polls.
             freeze: new FactoryFreeze(Contexts(options), controls, freezeOptions, TimeProvider.System, gate.GitHub, options.ConfiguredRepos,
-                FreezeCheckFailures.Process),
+                FreezeCheckFailures.Process, recovery),
+            recovery: recovery, backgroundRecovery: sharedRecovery is not null,
             // A looping worker is interrupted at its next tool boundary and its round fails (sc-25388).
             stuck: stuck,
             maxControlReadFailures: maxControlReadFailures,
@@ -462,6 +482,14 @@ public static class FactoryRunner
 
     /// <summary>The reviewers' router client: one reviewer call may take <c>Review:TimeoutMinutes</c>.</summary>
     internal static HttpClient ReviewerHttp(FactoryOptions options) => OutboundHttp.RouterApi(options.RouterBaseUrl, options.ReviewTimeout);
+
+    /// <summary>
+    /// The issue classifier's router client: <c>Issues:Classification:TimeoutSeconds</c> is the deadline, carried by the
+    /// classifier's own linked token on every request and body read, so the client's HTTP timeout is disabled — the gateway's
+    /// 100 s default would cut a longer configured deadline short in production only (tests inject their own clients).
+    /// </summary>
+    internal static HttpClient ClassifierHttp(FactoryOptions options) =>
+        OutboundHttp.RouterApi(options.RouterBaseUrl, Timeout.InfiniteTimeSpan);
 
     /// <summary>
     /// The merge gate as configured: CI on the PR's head polled every <c>Gate:CiPollSeconds</c> until <c>Gate:CiTimeoutMinutes</c>,
@@ -590,14 +618,17 @@ public sealed class FactoryItemStops(FactoryOptions options, WorkSourceRegistry 
 {
     public Task<ControlResult> StopAsync(ItemRef item, CancellationToken ct) => StopAsync(sources.Of(item.Naming), item.Id, ct);
 
-    private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct)
+    public Task<ControlResult> DraftRepositoryAsync(ItemRef item, RepoRef repository, CancellationToken ct) =>
+        StopAsync(sources.Of(item.Naming), item.Id, ct, repository);
+
+    private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct, RepoRef? repository = null)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
         var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var stopper = new ItemStopper(owner, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
             new GitHubPullRequests(githubHttp, app), FactoryRunner.Controls(options), log);
-        return await stopper.StopAsync(id, ct);
+        return repository is null ? await stopper.StopAsync(id, ct) : await stopper.DraftRepositoryAsync(id, repository, ct);
     }
 }
 
@@ -617,6 +648,10 @@ public sealed class FactoryItemStops(FactoryOptions options, WorkSourceRegistry 
 /// </summary>
 public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) : Issues.ITriageRunner
 {
+    // Test/held-out evaluation seam only: a locally materialized, frozen synthetic repository instead of GitHub.
+    // No configuration/env/CLI can set it. The sandbox, locks, worker, tools, taint and session accounting stay production's.
+    internal string? EvaluationSnapshot { private get; init; }
+
     /// <summary>The work root's directory of triage worktrees, apart from the items' <c>worktrees</c> (slot 1's; slot n's: <see cref="TriageWorktreesOf"/>).</summary>
     public const string TriageWorktrees = "triage-worktrees";
 
@@ -666,11 +701,16 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         await FactoryRunner.EnsureSandboxReadyAsync(slots, options.ClaudePath, ct);
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
-        var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
+        if (EvaluationSnapshot is { } snapshot && (!Path.IsPathFullyQualified(snapshot) || !Directory.Exists(snapshot)))
+        {
+            throw new InvalidOperationException("The evaluation snapshot must be a local absolute repository directory.");
+        }
+        var app = EvaluationSnapshot is null
+            ? new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System) : null;
         // The seat is the held slot's (sc-25990): its own root of triage worktrees, its own directory of session files.
         var seat = SlotSeat.Of(options.WorkRoot, TriageWorktrees, slots, slot);
-        GitWorkspace SeatsIn(string worktrees) => new(options.WorkRoot, GitWorkspace.GitHubRemote,
-            async (r, c) => (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
+        GitWorkspace SeatsIn(string worktrees) => new(options.WorkRoot, r => EvaluationSnapshot ?? GitWorkspace.GitHubRemote(r),
+            async (r, c) => app is null ? null : (await app.CreateInstallationTokenAsync(r, c, Issues.WorkerTriageRunner.TriageWorkspaceToken)).Token, sandbox: slots,
             worktreesDirectory: worktrees, shareWithWorker: false);
         var workspaces = SeatsIn(seat.Worktrees);
         // Whatever a crashed or unstoppable triage left in this slot's root is swept (nothing resumes a triage), this issue's own
@@ -695,11 +735,14 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
         // text is untrusted and the triage's answer is posted on the issue). The upstream token stays here; the session gets a
         // credential revoked when it ends, in a file (never argv).
         using var codeGraphHttp = OutboundHttp.CodeGraphApi(options.CodeGraphBaseUrl);
-        var upstreams = FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log);
+        // A held-out synthetic snapshot must not acquire private indexed context (or change context between arms).
+        var upstreams = EvaluationSnapshot is null ? FactoryRunner.CreateUpstreams(options, codeGraphHttp, kanbanHttp: null, log)
+            : new Mcp.McpUpstreams(null, null);
         await using var proxy = await StartMcpProxyAsync(upstreams, seat.Sessions, live, ct);
         var tools = TriageTools(upstreams, proxy is not null);
         var worker = new ClaudeWorker(options.ClaudePath, options.RouterBaseUrl, routerKey, options.WorkerTimeout, slots,
-            pauseFlagDirectory: options.PauseFlagDirectory, tools: tools);
+            pauseFlagDirectory: options.PauseFlagDirectory, tools: tools,
+            maxTurns: EvaluationSnapshot is null ? null : 12);
         var sessions = new SessionRecorder(new LedgerDbContextFactory(LedgerDbContext.PostgresOptions(options.LedgerConnectionString)),
             new RouterClient(routerHttp, routerKey), TimeProvider.System, log, costSettleDelay: options.CostSettleDelay);
         return await new Issues.WorkerTriageRunner(workspaces, worker, sessions, log,
@@ -869,7 +912,7 @@ public sealed class SandboxPlanRunner(FactoryOptions options, WorkerSlots? slots
 }
 
 /// <summary>The intake loop's runner: the production pipeline over the Postgres ledger, for one work source's items.</summary>
-public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source, TextWriter log) : IItemRunner
+public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source, TextWriter log, Func<Recovery.HotFileRecovery?>? recovery = null) : IItemRunner
 {
     public async Task<IReadOnlyList<int>> InFlightAsync(CancellationToken ct)
     {
@@ -890,7 +933,7 @@ public sealed class FactoryItemRunner(FactoryOptions options, IWorkSource source
         return await RunPipeline.RenewableAsync(new WorkLedger(db, TimeProvider.System), source.Naming, ct, FactoryRunner.Controls(options));
     }
 
-    public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct);
+    public Task<RunOutcome> RunAsync(int id, CancellationToken ct) => FactoryRunner.RunAsync(options, source, id, ignoreScope: false, log, ct, null, sharedRecovery: recovery?.Invoke());
 
     public async Task<string?> GiveUpAsync(int id, string reason, CancellationToken ct)
     {

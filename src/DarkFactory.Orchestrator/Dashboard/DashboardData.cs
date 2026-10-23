@@ -178,6 +178,9 @@ public sealed record RunView(bool? Live, string Phase, SlotUse Use, int? Slot = 
             WorkState.MergeGate => "merge gate",
             WorkState.Merge => "merged: closing out",
             WorkState.Watch => "merged",
+            // An automatic repository hold, not a human's Pause: it resumes by itself once the incident resolves.
+            WorkState.Paused when transitions.LastOrDefault()?.Detail == RunPipeline.RecoveryHeld =>
+                "held by repository recovery" + (transitions.Count > 1 ? $" in {transitions[^2].State}" : "") + ": resumes by itself",
             WorkState.Paused => "paused" + (transitions.Count > 1 ? $" in {transitions[^2].State}" : "")
                 + (transitions.LastOrDefault()?.Detail is { Length: > 0 } why ? $": {Cut(why)}" : ""),
             _ => state.ToString().ToLowerInvariant(),
@@ -276,6 +279,12 @@ public interface IDashboardData
 
     Task<SessionHeader?> SessionAsync(string claudeSessionId, CancellationToken ct);
 
+    /// <summary>Recovery observations from the ledger only; no recovery is triggered by rendering.</summary>
+    Task<Recovery.RecoveryStatusReport> RecoveryAsync(CancellationToken ct) =>
+        Task.FromResult(new Recovery.RecoveryStatusReport(DateTimeOffset.MinValue, []));
+
+    Task<Recovery.RecoveryStatusReport> RecoveryPageAsync(int page, CancellationToken ct) => RecoveryAsync(ct);
+
     /// <summary>Every scope's control (factory, epics, items).</summary>
     Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<Control>>([]);
 
@@ -333,6 +342,12 @@ public sealed class DashboardData(IDbContextFactory<LedgerDbContext> contexts, T
     private static readonly WorkState[] Finished = [WorkState.Done, WorkState.Cancelled];
 
     public TimeSpan QuietThreshold { get; } = quietThreshold ?? DefaultQuietThreshold;
+
+    public Task<Recovery.RecoveryStatusReport> RecoveryAsync(CancellationToken ct) =>
+        new Recovery.RecoveryStatusReader(contexts, time).ReadAsync(ct);
+
+    public Task<Recovery.RecoveryStatusReport> RecoveryPageAsync(int page, CancellationToken ct) =>
+        new Recovery.RecoveryStatusReader(contexts, time).ReadPageAsync(page, ct);
 
     public async Task<IReadOnlyList<Control>> ControlsAsync(CancellationToken ct)
     {

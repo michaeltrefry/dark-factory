@@ -120,7 +120,13 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         {
             var body = await response.Content.ReadAsStringAsync(ct);
             var message = $"GitHub {action} failed: {(int)response.StatusCode} {body}";
-            throw response.StatusCode == HttpStatusCode.NotFound ? new GitHubNotFoundException(message) : new InvalidOperationException(message);
+            throw response.StatusCode switch
+            {
+                HttpStatusCode.NotFound => new GitHubNotFoundException(message),
+                HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout =>
+                    new GitHubGatewayException(message, response.StatusCode),
+                _ => new InvalidOperationException(message)
+            };
         }
     }
 
@@ -146,3 +152,9 @@ public sealed class GitHubNotFoundException(string message) : InvalidOperationEx
 /// check that needed the read failed — it did not find "no such ref".
 /// </summary>
 public sealed class GitHubAppNotInstalledException(string message) : InvalidOperationException(message);
+
+/// <summary>A gateway answer cannot establish whether a write was accepted. Never blindly retry that write.</summary>
+public sealed class GitHubGatewayException(string message, HttpStatusCode status) : InvalidOperationException(message)
+{
+    public HttpStatusCode StatusCode { get; } = status;
+}

@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Include="Fixtures/systemone/**" CopyToOutputDirectory="PreserveNewest" />
     <Using Include="Xunit" />
     <Using Include="DarkFactory.Orchestrator.Gateway" />
   </ItemGroup>

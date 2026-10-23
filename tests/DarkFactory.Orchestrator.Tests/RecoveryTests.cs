@@ -38,7 +38,7 @@ public class RecoveryTests
         Assert.Contains(h.Reviewer.Requests, r => r.Role == ReviewRoles.SpecConformance);
         var rows = await h.Rows();
         var adopted = Assert.Single(rows.Where(r => r.Step is null && r.State == WorkState.Recovering));
-        var audit = RunPipeline.Recovery.Of(rows)!;
+        var audit = RunPipeline.OwnerRecovery.Of(rows)!;
         Assert.Equal("owner (cli)", audit.Owner);
         Assert.Equal(ShaD, audit.Head);
         Assert.Equal("factory/sc-77", audit.Branch);
@@ -251,7 +251,7 @@ public class RecoveryTests
         var verdict = ReviewVerdict.FromDetail(old.Detail)!;
         await h.Ledger.CheckpointAsync(item, RunPipeline.Steps.Verdict, null, (verdict with { HeadSha = ShaD }).ToDetail(), default);
         await h.Ledger.CheckpointAsync(item, RunPipeline.Steps.GatePassed, null, ShaD, default);
-        var audit = new RunPipeline.Recovery("owner", Sandbox.FullName, "factory/sc-77", "main", PrUrl, ShaC, ShaD);
+        var audit = new RunPipeline.OwnerRecovery("owner", Sandbox.FullName, "factory/sc-77", "main", PrUrl, ShaC, ShaD);
         await h.Ledger.RecordAsync(item, WorkState.Recovering, null, audit.ToDetail(), default);
         Assert.Null(RunPipeline.GatePassedAt(await h.Rows(), new PullFacts(1, PrUrl, false, true, false, ShaD, "main", "base", "merged")));
         Assert.Empty(RunPipeline.Verdicts(await h.Rows()));
@@ -341,7 +341,7 @@ public class RecoveryTests
         h.GitHub.DefaultBranch = actualDefault;
         var result = await h.Pipeline().RecoverAsync(77, ShaD, "owner", default, asserted);
         Assert.Equal(accepted ? WorkState.Watch : WorkState.Escalated, result.State);
-        if (accepted) Assert.Contains("owner assertion", RunPipeline.Recovery.Of(await h.Rows())!.BaseEvidence);
+        if (accepted) Assert.Contains("owner assertion", RunPipeline.OwnerRecovery.Of(await h.Rows())!.BaseEvidence);
         else Assert.StartsWith("Recovery refused:", result.Error);
     }
 
@@ -398,8 +398,8 @@ public class RecoveryTests
         Assert.Equal(WorkState.Watch, result.State);
         Assert.All(h.Reviewer.Requests, request => Assert.Equal(repo.FullName, request.Repo));
         Assert.Equal(workers, h.WorkerCalls.Count);
-        Assert.Contains("ledger changeset", RunPipeline.Recovery.Of(await h.Rows())!.BaseEvidence);
-        Assert.Equal(repo.FullName, RunPipeline.Recovery.Of(await h.Rows())!.Repo);
+        Assert.Contains("ledger changeset", RunPipeline.OwnerRecovery.Of(await h.Rows())!.BaseEvidence);
+        Assert.Equal(repo.FullName, RunPipeline.OwnerRecovery.Of(await h.Rows())!.Repo);
     }
 
     [Fact]

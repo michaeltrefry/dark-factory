@@ -252,5 +252,14 @@ public sealed class PushGrant
     internal Func<string, CancellationToken, Task>? BeforePush { get; private init; }
 
     internal PushGrant WithExpectedRemoteHead(string head, Func<string, CancellationToken, Task>? beforePush = null) =>
-        new(Sessions) { ExpectedRemoteHead = head, BeforePush = beforePush };
+        new(Sessions) { ExpectedRemoteHead = head, BeforePush = beforePush, Precheck = Precheck, BeforePublish = BeforePublish };
+    // Additional incident authority never replaces the ledger's taint grant.
+    internal Func<CancellationToken, Task>? BeforePublish { get; init; }
+    // The cheap checks before staging and before the token is minted; the full one (BeforePublish) only at the remote write.
+    internal Func<CancellationToken, Task>? Precheck { get; init; }
+    internal Task PrecheckAsync(CancellationToken ct) => (Precheck ?? BeforePublish)?.Invoke(ct) ?? Task.CompletedTask;
+    internal Task ValidateAsync(CancellationToken ct) => BeforePublish?.Invoke(ct) ?? Task.CompletedTask;
+    internal PushGrant WithValidation(Func<CancellationToken, Task> validate) => new(Sessions) { BeforePublish = validate, ExpectedRemoteHead = ExpectedRemoteHead, BeforePush = BeforePush };
+    internal PushGrant WithValidation(Func<CancellationToken, Task> precheck, Func<CancellationToken, Task> validate) =>
+        new(Sessions) { Precheck = precheck, BeforePublish = validate, ExpectedRemoteHead = ExpectedRemoteHead, BeforePush = BeforePush };
 }

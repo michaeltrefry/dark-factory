@@ -182,22 +182,23 @@ public class MergeQueueTests
             }
         }
 
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+        public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
         {
+            if (authorize is not null) await authorize(ct);
             lock (_gate)
             {
                 Calls.Add($"merge {number} {headSha}");
                 var branch = _pullBranch[number];
                 if (Branches[branch] != headSha)
                 {
-                    return Task.FromResult(new MergeResult(false, null, true, "Head branch was modified."));
+                    return new MergeResult(false, null, true, "Head branch was modified.");
                 }
                 Merges.Add((branch, headSha, Contains[headSha], Main.Count));
                 _updating.Remove(branch);
                 var commit = AdvanceMain($"merge-{branch}");
                 _merged.Add(number);
                 _mergeCommits[number] = commit;
-                return Task.FromResult(new MergeResult(true, commit, false, "merged"));
+                return new MergeResult(true, commit, false, "merged");
             }
         }
 

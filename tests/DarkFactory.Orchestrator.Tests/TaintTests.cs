@@ -9,6 +9,27 @@ namespace DarkFactory.Orchestrator.Tests;
 /// <summary>sc-25386: a worker session that read untrusted content is tainted (ledger) and never gets a push token (E4).</summary>
 public class TaintRuleTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_push_grant_keeps_the_remote_lease_and_incident_checks_in_either_composition_order(bool leaseFirst)
+    {
+        var calls = new List<string>();
+        Task Precheck(CancellationToken _) { calls.Add("precheck"); return Task.CompletedTask; }
+        Task Validate(CancellationToken _) { calls.Add("validate"); return Task.CompletedTask; }
+        Task Intent(string head, CancellationToken _) { calls.Add("intent " + head); return Task.CompletedTask; }
+        var grant = leaseFirst
+            ? TestGrants.Untainted.WithExpectedRemoteHead("adopted", Intent).WithValidation(Precheck, Validate)
+            : TestGrants.Untainted.WithValidation(Precheck, Validate).WithExpectedRemoteHead("adopted", Intent);
+
+        Assert.Equal(TestGrants.Untainted.Sessions, grant.Sessions);
+        Assert.Equal("adopted", grant.ExpectedRemoteHead);
+        await grant.PrecheckAsync(default);
+        await grant.ValidateAsync(default);
+        await grant.BeforePush!("published", default);
+        Assert.Equal(["precheck", "validate", "intent published"], calls);
+    }
+
     [Fact]
     public void The_stream_shows_each_web_or_mcp_tool_use_once_and_ignores_other_tools()
     {

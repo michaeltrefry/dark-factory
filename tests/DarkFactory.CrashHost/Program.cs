@@ -11,6 +11,8 @@ using DarkFactory.Orchestrator.Worker;
 using DarkFactory.Orchestrator.WorkSources;
 using Microsoft.EntityFrameworkCore;
 
+if (args[0] == "recovery") return await RecoveryCrashHost.RunAsync(args[1..]);
+
 var (connection, workDir, storyId) = (args[0], args[1], int.Parse(args[2]));
 
 await LedgerMigrations.MigrateAsync(connection, CancellationToken.None);

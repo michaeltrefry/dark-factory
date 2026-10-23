@@ -80,6 +80,7 @@ public partial class ChangesetPipelineTests
         public bool FailAfterOpen { get; set; }
         /// <summary>Called (outside the lock) with the base and head of every diff read, before it is answered.</summary>
         public Action<string, string>? OnDiffRead { get; set; }
+        public Action? OnPullRead { get; set; }
         /// <summary>The head branch of every <see cref="ConvertOpenToDraftAsync"/> call.</summary>
         public List<string> Drafted { get; } = [];
         /// <summary>The branches that have a worktree now.</summary>
@@ -228,6 +229,7 @@ public partial class ChangesetPipelineTests
 
         public Task<PullFacts> GetPullAsync(RepoRef repo, int number, CancellationToken ct)
         {
+            OnPullRead?.Invoke();
             lock (_gate)
             {
                 PullReads++;
@@ -301,8 +303,9 @@ public partial class ChangesetPipelineTests
             }
         }
 
-        public Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct)
+        public async Task<MergeResult> MergeAsync(RepoRef repo, int number, string headSha, CancellationToken ct, Func<CancellationToken, Task>? authorize = null)
         {
+            if (authorize is not null) await authorize(ct);
             OnMerge?.Invoke(number, headSha);
             lock (_gate)
             {
@@ -310,13 +313,13 @@ public partial class ChangesetPipelineTests
                 Calls.Add($"merge {number} {headSha} into {pull.Base}");
                 if (Branches[pull.Head] != headSha)
                 {
-                    return Task.FromResult(new MergeResult(false, null, true, "Head branch was modified."));
+                    return new MergeResult(false, null, true, "Head branch was modified.");
                 }
                 var commit = Commit($"merge-{number}", [.. Changes[Branches[pull.Base]], .. Changes[headSha]]);
                 Branches[pull.Base] = commit;
                 (pull.MergedHead, pull.MergeCommit) = (headSha, commit);
                 Merges.Add((pull.Head, pull.Base, headSha, commit));
-                return Task.FromResult(new MergeResult(true, commit, false, "merged"));
+                return new MergeResult(true, commit, false, "merged");
             }
         }
 
@@ -500,6 +503,34 @@ public partial class ChangesetPipelineTests
             session(new PlannerSeat(worker, "/plan-wt", null, ["mcp__codegraph__search_graph"], []), ct);
     }
 
+    internal sealed class EvidenceControls(IControls inner, Func<Task<bool>> evidenceRecorded, ControlState state,
+        bool atCloseout = false) : IControls
+    {
+        private async Task Before(bool closeout, CancellationToken ct)
+        {
+            if (closeout == atCloseout && await evidenceRecorded())
+                await inner.SetAsync("item:sc-500", state, "human", ct);
+        }
+        public async Task<ControlState> EffectiveInRepositoryAsync(string id, long? epic, string repo, CancellationToken ct)
+        {
+            await Before(false, ct);
+            return await inner.EffectiveInRepositoryAsync(id, epic, repo, ct);
+        }
+        public async Task<ControlState> EffectiveWithoutRepositoryAsync(string id, long? epic, CancellationToken ct)
+        {
+            await Before(true, ct);
+            return await inner.EffectiveWithoutRepositoryAsync(id, epic, ct);
+        }
+        public Task<ControlState> EffectiveAsync(string id, long? epic, CancellationToken ct) => inner.EffectiveAsync(id, epic, ct);
+        public Task<IReadOnlyList<Control>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+        public Task<Control?> UsagePauseAsync(CancellationToken ct) => inner.UsagePauseAsync(ct);
+        public Task<Control> PauseForUsageAsync(DateTimeOffset? reset, string reason, CancellationToken ct) => inner.PauseForUsageAsync(reset, reason, ct);
+        public Task<Control> FreezeAsync(string trigger, string detail, DateTimeOffset? read, CancellationToken ct) => inner.FreezeAsync(trigger, detail, read, ct);
+        public Task<Control?> GetAsync(string scope, CancellationToken ct) => inner.GetAsync(scope, ct);
+        public Task SetAsync(string scope, ControlState value, string by, CancellationToken ct) => inner.SetAsync(scope, value, by, ct);
+        public Task ClearAsync(string scope, CancellationToken ct) => inner.ClearAsync(scope, ct);
+    }
+
     private sealed class Harness
     {
         private readonly DbContextOptions<LedgerDbContext> _options =
@@ -539,6 +570,7 @@ public partial class ChangesetPipelineTests
         public FakeShortcutBoard Board { get; } = new();
         public ShortcutWorkSource Source { get; }
         public InProcessRunLocks Locks { get; } = new();
+        public IControls? ControlReads { get; set; }
         public IControls Controls => new LedgerControls(new LedgerDbContextFactory(_options), TimeProvider.System);
         public TextWriter Log => LazyInitializer.EnsureInitialized(ref _writer, () => TextWriter.Synchronized(_log));
         /// <summary>The planner's answers, one per planner session.</summary>
@@ -556,7 +588,7 @@ public partial class ChangesetPipelineTests
         }
 
         public RunPipeline Pipeline() =>
-            new(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, WorkerInstead ?? Worker, Repo, Sandbox, Log, controls: Controls,
+            new(Source, new WorkLedger(new LedgerDbContext(_options), TimeProvider.System), Locks, Repo, WorkerInstead ?? Worker, Repo, Sandbox, Log, controls: ControlReads ?? Controls,
                 controlPollInterval: TimeSpan.FromMilliseconds(10),
                 gate: new GateStage(Repo, Reviewer, TimeSpan.FromMilliseconds(5), TimeSpan.FromSeconds(30), Risk: FakeCodeGraphRisk.Reader(CodeGraph)),
                 planner: Planner is null ? null : new Seat(Planner));
@@ -1066,6 +1098,40 @@ public partial class ChangesetPipelineTests
         Assert.Contains("its failed verdict is from before this run of the changeset pull request", h.Logged);
         Assert.Equal((ChangesetBranch, Main), (h.Repo.Merges[^1].Head, h.Repo.Merges[^1].Base));
         Assert.Equal(FakeShortcutBoard.Done, h.State(PlanId));
+    }
+
+    [Theory]
+    [InlineData(false, ControlState.Paused)]
+    [InlineData(false, ControlState.Stopping)]
+    [InlineData(true, ControlState.Paused)]
+    [InlineData(true, ControlState.Stopping)]
+    public async Task A_control_during_empty_or_merged_changeset_evidence_prevents_closeout(bool mergedOutside, ControlState state)
+    {
+        var h = new Harness();
+        if (mergedOutside)
+        {
+            await h.ChangesetOpen();
+            h.Repo.SquashOutside(ChangesetBranch);
+            Assert.Equal(WorkState.Escalated, (await h.Run()).State);
+            Assert.Equal(WorkState.Planned, (await h.Run()).State);
+            h.Repo.OnPullRead = Hold;
+        }
+        else
+        {
+            var ids = await h.Plan(Two);
+            foreach (var id in ids) await h.Merge(id);
+            h.Repo.Advance(Main, [.. h.Repo.At(h.Repo.Tip(ChangesetBranch))]);
+            h.Repo.OnDiffRead = (_, _) => Hold();
+        }
+        void Hold() => h.Controls.SetAsync("item:sc-500", state, "human", CancellationToken.None).GetAwaiter().GetResult();
+        var result = await h.Run();
+        Assert.Equal(state == ControlState.Stopping ? WorkState.Cancelled : WorkState.Planned, result.State);
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.ChangesetEmpty));
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.ChangesetDelivered));
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.MergedReported));
+        Assert.Empty(await h.Steps(PlanId, RunPipeline.Steps.Closeout));
+        Assert.DoesNotContain(WorkState.Done, await h.Transitions(PlanId));
+        Assert.NotEqual(FakeShortcutBoard.Done, h.State(PlanId));
     }
 
     [Fact]

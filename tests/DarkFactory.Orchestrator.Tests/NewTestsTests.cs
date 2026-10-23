@@ -1173,7 +1173,7 @@ public class GateCloneTests : IDisposable
         OwnProcess? own = null;
         Task<TestRunReport>? running = null;
         using var cancellation = new CancellationTokenSource();
-        if (cancelled) cancellation.CancelAfter(TimeSpan.FromMilliseconds(300));
+        var started = Path.Combine(_root, "retained-started");
         var runner = new SandboxTestRunner(git, slots: null, cancelled ? TimeSpan.FromMinutes(1) : TimeSpan.FromMilliseconds(300))
         {
             DirectStopGrace = TimeSpan.FromMilliseconds(100),
@@ -1183,8 +1183,14 @@ public class GateCloneTests : IDisposable
         try
         {
             running = runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [],
-                [new TestStep(TestPhase.Build, "/bin/sh", ["-c", "sleep 600"]),
+                [new TestStep(TestPhase.Build, "/bin/sh", ["-c", $"touch '{started}'; sleep 600"]),
                  new TestStep(TestPhase.Cleanup, "/bin/sh", ["-c", $"touch '{cleaned}'"])], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), cancellation.Token);
+            // Cancellation must interrupt the test process, not the clone/worktree setup (which now does recovery's
+            // additional owner-side checks too). The termination deadline below starts only once that process exists.
+            using var readiness = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            while (!File.Exists(started) && !running.IsCompleted) await Task.Delay(10, readiness.Token);
+            Assert.True(File.Exists(started));
+            if (cancelled) cancellation.Cancel();
             var error = await Assert.ThrowsAsync<InvalidOperationException>(() => running.WaitAsync(TimeSpan.FromSeconds(2)));
             Assert.True(DarkFactory.Orchestrator.Worker.WorkerStillRunning.IsMarked(error));
             var path = Assert.Single(Directory.EnumerateDirectories(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name)));

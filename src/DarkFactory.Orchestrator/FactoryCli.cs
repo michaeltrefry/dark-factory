@@ -15,7 +15,10 @@ public static class FactoryCli
         Func<CancellationToken, Task<int>> setDashboardPassword,
         Func<string, string, CancellationToken, Task<int>> control,
         Func<Guid, bool, CancellationToken, Task<int>>? kanbanKey = null,
-        Func<WorkSources.ItemRef, string, string, bool, CancellationToken, Task<int>>? recover = null)
+        Func<WorkSources.ItemRef, string, string, bool, CancellationToken, Task<int>>? recover = null,
+        Func<CancellationToken, Task<int>>? recoveryStatus = null,
+        Func<int, CancellationToken, Task<int>>? recoveryPageStatus = null,
+        Func<string, CancellationToken, Task<int>>? recoveryReassess = null)
     {
         var storyArgument = new Argument<WorkSources.ItemRef?>("item-id")
         {
@@ -186,10 +189,37 @@ public static class FactoryCli
             : parse.GetValue(kanbanEpicOption) is { } epic ? kanbanKey(epic, true, ct)
             : kanbanKey(parse.GetValue(kanbanItemArgument), false, ct));
 
+        var recoveryStatusCommand = new Command("status", "Report repository incidents, blockers, correction PRs and controls from the ledger only; never advances recovery.");
+        var recoveryPage = new Option<int>("--page") { Description = "Zero-based recovery page (unresolved incidents first)." };
+        recoveryPage.Validators.Add(result => { if (result.GetValueOrDefault<int>() < 0 || result.GetValueOrDefault<int>() > int.MaxValue / Recovery.RecoveryStatusReader.MaxRepositories) result.AddError("Recovery page is out of range."); });
+        recoveryStatusCommand.Options.Add(recoveryPage);
+        recoveryStatusCommand.SetAction((parse, ct) => recoveryPageStatus is not null ? recoveryPageStatus(parse.GetValue(recoveryPage), ct)
+            : recoveryStatus?.Invoke(ct) ?? Task.FromResult(1));
+        var reassessRepo = new Option<string>("--repo")
+        {
+            Description = "The repository (owner/name) whose escalated hot-file incident gets a fresh assessment",
+            Required = true,
+            CustomParser = result =>
+            {
+                var name = result.Tokens.Single().Value;
+                if (Controls.ControlScope.RepositoryOf("repo:" + name.ToLowerInvariant()) is not null) return name;
+                result.AddError("Expected --repo owner/name.");
+                return null;
+            },
+        };
+        var recoveryReassessCommand = new Command("reassess",
+            "Re-arm an ESCALATED repository incident (human-only): a new generation of the same incident is assessed afresh with fresh "
+            + "budgets (3 assessments, 2 corrections, 3 refreshes), audited in the ledger. Clears no Pause or Stop, leaves the freeze and "
+            + "other repositories' incidents alone, and is refused for an incident that is not escalated.")
+        { reassessRepo };
+        recoveryReassessCommand.SetAction((parse, ct) => recoveryReassess is null ? Task.FromResult(1)
+            : recoveryReassess(parse.GetValue(reassessRepo)!, ct));
         return new RootCommand("Dark Factory orchestrator")
         {
             runCommand,
             recoverCommand,
+            new Command("recovery", "Repository hot-file recovery: read-only status, and the human re-arm of an escalated incident")
+                { recoveryStatusCommand, recoveryReassessCommand },
             new Command("kanban", "KanbanBoard work items") { kanbanKeyCommand },
             workCommand,
             ControlCommand("pause", "Pause a scope: nothing new is claimed or started there, and running workers stop after their current tool call (session and worktree kept).", control),
@@ -232,10 +262,21 @@ public static class FactoryCli
                 return null;
             },
         };
+        var repository = new Option<string?>("--repo")
+        {
+            Description = "One repository's human control (owner/name); Continue does not resolve an automatic recovery hold",
+            CustomParser = result =>
+            {
+                var name = result.Tokens.Single().Value.ToLowerInvariant();
+                if (Controls.ControlScope.RepositoryOf("repo:" + name) is not null) return "repo:" + name;
+                result.AddError("Expected --repo owner/name.");
+                return null;
+            },
+        };
         var factory = new Option<bool>("--factory") { Description = "The whole factory" };
         var usage = new Option<bool>("--usage") { Description = "The factory's usage pause (plans exhausted): lift it before its reset time" };
         var freeze = new Option<bool>("--freeze") { Description = "The factory's automatic freeze: clear it (only later events can freeze it again)" };
-        var command = new Command(action, description) { item, epic, factory };
+        var command = new Command(action, description) { item, epic, repository, factory };
         if (action == "continue")
         {
             command.Options.Add(usage);
@@ -244,19 +285,20 @@ public static class FactoryCli
         command.Validators.Add(result =>
         {
             var given = new[] { result.GetResult(item) is not null, result.GetResult(epic) is not null, result.GetResult(factory) is not null, result.GetResult(usage) is not null,
-                    result.GetResult(freeze) is not null }
+                    result.GetResult(freeze) is not null, result.GetResult(repository) is not null }
                 .Count(x => x);
             if (given != 1)
             {
                 result.AddError(action == "continue"
-                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --factory, --usage or --freeze."
-                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N) or --factory.");
+                    ? "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name>, --factory, --usage or --freeze."
+                    : "Give exactly one of --item <id> (sc-N, gh-N or kb-N), --epic <epic> (N or kb-N), --repo <owner/name> or --factory.");
             }
         });
         command.SetAction((parse, ct) =>
         {
             var scope = parse.GetValue(item) is { } story ? Controls.ControlScope.Item(story.ToString())
                 : parse.GetValue(epic) is { } named ? Controls.ControlScope.Epic(named)
+                : parse.GetValue(repository) is { } repoScope ? repoScope
                 : parse.GetValue(usage) ? Controls.ControlScope.Usage
                 : parse.GetValue(freeze) ? Controls.ControlScope.Freeze
                 : Controls.ControlScope.Factory;

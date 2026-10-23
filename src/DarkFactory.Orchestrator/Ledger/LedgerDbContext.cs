@@ -235,6 +235,7 @@ public sealed class GitHubIssueCursor
 
 public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) : DbContext(options)
 {
+    public DbSet<IssueClassification> IssueClassifications => Set<IssueClassification>();
     public DbSet<GitHubIssue> GitHubIssues => Set<GitHubIssue>();
     public DbSet<GitHubIssueCursor> GitHubIssueCursors => Set<GitHubIssueCursor>();
     public DbSet<KanbanItem> KanbanItems => Set<KanbanItem>();
@@ -245,9 +246,67 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
     public DbSet<SessionEvent> SessionEvents => Set<SessionEvent>();
     public DbSet<Control> Controls => Set<Control>();
     public DbSet<SessionTaint> SessionTaints => Set<SessionTaint>();
+    public DbSet<Recovery.HotFileIncident> HotFileIncidents => Set<Recovery.HotFileIncident>();
+
+    public DbSet<Recovery.RecoveryCorrection> RecoveryCorrections => Set<Recovery.RecoveryCorrection>();
+    public DbSet<Recovery.RecoveryAncestor> RecoveryAncestors => Set<Recovery.RecoveryAncestor>();
+    public DbSet<Recovery.RecoveryAssessmentAttempt> RecoveryAssessmentAttempts => Set<Recovery.RecoveryAssessmentAttempt>();
+    public DbSet<Recovery.RecoveryMaterial> RecoveryMaterials => Set<Recovery.RecoveryMaterial>();
+
+    // E3: an incident's state change is saved with its append-only ledger row (Recovery.IncidentTransitions).
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        Recovery.IncidentTransitions.Append(this);
+        return base.SaveChanges(acceptAllChangesOnSuccess);
+    }
+
+    public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+    {
+        await Recovery.IncidentTransitions.AppendAsync(this, cancellationToken);
+        return await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+    }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<Recovery.RecoveryAssessmentAttempt>(e =>
+        {
+            e.ToTable("recovery_assessment_attempts");
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => x.Session).IsUnique();
+            e.HasIndex(x => new { x.IncidentId, x.Snapshot, x.Number });
+            e.HasOne<Recovery.HotFileIncident>().WithMany().HasForeignKey(x => x.IncidentId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<Recovery.RecoveryCorrection>(e =>
+        {
+            e.ToTable("recovery_corrections");
+            e.Property(x => x.Repo).HasMaxLength(200);
+            e.Property(x => x.State).HasMaxLength(32);
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => new { x.IncidentId, x.Attempt }).IsUnique();
+            e.HasOne<Recovery.HotFileIncident>().WithMany().HasForeignKey(x => x.IncidentId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<Recovery.RecoveryAncestor>(e =>
+        {
+            e.ToTable("recovery_ancestors");
+            e.HasKey(x => new { x.CorrectionId, x.WorkItemId, x.Scope });
+            e.Property(x => x.Scope).HasMaxLength(240);
+            e.HasOne(x => x.Correction).WithMany().HasForeignKey(x => x.CorrectionId).OnDelete(DeleteBehavior.Restrict);
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<Recovery.RecoveryMaterial>(e =>
+        {
+            e.ToTable("recovery_materials");
+            e.HasKey(x => x.Hash);
+            e.Property(x => x.Hash).HasMaxLength(64);
+        });
+        modelBuilder.Entity<Recovery.HotFileIncident>(e =>
+        {
+            e.ToTable("hot_file_incidents");
+            e.Property(x => x.Repo).HasMaxLength(200);
+            e.Property(x => x.State).HasMaxLength(32);
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.HasIndex(x => new { x.Repo, x.Generation }).IsUnique();
+        });
         modelBuilder.Entity<WorkItem>(e =>
         {
             e.ToTable("work_items");
@@ -295,11 +354,25 @@ public sealed class LedgerDbContext(DbContextOptions<LedgerDbContext> options) :
         {
             e.ToTable("controls");
             e.HasKey(x => x.Scope);
-            e.Property(x => x.Scope).HasMaxLength(64);
+            e.Property(x => x.Scope).HasColumnType("text");
             e.Property(x => x.State).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.ChangedBy).HasMaxLength(128);
             e.Property(x => x.Reason).HasMaxLength(64);
             e.Property(x => x.Version).IsRowVersion();
+        });
+        modelBuilder.Entity<IssueClassification>(e =>
+        {
+            e.ToTable("issue_classifications");
+            e.Property(x => x.IssueVersion).HasMaxLength(64);
+            e.Property(x => x.Mode).HasMaxLength(16);
+            e.Property(x => x.Status).HasMaxLength(32);
+            e.Property(x => x.ClassifierVersion).HasMaxLength(64);
+            e.Property(x => x.PromptVersion).HasMaxLength(80);
+            e.Property(x => x.RequestedModel).HasMaxLength(128);
+            e.Property(x => x.Model).HasMaxLength(128);
+            e.Property(x => x.Label).HasMaxLength(32);
+            e.HasIndex(x => new { x.WorkItemId, x.IssueVersion });
+            e.HasOne<WorkItem>().WithMany().HasForeignKey(x => x.WorkItemId);
         });
         modelBuilder.Entity<GitHubIssue>(e =>
         {

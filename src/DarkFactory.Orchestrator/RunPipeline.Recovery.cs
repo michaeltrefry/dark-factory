@@ -10,18 +10,18 @@ namespace DarkFactory.Orchestrator;
 public sealed partial class RunPipeline
 {
     /// <summary>The owner's exact adoption, committed in the Recovering transition, not a detached checkpoint.</summary>
-    internal sealed record Recovery(string Owner, string Repo, string Branch, string Base, string Pull, string RejectedHead, string Head, string BaseEvidence = "owner assertion validated against repository default",
+    internal sealed record OwnerRecovery(string Owner, string Repo, string Branch, string Base, string Pull, string RejectedHead, string Head, string BaseEvidence = "owner assertion validated against repository default",
         string? Kind = null, long? SourceVerdictId = null, long? SourceEscalationId = null, int? MaxOutputTokens = null)
     {
         public string ToDetail() => JsonSerializer.Serialize(this);
-        public static Recovery? Of(IReadOnlyList<LedgerEntry> history)
+        public static OwnerRecovery? Of(IReadOnlyList<LedgerEntry> history)
         {
             var row = history.LastOrDefault(e => e.Step is null && e.State == WorkState.Recovering && e.Detail != "unpaused");
             if (row is null || history.SkipWhile(e => e.Id != row.Id).Skip(1)
                 .Any(e => e.Step is null && e.State is WorkState.Intake or WorkState.Planned)) return null;
             try
             {
-                return JsonSerializer.Deserialize<Recovery>(row.Detail ?? "")
+                return JsonSerializer.Deserialize<OwnerRecovery>(row.Detail ?? "")
                     ?? throw new InvalidOperationException("The recorded recovery is unreadable.");
             }
             catch (JsonException ex) { throw new InvalidOperationException("The recorded recovery is unreadable.", ex); }
@@ -49,7 +49,7 @@ public sealed partial class RunPipeline
                 return await OutcomeAsync(item, "Recovery refused: the item is already running.", ct);
             }
             await ledger.ReloadAsync(item, ct);
-            Recovery recovery;
+            OwnerRecovery recovery;
             try
             {
                 void Require(bool yes, string why) { if (!yes) throw new InvalidOperationException(why); }
@@ -96,7 +96,7 @@ public sealed partial class RunPipeline
                 var started = history.FindLastIndex(e => e.Step == Steps.WorkerStarted);
                 Require(started < 0 || history.Skip(started + 1).Any(e => e.Step == Steps.WorkerDone || e.Step == Steps.OrphanKilled),
                     "the last worker has no recorded completion; recover only after it is stopped");
-                var rejected = Verdicts(history).LastOrDefault()?.HeadSha ?? Recovery.Of(history)?.RejectedHead;
+                var rejected = Verdicts(history).LastOrDefault()?.HeadSha ?? OwnerRecovery.Of(history)?.RejectedHead;
                 Require(IsCommit(rejected), "no recorded reviewed/rejected head");
                 if (!retryIncompleteReview)
                     Require(head != rejected && head != pushed?.Detail, "the repaired head is unchanged from the rejected/pushed head");
@@ -107,7 +107,7 @@ public sealed partial class RunPipeline
                 var expectedBase = recordedBase ?? pull.DefaultBranch;
                 Require(!string.IsNullOrWhiteSpace(expectedBase) && assertedBase == expectedBase,
                     "--base must match the ledger's changeset base, or the repository's actual default branch for an ordinary story");
-                recovery = new Recovery(owner, repo.FullName, branch, expectedBase!, url, rejected!, head,
+                recovery = new OwnerRecovery(owner, repo.FullName, branch, expectedBase!, url, rejected!, head,
                     recordedBase is null ? "owner assertion validated against repository default" : "ledger changeset base (owner assertion matched)");
                 if (retryIncompleteReview)
                 {
@@ -116,7 +116,7 @@ public sealed partial class RunPipeline
                     var policy = GatePolicy.Parse(policyText);
                     var diff = await Gate.GitHub.GetDiffAsync(repo, pull.BaseSha, head, ct);
                     var required = ReviewRoles.Required(policy.SecurityReviewReasons(policy.Classify(diff)).Count > 0
-                        || Recovery.Of(history)?.Kind == "incomplete-review");
+                        || OwnerRecovery.Of(history)?.Kind == "incomplete-review");
                     var proof = IncompleteReviewEvidence.Require(history, head, url, required);
                     Require(Gate.Reviewer.MaxOutputTokens > 0, "Review:MaxOutputTokens must be positive");
                     recovery = recovery with { Kind = "incomplete-review", SourceVerdictId = proof.VerdictId,
@@ -164,7 +164,7 @@ public sealed partial class RunPipeline
         await ledger.RecordAsync(run.Item, WorkState.Review, null, pull.HtmlUrl, ct);
     }
 
-    private static void ValidateRecoveryPull(Recovery recovery, PullFacts pull, string expectedHead, bool requireOpen)
+    private static void ValidateRecoveryPull(OwnerRecovery recovery, PullFacts pull, string expectedHead, bool requireOpen)
     {
         if ((requireOpen && (!pull.Open || pull.Merged)) || pull.Draft
             || pull.HtmlUrl != recovery.Pull || pull.HeadSha != expectedHead
@@ -176,7 +176,7 @@ public sealed partial class RunPipeline
 
     private static void EnsureRecoveryPull(List<LedgerEntry> history, Run run, PullFacts pull)
     {
-        if (Recovery.Of(history) is not { } recovery) return;
+        if (OwnerRecovery.Of(history) is not { } recovery) return;
         // A later ordinary re-run retains its original semantics; this boundary applies only to its own attempt.
         var boundary = history.FindLastIndex(e => e.Step is null && e.State == WorkState.Recovering && e.Detail != "unpaused");
         if (history.Skip(boundary + 1).Any(e => e.Step is null && e.State is WorkState.Intake or WorkState.Planned)) return;
@@ -192,5 +192,119 @@ public sealed partial class RunPipeline
         var expected = advanced?.Step == Steps.Pushed ? advanced.Detail
             : update is not null ? !published && pull.HeadSha == update.From ? update.From : update.To : recovery.Head;
         ValidateRecoveryPull(recovery, pull, expected ?? throw new InvalidOperationException("Unreadable recovery head advance."), requireOpen: false);
+    }
+
+    // Old verdicts, test results, overlays and merge authorization remain audit facts, never authority for a redirected attempt.
+    internal static List<LedgerEntry> SinceRecoveryRestart(IReadOnlyList<LedgerEntry> history)
+    {
+        var start = 0;
+        for (var i = 0; i < history.Count; i++)
+            if (history[i].Step == Recovery.RecoveryRedirect.Started) start = i + 1;
+        return history.Skip(start).ToList();
+    }
+
+    private async Task RestartRedirectedCodingAsync(Run run, CancellationToken ct)
+    {
+        if (run.Redirect is not { } redirect || run.Item.State == WorkState.Intake) return;
+        var detail = JsonSerializer.Serialize(redirect);
+        var history = await ledger.HistoryAsync(run.Item, ct);
+        if (history.Any(e => e.Step == Recovery.RecoveryRedirect.Started && e.Detail == detail)) return;
+        await InWorkerPhaseAsync(run.Item, "restart redirected coding", async () =>
+        {
+            await ThrowIfControlledAsync(run.Item, ct);
+            var current = await recovery!.RedirectAsync(run.Item.ExternalId, ct);
+            if (current != redirect) throw new Recovery.RecoveryContinuationDeferredException("Recovery disposition changed while waiting for a slot.");
+            await ThrowIfControlledAsync(run.Item, ct);
+            var attempt = CurrentWorkerAttempt(history);
+            if (OrphanedWorkerPid(attempt) is { } pid)
+                await worker.StopOrphanAsync(pid, ct);
+            // PrepareAsync replaces the previous worktree as its own slot user. Never restore its old pushed branch.
+            await ledger.RestartCodingAsync(run.Item, redirect, ct);
+            await ledger.CheckpointAsync(run.Item, Recovery.RecoveryRedirect.Started, null, detail, ct);
+        }, ct);
+    }
+
+    private const string RecoveryDelivered = "recovery-delivered";
+    private const string RecoveryMergeAuthorized = "recovery-merge-authorized";
+    private const string RecoveryPushedHead = "recovery-pushed-head";
+
+    private async Task RecordCorrectionPushAsync(Run run, CancellationToken ct)
+    {
+        if (Naming != ItemNaming.Recovery) return;
+        await ledger.CheckpointAsync(run.Item, RecoveryPushedHead, null, await workspaces.HeadAsync(run.Workspace!, ct), ct);
+        // Real progress past the boundaries: a run of could-not-verify deferrals ends here, not at a verified check alone.
+        if (recovery is not null) await recovery.ProgressedAsync(run.Item.ExternalId, ct);
+    }
+    private sealed record CorrectionMerge(int Pull, string Base, string BaseSha, string Head);
+
+    private async Task ValidateCorrectionPushAsync(Run run, CancellationToken ct)
+    {
+        await ThrowIfControlledAsync(run.Item, ct);
+        var workspace = run.Workspace ?? throw new InvalidOperationException("Correction has no worktree to verify.");
+        var pinned = recovery is null ? null : await recovery.CorrectionBaseShaAsync(run.Item.ExternalId, ct);
+        if (pinned is null) throw ControlRequestedException.Deferred();
+        var paths = await workspaces.CorrectionPathsAsync(workspace, pinned, ct);
+        var authorized = await recovery!.AuthorizeCorrectionAsync(run.Item.ExternalId, run.Repo.FullName, ct,
+            workspace.BaseBranch, pinned, paths);
+        // Reads above may await network evidence. A human control arriving meanwhile still wins.
+        await ThrowIfControlledAsync(run.Item, ct);
+        if (!authorized) throw ControlRequestedException.Deferred();
+    }
+
+    private async Task ValidateCorrectionMergeAsync(Run run, PullFacts pull, IReadOnlyList<string> paths, CancellationToken ct)
+    {
+        if (Naming != ItemNaming.Recovery) return;
+        // Called by the merge transport AFTER its write token is minted. These reads use their own read-only token.
+        // GitHub binds only the head: a base/control/grant change after these last reads and before the PUT remains a race.
+        var current = await Gate.GitHub.GetPullAsync(run.Repo, pull.Number, ct);
+        if (!current.Open || current.HeadSha != pull.HeadSha)
+            throw new GateBlockedException("Correction pull request changed before its authorized merge.");
+        var authorized = recovery is not null && await recovery.AuthorizeCorrectionAsync(run.Item.ExternalId, run.Repo.FullName, ct,
+            current.BaseRef, current.BaseSha, paths);
+        await ThrowIfControlledAsync(run.Item, ct);
+        if (!authorized) throw ControlRequestedException.Deferred();
+        await ledger.CheckpointAsync(run.Item, RecoveryMergeAuthorized, null,
+            JsonSerializer.Serialize(new CorrectionMerge(pull.Number, pull.BaseRef, pull.BaseSha, pull.HeadSha)), ct);
+        await recovery!.ProgressedAsync(run.Item.ExternalId, ct);
+        await ThrowIfFrozenAsync(run.Item, ct, fresh: true);
+    }
+
+    // Observe, never execute, a merge whose authorized call was interrupted. The base moving because of our own merge
+    // must not revoke its completed delivery or make a restart implement the same correction twice.
+    private async Task ObserveCorrectionMergeAsync(WorkItem item, CancellationToken ct)
+    {
+        if (Naming != ItemNaming.Recovery || gate is null || item.State is not (WorkState.MergeGate or WorkState.Paused)) return;
+        await using var held = await locks.TryAcquireAsync(item.Id, ct);
+        if (held is null) return;
+        await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        var history = await ledger.HistoryAsync(item, ct);
+        var context = TransitionContext.From(history.Where(e => e.Step is null).Select(e => e.State).ToList());
+        if (item.State != WorkState.MergeGate && !(item.State == WorkState.Paused && context.PausedFrom == WorkState.MergeGate)) return;
+        var authorized = history.LastOrDefault(e => e.Step == RecoveryMergeAuthorized);
+        if (authorized?.Detail is null || LinkedPullRequestUrl(history) is not { } url) return;
+        var expected = JsonSerializer.Deserialize<CorrectionMerge>(authorized.Detail)!;
+        var (repo, number) = GitHubGate.ParsePullUrl(url);
+        if (!repo.Is(RepoRef.Parse(item.Repo)) || number != expected.Pull) return;
+        var pull = await Gate.GitHub.GetPullAsync(repo, number, ct);
+        if (pull.BaseRef != expected.Base || pull.HeadSha != expected.Head || GatePassedAt(history, pull) is not { } commit
+            || !await CorrectionMergeWasAuthorizedAsync(repo, history, pull, ct)) return;
+        if (await _controls.EffectiveWithoutRepositoryAsync(item.ExternalId, item.EpicId, ct) != ControlState.Running) return;
+        if (item.State == WorkState.Paused) await ledger.RecordAsync(item, WorkState.MergeGate, null, "unpaused", ct);
+        await ledger.RecordAsync(item, WorkState.Merge, null, commit, ct);
+    }
+
+    private async Task<bool> CorrectionMergeWasAuthorizedAsync(RepoRef repo, IReadOnlyList<LedgerEntry> history, PullFacts pull, CancellationToken ct) =>
+        Naming != ItemNaming.Recovery || history.LastOrDefault(e => e.Step == RecoveryMergeAuthorized)?.Detail is { } detail
+            && JsonSerializer.Deserialize<CorrectionMerge>(detail) is { } expected
+            && expected.Pull == pull.Number && expected.Base == pull.BaseRef && expected.Head == pull.HeadSha
+            && await Gate.GitHub.IsGateMergeAsync(repo, pull, ct);
+
+    private async Task RecordCorrectionDeliveryAsync(Run run, string? commit, CancellationToken ct)
+    {
+        if (Naming != ItemNaming.Recovery) return;
+        var history = await ledger.HistoryAsync(run.Item, ct);
+        if (history.Any(e => e.Step == RecoveryDelivered)) return;
+        await ledger.CheckpointAsync(run.Item, RecoveryDelivered, null,
+            $"{LinkedPullRequestUrl(history)} into {run.RequiredBase} at {commit}; awaiting fresh recovery assessment", ct);
     }
 }

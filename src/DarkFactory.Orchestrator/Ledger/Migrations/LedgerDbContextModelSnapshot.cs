@@ -25,8 +25,7 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.Control", b =>
                 {
                     b.Property<string>("Scope")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
+                        .HasColumnType("text");
 
                     b.Property<TimeSpan?>("Backoff")
                         .HasColumnType("interval");
@@ -104,6 +103,80 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.HasKey("Repo");
 
                     b.ToTable("github_issue_cursors", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.IssueClassification", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("ClassifierVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<double?>("Confidence")
+                        .HasColumnType("double precision");
+
+                    b.Property<long>("ElapsedMs")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("InputTokens")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("IssueVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Label")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<string>("Mode")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<string>("Model")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<long?>("OutputTokens")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Probabilities")
+                        .HasColumnType("text");
+
+                    b.Property<string>("PromptVersion")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)");
+
+                    b.Property<DateTimeOffset>("RecordedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("RequestedModel")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("WorkItemId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("WorkItemId", "IssueVersion");
+
+                    b.ToTable("issue_classifications", (string)null);
                 });
 
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.KanbanEpicKey", b =>
@@ -374,6 +447,239 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                     b.ToTable("worker_sessions", (string)null);
                 });
 
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.HotFileIncident", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Answer")
+                        .HasColumnType("text");
+
+                    b.Property<int>("Attempts")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Error")
+                        .HasColumnType("text");
+
+                    b.Property<string>("EvidenceHash")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int>("Generation")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Prompt")
+                        .HasColumnType("text");
+
+                    b.Property<int>("Refreshes")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Repo")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTimeOffset?>("ResolvedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Session")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Snapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Repo", "Generation")
+                        .IsUnique();
+
+                    b.ToTable("hot_file_incidents", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAncestor", b =>
+                {
+                    b.Property<int>("CorrectionId")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("WorkItemId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Scope")
+                        .HasMaxLength(240)
+                        .HasColumnType("character varying(240)");
+
+                    b.HasKey("CorrectionId", "WorkItemId", "Scope");
+
+                    b.HasIndex("WorkItemId");
+
+                    b.ToTable("recovery_ancestors", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAssessmentAttempt", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<long>("IncidentId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTimeOffset>("LeaseUntil")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("Number")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Result")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Session")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Snapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Session")
+                        .IsUnique();
+
+                    b.HasIndex("IncidentId", "Snapshot", "Number");
+
+                    b.ToTable("recovery_assessment_attempts", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("Attempt")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Base")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int>("Deferrals")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("EvidenceHash")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int>("Generation")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("IncidentId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("MaterialHash")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("MaterialSnapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Paths")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Repo")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTimeOffset?>("RetryAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Snapshot")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Spec")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("IncidentId", "Attempt")
+                        .IsUnique();
+
+                    b.ToTable("recovery_corrections", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryMaterial", b =>
+                {
+                    b.Property<string>("Hash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Body")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset>("CapturedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Hash");
+
+                    b.ToTable("recovery_materials", (string)null);
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.IssueClassification", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
+                        .WithMany()
+                        .HasForeignKey("WorkItemId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("DarkFactory.Orchestrator.Ledger.LedgerEntry", b =>
                 {
                     b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
@@ -419,6 +725,41 @@ namespace DarkFactory.Orchestrator.Ledger.Migrations
                         .WithMany()
                         .HasForeignKey("WorkItemId")
                         .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAncestor", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", "Correction")
+                        .WithMany()
+                        .HasForeignKey("CorrectionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("DarkFactory.Orchestrator.Ledger.WorkItem", null)
+                        .WithMany()
+                        .HasForeignKey("WorkItemId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Correction");
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryAssessmentAttempt", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Recovery.HotFileIncident", null)
+                        .WithMany()
+                        .HasForeignKey("IncidentId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("DarkFactory.Orchestrator.Recovery.RecoveryCorrection", b =>
+                {
+                    b.HasOne("DarkFactory.Orchestrator.Recovery.HotFileIncident", null)
+                        .WithMany()
+                        .HasForeignKey("IncidentId")
+                        .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
                 });
 

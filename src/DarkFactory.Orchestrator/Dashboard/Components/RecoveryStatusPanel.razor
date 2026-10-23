@@ -1,0 +1,65 @@
+@using DarkFactory.Orchestrator.Recovery
+
+@if (Report is { } report)
+{
+    <section aria-label="Repository recovery">
+        <h2>Repository recovery</h2>
+        <p class="muted">Ledger observation @report.ReadAt.ToString("u"); refreshed at most every 15 seconds while this page is open.
+            Evidence is not live-validated here. Reading this page never starts recovery or changes controls.</p>
+        @if (report.Note is { } note) { <p class="error">@note</p> }
+        @foreach (var row in report.Repositories)
+        {
+            var scope = ControlScope.Repository(RepoRef.Parse(row.Repo));
+            <article class="repository-recovery" data-repo="@row.Repo" data-incident="@row.Incident">
+                <h3>@row.Repo — incident @row.Incident, generation @row.Generation</h3>
+                <div class="controls" data-scope="@scope">
+                    <span>Repository manual control: @(Paused(scope) ? "human Pause remains" : "not paused at repository scope (other controls may apply)")</span>
+                    <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />
+                    <ControlButton Action="stop" Scope="@scope" />
+                </div>
+                <p><strong>@row.Stage</strong> — @row.Hold</p>
+                <p>@row.Attempts</p>
+                <dl>
+                    <dt>Hot files / delivery base</dt><dd>@string.Join("; ", row.HotFiles)</dd>
+                    <dt>Evidence / provenance</dt><dd>@row.Evidence</dd>
+                    <dt>Assessment</dt><dd>@row.Assessment</dd>
+                    <dt>Applicable controls</dt><dd>@(row.Controls.Count == 0 ? "None recorded at observation time; not authorization to run." : string.Join("; ", row.Controls))</dd>
+                    <dt>Held repository items</dt><dd>@(row.HeldItems.Count == 0 ? "None recorded." : string.Join("; ", row.HeldItems))</dd>
+                    <dt>Affected-work dispositions</dt><dd>@(row.Redirects.Count == 0 ? "None recorded." : string.Join("; ", row.Redirects))</dd>
+                </dl>
+                @foreach (var correction in row.Corrections)
+                {
+                    <p>Correction <span class="id">@correction.Item</span>, attempt @correction.Attempt: @correction.State —
+                        @if (correction.PullRequest is { } pr) { <a class="correction-pr" href="@pr">@pr</a> }
+                        else { <span class="muted">PR unavailable (not recorded or not scoped to this repository)</span> }
+                    </p>
+                }
+                @if (row.Blocker is { } blocker) { <p class="error">Blocker: @blocker</p> }
+                <p>@row.Remedy</p>
+                @if (row.Stage == "Escalated")
+                {
+                    @* The human re-arm (login + antiforgery, like every control post): a fresh assessment with fresh budgets; no control is cleared. *@
+                    <form method="post" action="recovery/reassess" class="recovery-reassess" data-repo="@row.Repo"
+                          onsubmit="@($"return confirm('Re-arm a fresh assessment of {row.Repo}\\'s escalated incident? Pauses and Stops stay as they are.')")">
+                        <AntiforgeryToken />
+                        <input type="hidden" name="repo" value="@row.Repo" />
+                        <button type="submit">Reassess</button>
+                    </form>
+                }
+            </article>
+        }
+        <nav aria-label="Recovery pages">
+            @if (report.Page > 0) { <button type="button" class="recovery-previous" @onclick="() => PageChanged.InvokeAsync(report.Page - 1)">Previous</button> }
+            <span>Recovery page @(report.Page + 1); unresolved incidents first</span>
+            @if (report.HasMore) { <button type="button" class="recovery-next" @onclick="() => PageChanged.InvokeAsync(report.Page + 1)">Next</button> }
+        </nav>
+        @if (report.Repositories.Count == 0) { <p class="muted">No repository recovery incidents recorded on this page.</p> }
+    </section>
+}
+
+@code {
+    [Parameter] public RecoveryStatusReport? Report { get; set; }
+    [Parameter] public EventCallback<int> PageChanged { get; set; }
+    [Parameter] public IReadOnlyDictionary<string, Control> Controls { get; set; } = new Dictionary<string, Control>();
+    private bool Paused(string scope) => Controls.GetValueOrDefault(scope)?.State == ControlState.Paused;
+}

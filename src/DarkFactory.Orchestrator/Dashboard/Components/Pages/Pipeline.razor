@@ -34,6 +34,10 @@
         <span>Factory frozen: <span class="freeze-trigger">@freeze.Reason</span> — <span class="freeze-detail">@freeze.Detail</span>
             (since @freeze.ChangedAt.ToString("u")). New work is deferred and running workers stop at their next tool call.
             Continue clears it; only what happens after that can freeze the factory again.</span>
+        @if (freeze.Reason == "hot-file")
+        {
+            <span>Legacy global hot-file freeze: predates repository incident recovery. Only an explicit human Continue clears this global freeze; automatic recovery never acknowledges it.</span>
+        }
         <ControlButton Action="continue" Scope="@ControlScope.Freeze" />
     </div>
 }
@@ -68,6 +72,16 @@ else if (Intake.Deferrals is { Count: > 0 } deferrals)
     <ControlButton Action="@(Paused(ControlScope.Factory) ? "continue" : "pause")" Scope="@ControlScope.Factory" />
     <ControlButton Action="stop" Scope="@ControlScope.Factory" />
 </div>
+<RecoveryStatusPanel Report="@_recovery" Controls="@_controls" PageChanged="ChangeRecoveryPageAsync" />
+@foreach (var repo in RepositoriesWithoutIncident)
+{
+    var scope = ControlScope.Repository(repo);
+    <div class="controls repository-control" data-scope="@scope">
+        <span>Repository @repo: @(Paused(scope) ? "human Pause" : "not paused at repository scope")</span>
+        <ControlButton Action="@(Paused(scope) ? "continue" : "pause")" Scope="@scope" />
+        <ControlButton Action="stop" Scope="@scope" />
+    </div>
+}
 @foreach (var epic in Epics.Where(e => !EpicFinished(e)))
 {
     @* An epic's scope carries its source (sc-25985): `epic:12` a Shortcut epic, `epic:kb-3` a Kanban epic. *@
@@ -304,6 +318,10 @@ else
 
     private readonly CancellationTokenSource _cts = new();
     private IReadOnlyList<PipelineRow>? _rows;
+    private DarkFactory.Orchestrator.Recovery.RecoveryStatusReport? _recovery;
+    private IEnumerable<RepoRef> RepositoriesWithoutIncident => (_rows ?? []).Select(r => RepoRef.Parse(r.Repo))
+        .Concat(_controls.Keys.Select(ControlScope.RepositoryOf).OfType<RepoRef>()).DistinctBy(r => r.Key)
+        .Where(r => _recovery?.Repositories.Any(i => RepoRef.Parse(i.Repo).Is(r)) != true).OrderBy(r => r.Key);
     private IReadOnlyList<Metric>? _metrics;
     private IReadOnlyDictionary<string, Control> _controls = new Dictionary<string, Control>();
 
@@ -372,13 +390,47 @@ else
 
     private Task OnTickAsync()
     {
-        // A run shown alive is asked about again too (sc-25991): one that died wrote no row, so no change announces it.
-        if (_rows?.Any(r => r.Sessions.Any(s => s.Running) || r.Run?.Live == true) == true)
+        // A run shown alive is asked about again too (sc-25991): one that died wrote no row, so no change announces it. A read
+        // that failed is retried whole, also on an idle page with no notification.
+        if (_stale || _rows is null || _rows.Any(r => r.Sessions.Any(s => s.Running) || r.Run?.Live == true))
         {
             return ReloadAsync();
         }
-        StateHasChanged();
-        return Task.CompletedTask;
+        // Recovery writes notify no work_items change: only the recovery panel (and the controls it shows) is polled on its own,
+        // never the whole page — a new or changed incident appears within one tick.
+        return ReloadRecoveryAsync();
+    }
+
+    private async Task ReloadRecoveryAsync()
+    {
+        if (_loading) return; // a full read in progress reads the recovery panel too
+        _loading = true;
+        try
+        {
+            _recovery = await Data.RecoveryPageAsync(_recoveryPage, _cts.Token);
+            _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
+        }
+        catch (Exception) when (_cts.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception)
+        {
+            _stale = true; // the next tick retries the whole page
+        }
+        finally
+        {
+            _loading = false;
+        }
+        if (_again) await ReloadAsync(); // a change that arrived meanwhile
+        else StateHasChanged();
+    }
+
+    private int _recoveryPage;
+    private Task ChangeRecoveryPageAsync(int page)
+    {
+        _recoveryPage = page;
+        return ReloadAsync();
     }
 
     private void OnIntakeChanged() => _ = InvokeAsync(StateHasChanged);
@@ -398,6 +450,7 @@ else
             {
                 _again = false;
                 _rows = await Data.ActiveItemsAsync(_cts.Token);
+                _recovery = await Data.RecoveryPageAsync(_recoveryPage, _cts.Token);
                 _controls = (await Data.ControlsAsync(_cts.Token)).ToDictionary(c => c.Scope);
                 _stale = false;
                 await ReloadMetricsAsync();

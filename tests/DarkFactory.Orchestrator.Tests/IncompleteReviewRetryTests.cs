@@ -60,7 +60,7 @@ public class IncompleteReviewRetryTests
         Assert.Null(result.Error);
         Assert.Equal(WorkState.Watch, result.State);
         var rows = await h.Rows();
-        var audit = RunPipeline.Recovery.Of(rows)!;
+        var audit = RunPipeline.OwnerRecovery.Of(rows)!;
         Assert.Equal("incomplete-review", audit.Kind);
         Assert.Equal(verdict.Id, audit.SourceVerdictId);
         Assert.Equal(escalation.Id, audit.SourceEscalationId);
@@ -132,7 +132,7 @@ public class IncompleteReviewRetryTests
             case "turn-class": reviews[0] = reviews[0] with { Turns = [new ServedTurn(1, "router-selected", "mid", StopReason: "max_tokens", MaxOutputTokens: 24576)] }; break;
             case "consumed":
                 await h.Ledger.RecordAsync(await h.Db.WorkItems.SingleAsync(), WorkState.Recovering, null,
-                    new RunPipeline.Recovery("owner", Sandbox.FullName, "factory/sc-77", "main", PrUrl, h.GitHub.Head, h.GitHub.Head,
+                    new RunPipeline.OwnerRecovery("owner", Sandbox.FullName, "factory/sc-77", "main", PrUrl, h.GitHub.Head, h.GitHub.Head,
                         Kind: "incomplete-review", SourceVerdictId: vrow.Id, SourceEscalationId: erow.Id, MaxOutputTokens: 24576).ToDetail(), default);
                 await h.Ledger.RecordAsync(await h.Db.WorkItems.SingleAsync(), WorkState.Escalated, null, erow.Detail, default);
                 break;
@@ -191,12 +191,12 @@ public class IncompleteReviewRetryTests
         await h.Pipeline().RecoverAsync(77, h.GitHub.Head, "owner", default, "main", retryIncompleteReview: true);
         var rows = await h.Rows();
         Assert.Single(rows, r => r.State == WorkState.Recovering && r.Step is null);
-        var first = RunPipeline.Recovery.Of(rows)!;
+        var first = RunPipeline.OwnerRecovery.Of(rows)!;
         Assert.Equal(WorkState.Escalated, (await h.Db.WorkItems.SingleAsync()).State);
         await h.Pipeline().RecoverAsync(77, h.GitHub.Head, "owner", default, "main", retryIncompleteReview: true);
         rows = await h.Rows();
         Assert.Equal(2, rows.Count(r => r.State == WorkState.Recovering && r.Step is null));
-        Assert.NotEqual(first.SourceVerdictId, RunPipeline.Recovery.Of(rows)!.SourceVerdictId);
+        Assert.NotEqual(first.SourceVerdictId, RunPipeline.OwnerRecovery.Of(rows)!.SourceVerdictId);
     }
     [Theory]
     [InlineData("ownership")]
@@ -264,7 +264,7 @@ public class IncompleteReviewRetryTests
         var rows = await h.Rows();
         Assert.Empty(RunPipeline.Verdicts(rows));
         Assert.Equal(WorkState.Recovering, (await h.Db.WorkItems.SingleAsync()).State);
-        var audit = RunPipeline.Recovery.Of(rows)!;
+        var audit = RunPipeline.OwnerRecovery.Of(rows)!;
         Assert.Equal(24576, audit.MaxOutputTokens);
         panel.Truncate = false;
         panel.MaxOutputTokens = 49152; // A resumed process configuration cannot silently change the admitted budget.

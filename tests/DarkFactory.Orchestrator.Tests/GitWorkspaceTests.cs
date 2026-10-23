@@ -1,6 +1,11 @@
 using System.Diagnostics;
 using DarkFactory.Orchestrator.Git;
 using DarkFactory.Orchestrator.Ledger;
+using DarkFactory.Orchestrator.Recovery;
+using DarkFactory.Orchestrator.Plans;
+using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
+using static DarkFactory.Orchestrator.Tests.RunPipelineTests;
 
 namespace DarkFactory.Orchestrator.Tests;
 
@@ -73,6 +78,34 @@ public class GitWorkspaceTests
         Assert.Equal(intended, Git(_root, "--git-dir=" + _remote, "rev-parse", "refs/heads/factory/sc-77").Trim());
     }
 
+    [Fact]
+    public async Task Recovery_first_read_closes_clone_locks_owner_side_without_a_worker_or_slot()
+    {
+        var root = Directory.CreateDirectory(Path.Combine(_root, "recovery-first")).FullName;
+        if (OperatingSystem.IsMacOS())
+        {
+            var chmod = new ProcessStartInfo("/bin/chmod") { UseShellExecute = false };
+            foreach (var arg in new[] { "+a", "user:nobody allow list,search,read,file_inherit,directory_inherit", root }) chmod.ArgumentList.Add(arg);
+            using var process = Process.Start(chmod)!;
+            await process.WaitForExitAsync();
+            Assert.Equal(0, process.ExitCode);
+        }
+        var head = Git(Path.Combine(_root, "seed"), "rev-parse", "HEAD").Trim();
+        var workspace = new GitWorkspace(root, _ => _remote, (_, _) => Task.FromResult<string?>(null),
+            git: async (cwd, env, args, ct) =>
+            {
+                if (OperatingSystem.IsMacOS()) Assert.True(DarkFactory.Orchestrator.Worker.WorkerSandbox.IsClosed(
+                    await DarkFactory.Orchestrator.Worker.WorkerSandbox.ListAclAsync(Path.Combine(root, CloneLock.DirectoryName), ct)));
+                return await GitWorkspace.RunGitAsync(cwd, env, args, ct);
+            }, protectCloneLocks: true);
+        Assert.Equal("hello\n", await ((Gate.IReviewFiles)workspace).ReadAsync(Repo, head, "README.md", CancellationToken.None));
+        var locks = Path.Combine(root, CloneLock.DirectoryName);
+        if (OperatingSystem.IsMacOS())
+            Assert.True(DarkFactory.Orchestrator.Worker.WorkerSandbox.IsClosed(
+                await DarkFactory.Orchestrator.Worker.WorkerSandbox.ListAclAsync(locks, CancellationToken.None)));
+        else Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(locks));
+    }
+
     private const string Token = "ghs_FakeInstallationToken123";
     private static readonly string BasicAuth = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"x-access-token:{Token}"));
 
@@ -116,6 +149,157 @@ public class GitWorkspaceTests
             }
         }
         return "";
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Recovery_restart_replaces_old_work_and_includes_the_delivered_commit_without_losing_plan_blockers(bool planChild)
+    {
+        var seed = Path.Combine(_root, "seed");
+        Git(seed, "checkout", "-b", "factory/changeset-sc-1");
+        File.WriteAllText(Path.Combine(seed, "blocker.txt"), "merged plan blocker");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "blocker");
+        Git(seed, "push", _remote, "factory/changeset-sc-1");
+        Git(seed, "checkout", "main");
+        File.WriteAllText(Path.Combine(seed, "fixed.txt"), "delivered repair");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "repair");
+        Git(seed, "push", _remote, "main");
+        var corrected = Git(seed, "rev-parse", "HEAD").Trim();
+        var workspace = Workspace();
+        var old = await workspace.PrepareAsync(Repo, "factory/sc-77", default);
+        File.WriteAllText(Path.Combine(old.Path, "stale.txt"), "old assumptions");
+        var fresh = await workspace.PrepareCorrectedAsync(Repo, "factory/sc-77", corrected, default,
+            planChild ? "factory/changeset-sc-1" : null);
+        Assert.Equal("delivered repair", File.ReadAllText(Path.Combine(fresh.Path, "fixed.txt")));
+        Assert.False(File.Exists(Path.Combine(fresh.Path, "stale.txt")));
+        Assert.Equal(planChild, File.Exists(Path.Combine(fresh.Path, "blocker.txt")));
+        Assert.Equal(planChild ? "factory/changeset-sc-1" : "main", fresh.BaseBranch);
+        Assert.Equal("0", Git(fresh.Path, "rev-list", "--count", $"HEAD..{corrected}").Trim());
+        await workspace.RemoveAsync(Repo, fresh, default);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Conflicting_correction_and_plan_blocker_reach_a_fresh_worker_and_keep_both_merge_parents(bool resolve)
+    {
+        var seed = Path.Combine(_root, "seed");
+        const string changeset = "factory/changeset-sc-10";
+        Git(seed, "checkout", "-b", changeset);
+        File.WriteAllText(Path.Combine(seed, "README.md"), "plan blocker behavior\n");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "plan blocker");
+        Git(seed, "push", _remote, changeset);
+        var blocker = Git(seed, "rev-parse", "HEAD").Trim();
+        Git(seed, "checkout", "main");
+        File.WriteAllText(Path.Combine(seed, "README.md"), "corrected behavior\n");
+        Git(seed, "add", ".");
+        Git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "correction");
+        Git(seed, "push", _remote, "main");
+        var corrected = Git(seed, "rev-parse", "HEAD").Trim();
+        var f = await RecoveryContinuationBoundaryTests.SeedSafe();
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var parent = await db.WorkItems.SingleAsync(i => i.ExternalId == "sc-10");
+            var change = new Changeset("owner/alpha", changeset, "main", blocker);
+            db.Add(new LedgerEntry { WorkItemId = parent.Id, State = parent.State, Step = RunPipeline.Steps.Changeset,
+                Detail = change.ToDetail(), Outcome = StepOutcome.Passed });
+            db.Add(new LedgerEntry { WorkItemId = parent.Id, State = parent.State, Step = RunPipeline.Steps.ChangesetPushed,
+                Detail = DarkFactory.Orchestrator.Plans.Changeset.PushedDetail(changeset, blocker, false), Outcome = StepOutcome.Passed });
+            foreach (var row in await db.LedgerEntries.Where(e => e.Step == RecoveryRedirect.Step).ToListAsync())
+                row.Detail = JsonSerializer.Serialize(RecoveryRedirect.Parse(row.Detail)! with { Commit = corrected });
+            await db.SaveChangesAsync();
+        }
+        var material = await f.Evidence.CaptureAsync(f.Trigger, default);
+        await using (var db = f.Contexts.CreateDbContext())
+        {
+            var incident = await db.HotFileIncidents.SingleAsync();
+            incident.Answer = JsonSerializer.Serialize(HotFileAssessment.FromDetail(incident.Answer)! with { Material = material });
+            await db.SaveChangesAsync();
+        }
+        string? conflictPath = null;
+        var worker = new FakeWorker(async call =>
+        {
+            Assert.Null(call.Resume);
+            Assert.Contains("original spec", call.Prompt);
+            Assert.Contains("Retain BOTH parents", call.Prompt);
+            Assert.Contains("README.md", call.Prompt);
+            Assert.Contains(corrected, call.Prompt);
+            var path = conflictPath!;
+            Assert.Contains("<<<<<<<", File.ReadAllText(path));
+            if (resolve) File.WriteAllText(path, "plan blocker behavior AND corrected behavior\n");
+            await call.Callbacks.OnSession!("fresh-conflict", default);
+            return new Worker.WorkerResult("fresh-conflict", 0, false, "success", "done", "");
+        });
+        var real = Workspace();
+        // The path is deterministic under the real workspace, as for every production worktree.
+        conflictPath = Path.Combine(_root, "work", "worktrees", "owner", "alpha", "factory-sc-2", "README.md");
+        await using var recovery = RecoveryContinuationBoundaryTests.Recovery(f);
+        var result = await RecoveryContinuationBoundaryTests.Run(f, recovery, 2, real, worker);
+        Assert.Single(worker.Calls);
+        Assert.Equal(resolve ? WorkState.Review : WorkState.Escalated, result.State);
+        var parents = Git(_root, "--git-dir=" + _remote, "rev-list", "--parents", "-n", "1", "factory/sc-2").Trim().Split(' ');
+        Assert.Equal(3, parents.Length);
+        Assert.Equal(blocker, parents[1]); Assert.Equal(corrected, parents[2]);
+        if (!resolve) Assert.Contains("conflict markers", result.Error);
+    }
+
+    [Fact]
+    public async Task Correction_paths_include_committed_staged_unstaged_untracked_and_both_rename_sides()
+    {
+        var git = Workspace();
+        var ws = await git.PrepareAsync(Repo, "factory/rc-1", default);
+        var pinned = (await git.HeadAsync(ws, default)).Trim();
+        File.WriteAllText(Path.Combine(ws.Path, "committed.txt"), "first");
+        await git.CommitAndPushAsync(Repo, ws, "first", TestGrants.Untainted, default);
+        File.Move(Path.Combine(ws.Path, "README.md"), Path.Combine(ws.Path, "renamed.txt"));
+        File.WriteAllText(Path.Combine(ws.Path, "staged.txt"), "stage");
+        Git(ws.Path, "add", "staged.txt");
+        File.WriteAllText(Path.Combine(ws.Path, "committed.txt"), "modified");
+        File.WriteAllText(Path.Combine(ws.Path, "untracked.txt"), "new");
+        File.WriteAllText(Path.Combine(ws.Path, "line\nbreak.txt"), "new");
+        var paths = await git.CorrectionPathsAsync(ws, pinned, default);
+        Assert.Equal(new[] { "README.md", "committed.txt", "line\nbreak.txt", "renamed.txt", "staged.txt", "untracked.txt" }, paths.Order(StringComparer.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task Correction_authority_is_checked_before_staging_token_mint_and_final_push(int refusal)
+    {
+        var git = Workspace();
+        var ws = await git.PrepareAsync(Repo, "factory/rc-2", default);
+        File.WriteAllText(Path.Combine(ws.Path, "repair.txt"), "repair");
+        _gitCalls.Clear();
+        var tokens = _tokenRequests;
+        var reads = 0;
+        var grant = TestGrants.Untainted.WithValidation(_ => ++reads == refusal
+            ? Task.FromException(new InvalidOperationException("stale incident grant")) : Task.CompletedTask);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => git.CommitAndPushAsync(Repo, ws, "repair", grant, default));
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
+        if (refusal == 1) Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "add");
+        if (refusal <= 2) Assert.Equal(tokens, _tokenRequests);
+        Assert.Equal(refusal, reads);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Correction_base_update_push_rechecks_authority_after_waits(int refusal)
+    {
+        var git = Workspace();
+        var ws = await git.PrepareAsync(Repo, "factory/rc-3", default);
+        _gitCalls.Clear();
+        var reads = 0;
+        Task Check(CancellationToken _) => ++reads == refusal
+            ? Task.FromException(new InvalidOperationException("stale incident grant")) : Task.CompletedTask;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => git.PushAsync(Repo, ws, default, Check, Check));
+        Assert.DoesNotContain(_gitCalls, c => Subcommand(c.Args) == "push");
+        Assert.Equal(refusal, reads);
     }
 
     [Fact]

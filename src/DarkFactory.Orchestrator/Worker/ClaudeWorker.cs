@@ -306,7 +306,8 @@ public static class WorkerStillRunning
 /// </summary>
 public sealed class ClaudeWorker(
     string claudePath, Uri routerBaseUrl, string routerKey, TimeSpan timeout,
-    WorkerSlots? slots = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null) : IWorker
+    WorkerSlots? slots = null, TimeSpan? stopGrace = null, string? pauseFlagDirectory = null, WorkerTools? tools = null,
+    int? maxTurns = null) : IWorker
 {
     /// <summary>
     /// The sandbox this worker runs in now: the slot the calling flow holds (<see cref="WorkerSlots.Current"/>, sc-25989) — a
@@ -500,8 +501,9 @@ public sealed class ClaudeWorker(
     /// (<see cref="WorkerTools.ConfinedToWorkingDirectory"/>), whose one allow rule names it.
     /// </summary>
     public static IReadOnlyList<string> BuildArguments(string prompt, string? resumeSessionId = null, string? settings = null,
-        WorkerTools? tools = null, string? workingDirectory = null, string? mcpConfigPath = null)
+        WorkerTools? tools = null, string? workingDirectory = null, string? mcpConfigPath = null, int? maxTurns = null)
     {
+        if (maxTurns is <= 0) { throw new ArgumentOutOfRangeException(nameof(maxTurns)); }
         tools ??= WorkerTools.Implementer;
         if (mcpConfigPath is not null && tools.McpAllowed.Count == 0)
         {
@@ -529,6 +531,11 @@ public sealed class ClaudeWorker(
         {
             args.Add("--mcp-config");
             args.Add(mcpConfigPath);
+        }
+        if (maxTurns is { } turns)
+        {
+            args.Add("--max-turns");
+            args.Add(turns.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
         args.Add("--allowedTools");
         args.AddRange(tools.AllowedIn(workingDirectory));
@@ -585,7 +592,7 @@ public sealed class ClaudeWorker(
         if (pauseFlagDirectory is null)
         {
             return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, tools: Tools, workingDirectory: workingDirectory,
-                mcpConfigPath: mcpConfigPath),
+                mcpConfigPath: mcpConfigPath, maxTurns: maxTurns),
                 modelClass, callbacks, ct);
         }
         var flag = PauseFlagPath(pauseFlagDirectory, workingDirectory);
@@ -593,7 +600,7 @@ public sealed class ClaudeWorker(
         File.Delete(flag); // left by a crashed run, it would stop this one at its first tool call
         try
         {
-            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory, mcpConfigPath),
+            return await RunProcessAsync(workingDirectory, BuildArguments(prompt, resumeSessionId, BuildPauseSettings(flag), Tools, workingDirectory, mcpConfigPath, maxTurns),
                 modelClass, callbacks, ct);
         }
         finally
