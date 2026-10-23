@@ -22,7 +22,26 @@ globals_ = main.__globals__
 IDENTIFIER = 'TallyTests/TallyTests/testNew'
 FIXTURES = pathlib.Path(__file__).resolve().parent.parent
 PROJECT_FILE = FIXTURES / 'xcode-ios/Tally.xcodeproj/project.pbxproj'
-PROJECT = json.loads(subprocess.check_output(['/usr/bin/plutil', '-convert', 'json', '-o', '-', str(PROJECT_FILE)]))
+def portable_project_fixture():
+    # Replay only ownership facts used by this fixture. Linux CI has no plutil;
+    # on macOS the very same tests also consume the real recorded pbxproj.
+    objects = {'project': {'isa': 'PBXProject', 'mainGroup': 'main', 'targets': []},
+               'main': {'isa': 'PBXGroup', 'sourceTree': '<group>', 'children': []}}
+    for name, kind in [('Tally', 'application'), ('TallyTests', 'bundle.unit-test'),
+                       ('TallyUITests', 'bundle.ui-testing')]:
+        target, group, phase = name + '-target', name + '-group', name + '-sources'
+        objects['project']['targets'].append(target)
+        objects['main']['children'].append(group)
+        objects[target] = {'isa': 'PBXNativeTarget', 'name': name,
+                           'productType': 'com.apple.product-type.' + kind,
+                           'fileSystemSynchronizedGroups': [group], 'buildPhases': [phase]}
+        objects[group] = {'isa': 'PBXFileSystemSynchronizedRootGroup', 'path': name, 'sourceTree': '<group>'}
+        objects[phase] = {'isa': 'PBXSourcesBuildPhase', 'files': []}
+    return {'rootObject': 'project', 'objects': objects}
+
+
+PROJECT = (json.loads(subprocess.check_output(['/usr/bin/plutil', '-convert', 'json', '-o', '-', str(PROJECT_FILE)]))
+           if sys.platform == 'darwin' and not os.environ.get('IOS_FIXTURE_PORTABLE') else portable_project_fixture())
 SOURCE = 'import XCTest\n@testable import Tally\nfinal class TallyTests: XCTestCase {\n    func testNew() {\n        XCTAssertEqual(Counter.start, 0)\n    }\n}\n'
 
 

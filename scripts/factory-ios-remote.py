@@ -300,7 +300,7 @@ def main():
         raise ValueError('invalid request identity')
     if not isinstance(tests, list) or not 1 <= len(tests) <= 20 or len(set(tests)) != len(tests) or not all(re.fullmatch(r'TallyTests/TallyTests/test[A-Za-z0-9_]{1,100}', t) for t in tests):
         raise ValueError('invalid test identifiers')
-    with tempfile.TemporaryDirectory(prefix='factory-ios-', dir='/private/tmp') as directory:
+    with tempfile.TemporaryDirectory(prefix='factory-ios-', dir='/tmp') as directory:
         root = pathlib.Path(directory)
         for side in ('base', 'head'):
             unpack(pathlib.Path('sources') / (side + '.zip'), root / side)
