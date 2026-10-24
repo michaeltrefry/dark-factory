@@ -1732,23 +1732,51 @@ per-user agents, but never its own Aqua login or another slot's.
 (exit 78), readiness fails naming the user, and the factory's workers do not run. The login is the owner's to establish — the
 factory never provisions a credential or logs anyone in by itself.
 
-### Prerequisites (the owner only; each step needs its own decision)
+### First-slot feasibility guide (owner approvals, not actions performed)
 
-1. Review, then separately authorize reinstalling the current helper with `sudo scripts/setup-worker-user.sh --slots 2 --swift`.
-   Stop `factory work` and worker commands first; do not assume logging out a required GUI lifecycle is necessary or safe.
-   Setup installs helper_version 6 and the root rules, then runs toolchain probes that themselves require genuine own-user
-   GUI logins. Without those prerequisites installation may have happened while the probe step still fails; a completed
-   install is not live acceptance or proof that a GUI login exists.
-2. Establish each sandbox user's GUI login **only through separately approved, guided owner actions**. No mechanism is
-   claimed verified here. A password, shell/visibility changes, Fast User Switching, or a console-session limit setting
-   must each be reviewed before making that concrete change; do not put credentials in commands, argv, transcripts or docs.
-   The currently reported accounts (uids 498 and 496, `IsHidden=false`, no password/shell) have UNKNOWN GUI state. macOS's
-   reported maximum of two console sessions and the effect of changing that setting are also unverified: do not assume the
-   owner and both slots can remain logged in simultaneously. `launchctl asuser` adopts an existing bootstrap; it creates no
-   GUI login. The helper's own uid/manager/provenance checks, not a successful `sudo id` or `managername` alone, decide entry.
-3. Nothing else changes: no TCC grant, no `launchctl asuser` config, no launchd edits, no DevToolsSecurity change.
+**Dated evidence, not enduring installation state:** the prior verified facts relayed in the 2026-10-24 operator handoff
+were worker UIDs 498 and 496, `IsHidden=1`, a `false` UserShell, no configured password/authentication authority, and homes
+under `/Volumes/Factory/homes`; the owner and `lwrunner` were reported at the console. A `maxusers` value of 2 was reported,
+but its enforcement and the effect of changing it are unverified. These facts were NOT re-probed by this fixpass. Whether
+these UID-below-500 role accounts are eligible for a genuine GUI login is unknown. Neither a password plus Fast User
+Switching nor an unhide/shell change is claimed sufficient. `launchctl asuser` adopts a bootstrap; it creates no GUI login.
+
+1. **Obtain the USER's confirmation that ALL factory sessions and worker commands are stopped**, across both slots and
+   separate `factory run` processes, before any installation or destructive probe. Do not infer this from a dashboard,
+   stop processes automatically, log out `lwrunner`, or change console-session settings. Each such action needs its own
+   concrete owner approval; preserve a required GUI lifecycle rather than assuming logout is safe.
+2. **Before any v6 install, separately approve and verify root-private rollback backups:** identify both actual installed
+   slot-helper copies and every actual sudoers file authorizing them, then back up BOTH helpers plus those sudoers files
+   into a root-owned 0700 directory closed by ACL to non-root users. Preserve/record the originals' bytes, ownership, modes
+   and ACLs, reject unexpected links/types, and verify the backups. A regenerated rule or a copy of this repository's
+   script is not a backup of the installed state. No backup or installation was performed here.
+3. **First establish feasibility for slot 1 only.** Any account credential, authentication, shell/visibility or
+   loginwindow action is separately approved and performed by the owner; enter secrets interactively, never in argv,
+   transcripts or this document. UID eligibility and console capacity are unresolved gates, not instructions to change
+   them. Do not promise that a password or Fast User Switching will create the required domain.
+4. **Separately approve read-only system metadata verification, not an old helper invocation.** Before any v6 probe,
+   verify slot 1's effective uid/user, its own manager uid and `Aqua`, authoritative `gui/<uid>` type `login` with matching
+   security-context uid/ASID, and the exact system `loginwindow` creator's uid and kernel start identity. No one field
+   alone proves entry; unknown, changed or mismatched metadata stops the plan. No owner-service Mach messages are part
+   of this step. The old helper must not be used as a harmless metadata query: it may sweep the user's whole lifecycle.
+5. **Installation and probes require explicit approvals.** `setup-worker-user.sh --slots 2 --swift` installs both helpers
+   and root rules AND immediately runs toolchain probes for both slots; it is not install-only. Obtain approval for both
+   operations before invoking it, or pause for an owner-reviewed staged procedure. Do not invent an install-only flag.
+   Do not use setup `--slots 1` as a first-slot probe: it removes slot 2's helper/rule. Setup's ACL preflight must pass;
+   any ACL remediation is another explicit approval. A later probe failure may leave installation already changed and
+   is not readiness, acceptance, or permission to start the factory.
+6. **After install, separately approve each first-slot-only probe.** Start with the exact read-only session-status query,
+   then only an explicitly approved command that exercises cleanup; a helper exit can kill that uid's processes. No
+   second-slot probe, environment/configuration override, owner Mach-service probe, or account/session switch is implied.
+   Stop on any refusal, runtime failure or unproven cleanup; do not retry by clearing quarantine. Genuine GUI entry and
+   preservation remain live-unverified until the approved evidence is collected. AC2 needs its own explicit live approval.
+
+No TCC, DevToolsSecurity, launchd, account, installed-helper, sudoers or host configuration change was made by this fixpass.
 
 ### The live probe (AC1/AC3 and the AC2 evidence)
+
+The command below is the two-slot acceptance run, NOT a first-slot feasibility step. It requires completed prerequisites
+and explicit approval for both slots and the owner lookup probe; the guide above grants none of those approvals.
 
 ```sh
 FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 Worker__Swift=true \
@@ -1794,14 +1822,24 @@ reports that slot; a named slot or all slots quarantined refuses explicitly, nev
 item's assigned uid. A held assigned item is not escalated and does not stop intake for independent slots; best-effort
 sweeps leave quarantined leftovers without running a helper, so they cannot take down another slot's phase. Other slots remain usable.
 
-Recovery is an explicit owner decision, not an automatic retry: stop the factory processes using that slot; independently
-verify no worker process of that uid remains (detached/reparented processes included), preserving only independently proven
-login lifecycle processes; establish the user's valid own Aqua login; only then explicitly remove that slot's marker.
-Do not delete it merely because the helper exited. This session made no host recovery/setup changes and ran no live probe.
+Recovery is an explicit owner decision, not an automatic retry. The exact marker paths are
+`<WorkRoot>/.factory-run.lock.cleanup-unproven` for slot 1 and
+`<WorkRoot>/slot-locks/.factory-run-2.lock.cleanup-unproven` for slot 2 (`WorkRoot` is the configured `Factory:WorkRoot`).
+Require the USER's confirmation that the controllers and every outstanding helper/sudo monitor for that slot, including
+root-owned monitors, have finished. With separately approved read-only metadata checks, independently prove no worker of
+that uid remains in either real/effective-uid view, detached/reparented processes included; preserve only the exact proven
+login creator/start identity, never a broad parent/name exemption. Establish the user's valid own Aqua login. Unknown
+processes or unproven identity mean STOP: keep quarantine. Every process termination, account/login change and manual
+marker removal requires its own concrete owner approval, and manual removal happens only AFTER that recovery proof.
+A runtime failure, helper exit, lock acquisition or reinstall alone never authorizes clearing a marker. The normal runtime
+clear is authorized by the root parent's independent successful cleanup proof, not by an error code or a retry. No host
+recovery/setup action or live probe was performed by this fixpass.
 
 ### Rollback
 
-`sudo scripts/setup-worker-user.sh` re-run from the previous commit's script restores the previous helper and sudoers file
-(it overwrites both), and logging the worker users out (Fast User Switching) ends their sessions; the factory never does
-either by itself. A worker user without a GUI login simply makes the factory refuse to run workers (exit 78), which is the
-pre-S3-safe state for the account but not a return of pre-S3 behaviour.
+Rollback is also separately approved, never automatic: keep every factory process stopped, restore BOTH installed helper
+copies and the actual sudoers files from the verified root-private backups with their recorded metadata, and validate the
+matched orchestrator/helper/rules state before restarting anything. Restoring a repository script or regenerating a rule is
+not proof that the previous installed state was restored. Logging an account out, changing a credential or ending a console
+session is another owner decision, not an implicit rollback step. Nothing here was restored or changed on the host. A worker
+without a proven own GUI login remains refused; do not call that readiness or a successful return to pre-S3 behaviour.
