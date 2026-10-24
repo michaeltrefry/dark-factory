@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.WorkSources;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -62,7 +63,8 @@ public sealed class WorktreeWritersException(string path, string user, string wh
 /// <summary>
 /// Runs workers as a dedicated macOS user (E5) through the root-owned launch helper
 /// (<c>scripts/factory-worker-launch</c>), which <c>scripts/setup-worker-user.sh</c> installs — one copy per sandbox user, pinned
-/// to it — and allows the owner to run as <see cref="User"/> via a NOPASSWD sudoers rule.
+/// to it — and allows the owner to run only that fixed trampoline as root via a NOPASSWD sudoers rule.
+/// It adopts the pinned non-GUI user domain, drops to <see cref="User"/>, then checks that identity before the protocol.
 /// Router variables travel on the helper's stdin, never argv; closing stdin stops the worker.
 /// <paramref name="HelperSource"/>: the helper as <c>scripts/factory-worker-launch</c> has it, which the installed one must
 /// match (<see cref="StaleHelperReason"/>); null is the copy compiled into this assembly.
@@ -168,7 +170,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public const string ReinstallCommand = "sudo scripts/setup-worker-user.sh";
 
     /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
-    public const int HelperVersion = 5;
+    public const int HelperVersion = 6;
 
     /// <summary>
     /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
@@ -192,9 +194,9 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         "read,write,append,execute,delete,list,search,add_file,add_subdirectory,delete_child," +
         "readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
 
-    /// <summary><c>sudo -n -u &lt;user&gt; &lt;helper&gt; &lt;program&gt; args…</c>.</summary>
+    /// <summary><c>sudo -n -u root &lt;helper&gt; &lt;program&gt; args…</c>.</summary>
     public IReadOnlyList<string> BuildLaunchArguments(string program, IEnumerable<string> args) =>
-        ["-n", "-u", User, HelperPath, program, .. args];
+        ["-n", "-u", "root", HelperPath, program, .. args];
 
     /// <summary>The one variable whose value may span lines: one header per line (the router key, the model class).</summary>
     public const string MultiLineVariable = "ANTHROPIC_CUSTOM_HEADERS";
@@ -228,7 +230,13 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// <see cref="Lock"/> until the process has exited (the helper's exit is the kill of every <see cref="User"/> process): unless
     /// the calling flow holds it, nothing is started and this throws.
     /// </summary>
-    public Process Start(string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables)
+    public Process Start(string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables) =>
+        StartCore(workingDirectory, program, args, variables, cleanupOnly: false);
+
+    private sealed record Bootstrap(string Nonce) { public bool Ready { get; set; } }
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Process, Bootstrap> Bootstraps = new();
+
+    private Process StartCore(string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables, bool cleanupOnly)
     {
         Lock?.Require($"a run of {program} as {User} through {HelperPath}");
         var psi = new ProcessStartInfo(SudoPath)
@@ -239,7 +247,9 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        foreach (var arg in BuildLaunchArguments(program, args))
+        var nonce = Guid.NewGuid().ToString("N");
+        var protocol = cleanupOnly ? "__factory_cleanup" : "__factory_run";
+        foreach (var arg in BuildLaunchArguments(protocol, cleanupOnly ? [nonce] : [nonce, program, .. args]))
         {
             psi.ArgumentList.Add(arg);
         }
@@ -248,6 +258,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         psi.Environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin";
 
         var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {SudoPath}.");
+        Bootstraps.Add(process, new(nonce));
         try
         {
             // Straight to the pipe, so the writer never holds unsent bytes that would throw again on Close.
@@ -260,6 +271,37 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         }
         return process;
     }
+
+    /// <summary>The helper's nonce-bound first line must precede ALL program output. Never infer infrastructure from an application exit code.</summary>
+    internal async Task VerifyStartedAsync(Process process, CancellationToken ct)
+    {
+        if (!Bootstraps.TryGetValue(process, out var bootstrap)) throw Unavailable("missing launch protocol");
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bounded.CancelAfter(TimeSpan.FromSeconds(10));
+        string? line;
+        try { line = await process.StandardOutput.ReadLineAsync(bounded.Token); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw Unavailable("bootstrap did not acknowledge its identity within 10 seconds"); }
+        if (line != $"factory-bootstrap {bootstrap.Nonce}") throw Unavailable("bootstrap identity was not acknowledged (or the slot is quarantined)");
+        bootstrap.Ready = true;
+    }
+
+    /// <summary>Only root can remove the marker after proving cleanup; a worker's exit/status/output cannot vouch for that proof.</summary>
+    internal void VerifyCompleted(Process process)
+    {
+        if (!Bootstraps.TryGetValue(process, out var bootstrap) || !bootstrap.Ready) throw Unavailable("unconfirmed bootstrap");
+        try
+        {
+            _ = File.GetAttributes(HelperPath + ".quarantine");
+            throw Unavailable("cleanup is unconfirmed; the slot remains quarantined");
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+        catch (IOException ex) { throw Unavailable("quarantine status cannot be read", ex); }
+        catch (UnauthorizedAccessException ex) { throw Unavailable("quarantine status cannot be read", ex); }
+    }
+
+    private FactoryUnavailableException Unavailable(string reason, Exception? inner = null) =>
+        new($"the worker sandbox ({User}, {HelperPath}): {reason}. The item is retained; verify this slot's bootstrap and cleanup before reuse.", inner ?? new InvalidOperationException(reason));
 
     /// <summary>
     /// Kills every process of the worker user (left by a crashed run) by running a no-op through the
@@ -328,7 +370,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 return false;
             }
         }
-        var (exitCode, _, stderr) = await RunAsync("/", "/usr/bin/true", [], ct);
+        var (exitCode, _, stderr) = await LockedAsync(() => RunLockedAsync("/", "/usr/bin/true", [], new Dictionary<string, string>(), ct, cleanupOnly: true), ct);
         if (exitCode != 0)
         {
             throw new InvalidOperationException($"Could not stop the worker user's processes through {HelperPath} ({stderr.Trim()}).");
@@ -358,15 +400,19 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         LockedAsync(() => RunLockedAsync(workingDirectory, program, args, variables, ct), ct);
 
     private async Task<(int ExitCode, string Stdout, string Stderr)> RunLockedAsync(
-        string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables, CancellationToken ct)
+        string workingDirectory, string program, IEnumerable<string> args, IReadOnlyDictionary<string, string> variables, CancellationToken ct, bool cleanupOnly = false)
     {
-        var process = Start(workingDirectory, program, args, variables);
+        var process = StartCore(workingDirectory, program, args, variables, cleanupOnly);
         try
         {
+            await VerifyStartedAsync(process, ct);
             var stdout = process.StandardOutput.ReadToEndAsync(ct);
             var stderr = process.StandardError.ReadToEndAsync(ct);
             await process.WaitForExitAsync(ct);
-            return (process.ExitCode, await stdout, await stderr);
+            var output = await stdout;
+            var error = await stderr;
+            VerifyCompleted(process);
+            return (process.ExitCode, output, error);
         }
         finally
         {
@@ -378,8 +424,8 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
 
     /// <summary>
     /// Why <paramref name="installed"/> (the installed helper's text) is not the current helper set up for
-    /// <paramref name="user"/>, or null. Setup installs <c>scripts/factory-worker-launch</c> with exactly two lines edited,
-    /// <c>sandbox_user=&lt;user&gt;</c> and <c>sandbox_uid=&lt;its uid&gt;</c>; with those two undone, the installed file
+    /// <paramref name="user"/>, or null. Setup installs <c>scripts/factory-worker-launch</c> with the user, uid and installing owner pinned,
+    /// <c>sandbox_user=&lt;user&gt;</c> and <c>sandbox_uid=&lt;its uid&gt;</c>; with those pins undone, the installed file
     /// must have the same SHA-256 as <paramref name="source"/> (null: the compiled-in helper). So a helper installed before
     /// a change (or edited since) is stale, whatever its version line says.
     /// </summary>
@@ -404,6 +450,17 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         if (uids.Count != 1 || !Regex.IsMatch(uids[0].Groups[1].Value, "^[0-9]+$"))
         {
             return "it has no pinned sandbox_uid";
+        }
+        var owners = Regex.Matches(installed, "^sandbox_owner=(.*)$", RegexOptions.Multiline);
+        if (source.Contains("\nsandbox_owner=\n", StringComparison.Ordinal)
+            && (owners.Count != 1 || !Regex.IsMatch(owners[0].Groups[1].Value, "^[a-zA-Z_][a-zA-Z0-9_.-]*$")))
+        {
+            return "it has no pinned sandbox_owner";
+        }
+        if (owners.Count == 1)
+        {
+            installed = installed.Remove(owners[0].Index, owners[0].Length).Insert(owners[0].Index, "sandbox_owner=");
+            uids = Regex.Matches(installed, "^sandbox_uid=(.*)$", RegexOptions.Multiline);
         }
         var unpinned = installed
             .Remove(uids[0].Index, uids[0].Length).Insert(uids[0].Index, "sandbox_uid=");

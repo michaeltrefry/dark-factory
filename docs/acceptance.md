@@ -1716,3 +1716,72 @@ default.
 Bounds: the safe case waits up to 2 h and the defect case 4 h for the incident to end (Resolved or Escalated). Cost: four
 real implementer sessions (five with the correction), their panels, and two to four high-class assessments. They leave merged
 pull requests, `docs/hotfile-e2e.md` and `HotFileCount` on the sandbox, and clones under `<Factory:WorkRoot>/e2e/`.
+
+
+## Revised S3: headless sandbox workers (sc-26789, epic sc-26198)
+
+This replaces the closed, unmerged own-Aqua proposal in PR #149. No new GUI users, GUI logins,
+loginwindow exceptions, password changes or launchd service installation are part of S3.
+The historical Phase 5 local-simulator instructions above do not authorize running workers in the
+owner's GUI session: production iOS checks use S2's sealed remote executor. S4 owns GUI test routing
+through the existing serialized lwrunner; GPU placement remains out of scope.
+
+### Bootstrap and installation contract
+
+The v6 helper is installed at its fixed root-owned path, pinned to one worker user/uid and the installing
+owner. Setup verifies every ancestor and the helper's ownership, 0755 mode, lack of links, and strict
+read-only non-root ACL rights before installing a sudoers rule. That rule allows only the exact pinned
+helper as root. Root reads neither the router protocol nor arbitrary program/environment input; it
+uses fixed system launchctl and sudo paths to adopt `user/<uid>` and drop uid before re-entering the
+trusted helper. The unprivileged half requires the pinned effective identity, own `manageruid`,
+`managername = Background`, and a strictly parsed own `type = user` security context. An existing
+`gui/<uid>` is refused before adoption and again before the worker starts: `asuser` alone is not proof
+of a non-GUI bootstrap. Unknown launchctl formats fail closed; terminal S6 must establish the real
+host's supported format rather than weakening those checks to pass a live probe.
+
+**Owner installation is required after delivery**, with factory work and every sandbox session stopped:
+`sudo scripts/setup-worker-user.sh [--slots n] [--swift]`. This code change does not itself run setup,
+change the installed v5 helpers or their backups, or authorize account/system configuration changes.
+Readiness's remote-iOS mode still requires Swift, Xcode, accepted license/first launch, macOS SDK and the
+current wrapper when Worker:Swift is enabled, but does not require local Aqua, iOS Simulator SDK or
+CoreSimulator. Explicit local simulator probes still refuse missing local prerequisites; no new CLI
+setting selects a local production simulator.
+
+### Cleanup and quarantine
+
+The existing helper tree/group/whole-uid sweep is retained, with no GUI lifecycle exemption. Root then
+checks a successful complete process-table read for both real and effective worker uids. Unknown rows,
+read failures, or any live process of that uid refuse reuse. A private exclusive `<helper>.quarantine`
+marker in the root-owned helper directory is created **before** adoption and removed only after cleanup
+and domain proof succeed. A crash or uncertainty therefore survives orchestrator restarts. Each helper
+has its own marker: another slot is not quarantined. Setup does not clear markers. The authenticated emergency-stop route is cleanup-only: it can bypass an
+existing marker only to drop to the pinned UID, run the fixed no-op and perform the same UID sweep.
+It accepts no caller-selected program or environment, and clears quarantine only after independent
+process-table and domain proof. This preserves StopAsync's second-helper fallback when the first
+helper is wedged, without reopening ordinary work in that slot. Recovery otherwise requires the
+owner to verify that slot's processes are gone and its own non-GUI domain is correct before manually
+removing its exact marker as root; never clear one just to retry. No test or implementation session may
+perform that operation without separate approval.
+
+### Evidence boundary
+
+`WorkerHeadlessTests` executes only SafeHelper copies with fake executable identity, launchctl,
+privilege-drop, ownership/ACL and process-table answers. It covers inherited/other-user/Aqua refusal,
+strict domain provenance, authorized root argv and unread stdin, path/ACL refusals, detached-process
+cleanup proof and durable per-helper quarantine. Existing OwnProcess/SafeHelper lifecycle tests retain
+real test-owned detached-process and cross-slot sweep checks. Swift readiness and setup are tested with
+fake tools. These tests are **not** live bootstrap evidence. Each orchestrator launch uses a nonce-bound first stdout
+line produced by the helper after its identity check and before program execution; it is consumed
+before worker/test output is parsed. After helper exit the owner checks the root-protected quarantine
+marker. Missing bootstrap proof or unconfirmed cleanup throws FactoryUnavailableException from worker
+sessions, sandbox commands and gate execution/cleanup, leaving work resumable rather than escalating
+an item or judging a new-tests result. Neither exit 78 nor a program's imitated helper stderr alone is
+infrastructure evidence: a program that exits 78 after proven bootstrap and cleanup is still an
+ordinary application failure. Emergency-stop, infrastructure propagation and pipeline preservation
+regressions have actual assertion-failing mutations, then restored green runs.
+
+Terminal S6 requires separately authorized real proof from a headless source: own non-GUI bootstrap,
+file/credential identity, no owner/lwrunner GUI service access, detached-worker removal and other-slot
+survival, plus local non-host macOS build/test behavior. This session performs no real sudo/helper run,
+launchd adoption, account/password/shell change, native Mach message, GUI service lookup or simulator
+probe. A skipped or unperformed live proof is not passed acceptance.

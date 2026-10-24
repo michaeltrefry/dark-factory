@@ -701,6 +701,7 @@ public sealed class ClaudeWorker(
             {
                 await onStarted(process.Id, ct);
             }
+            if (Sandbox is not null) await Sandbox.VerifyStartedAsync(process, timeoutCts.Token);
             var (onSession, onLine, onModel, onUntrusted) = (callbacks?.OnSession, callbacks?.OnLine, callbacks?.OnModel, callbacks?.OnUntrusted);
             string? reported = null;
             var modelsReported = 0;
@@ -762,6 +763,7 @@ public sealed class ClaudeWorker(
         if (Sandbox is not null)
         {
             WorkerSandbox.Stop(process);
+            Sandbox.VerifyCompleted(process);
         }
 
         return new WorkerResult(

@@ -107,7 +107,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 var (exit, output, timedOut, _) = await RunStepAsync(worktree, step, CleanupTimeout, CancellationToken.None);
                 log.AppendLine($"$ {Describe(step)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
             }
-            catch (Exception e) when (e is not OutOfMemoryException && !WorkerStillRunning.IsMarked(e))
+            catch (Exception e) when (e is not OutOfMemoryException and not FactoryUnavailableException && !WorkerStillRunning.IsMarked(e))
             {
                 log.AppendLine($"$ {Describe(step)} → could not be run: {e.Message}");
             }
@@ -285,13 +285,22 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         var stopped = false;
         try
         {
+            if (Sandbox is not null) await Sandbox.VerifyStartedAsync(started, ct);
             var result = await RunStartedAsync(started, step, remaining, worktree, ct);
+            if (Sandbox is not null) Sandbox.VerifyCompleted(started);
             stopped = true;
             return result;
         }
         catch (OperationCanceledException ex) when (!WorkerStillRunning.IsMarked(ex))
         {
-            stopped = true;
+            stopped = Sandbox is null || await StopAsync(started);
+            if (!stopped) WorkerStillRunning.Mark(ex);
+            throw;
+        }
+        catch (Exception ex) when (Sandbox is not null && !WorkerStillRunning.IsMarked(ex))
+        {
+            stopped = await StopAsync(started);
+            if (!stopped) WorkerStillRunning.Mark(ex);
             throw;
         }
         finally

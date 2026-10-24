@@ -26,8 +26,16 @@ internal sealed record FakeIdentity(string User, string Uid, IReadOnlyDictionary
     public static string SlotUid(int slot) => (449 + slot).ToString();
 }
 
+internal sealed record FakeBootstrap(string ManagerUid = "450", string ManagerName = "Background", bool GuiExists = false,
+    string Domain = "user/450 = {\n type = user\n security context = {\n uid = 450\n }\n}",
+    bool Root = false, string Owner = "df-test-owner", string OwnerUid = "501", string? UnsafePath = null,
+    string Metadata = "0:755", string Rights = "write", string Processes = "1 0 0 S", bool ProcessFailure = false,
+    string InstalledPath = SafeHelper.RootHelperPath, string? SymlinkPath = null, bool RunWorker = false);
+
 internal sealed record SafeHelperOptions
 {
+    public FakeBootstrap? Bootstrap { get; init; }
+
     /// <summary>null: the real <c>id</c>, <c>sandbox_user</c> stays <c>_factory</c> (we are not) and <c>sandbox_uid</c> unpinned, so the uid sweep never runs.</summary>
     public FakeIdentity? Identity { get; init; }
 
@@ -73,6 +81,8 @@ internal sealed record SafeHelperOptions
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 internal sealed class SafeHelper
 {
+    public const string RootHelperDirectory = "/usr/local/libexec/dark-factory";
+    public const string RootHelperPath = RootHelperDirectory + "/factory-worker-launch";
     /// <summary>The production signal primitive and process listing: both must be present once, and both are replaced.</summary>
     public const string SignalPrimitive = """
         send_signal() {
@@ -307,19 +317,48 @@ internal sealed class SafeHelper
             {{SeamEnd}}
             """;
         var copy = source.Replace(SignalPrimitive, seam).Replace(ListPrimitive, listing);
+        // Replace every native bootstrap / privileged action before safety validation. No live launchd or sudo in a test.
+        var boot = options.Bootstrap;
+        var directory = System.IO.Path.GetDirectoryName(targets)!;
+        var metadata = SandboxSupport.Executable(directory, $"bootstrap-metadata-{Guid.NewGuid():N}",
+            "#!/bin/sh\ncase \"$1\" in\n"
+            + $"manageruid) echo '{boot?.ManagerUid ?? "450"}' ;;\nmanagername) echo '{boot?.ManagerName ?? "Background"}' ;;\n"
+            + $"print) case \"$2\" in gui/*) exit {(boot?.GuiExists == true ? 0 : 1)} ;; esac; cat <<'DOMAIN'\n{boot?.Domain ?? ""}\nDOMAIN\n;;\n"
+            + "asuser) shift 2; exec \"$@\" ;;\n*) exit 91 ;;\nesac\n");
+        var drop = SandboxSupport.Executable(directory, $"identity-drop-{Guid.NewGuid():N}",
+            boot?.RunWorker == true
+            ? "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] && [ \"$3\" = _dftest ] && [ \"$4\" = -- ] || exit 92\nshift 4\nexport SAFE_HELPER_DROPPED=1\nexec \"$@\"\n"
+            :             "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] && [ \"$3\" = _dftest ] && [ \"$4\" = -- ] || exit 92\nshift 5\nprintf 'dropped-to=_dftest path=%s\\n' \"$PATH\"\nprintf 'arg=<%s>\\n' \"$@\"\nIFS= read -r line; printf 'protocol=<%s>\\n' \"$line\"\nexit 77\n");
+        var stat = SandboxSupport.Executable(directory, $"trust-metadata-{Guid.NewGuid():N}",
+            $"#!/bin/sh\n[ \"$3\" = '{boot?.UnsafePath}' ] && echo '{boot?.Metadata ?? "0:755"}' || echo '0:755'\n");
+        var acl = SandboxSupport.Executable(directory, $"acl-metadata-{Guid.NewGuid():N}",
+            $"#!/bin/sh\necho 'drwxr-xr-x+ 2 root wheel 64 Jan 1 00:00 path'\nif [ \"$2\" = '{boot?.UnsafePath}' ]; then echo ' 0: user:outsider allow {boot?.Rights ?? "read"}'; fi\n");
+        var processes = SandboxSupport.Executable(directory, $"cleanup-metadata-{Guid.NewGuid():N}",
+            $"#!/bin/sh\nprintf '%s\\n' '{boot?.Processes}'\nexit {(boot?.ProcessFailure == true ? 1 : 0)}\n");
+        copy = copy.Replace("/bin/launchctl", metadata).Replace("/usr/bin/sudo", drop)
+            .Replace("/usr/bin/stat", stat).Replace("/bin/ls -lde", acl + " -lde")
+            .Replace("/bin/ps -axo pid=,uid=,ruid=,stat=", processes)
+            .Replace("$(uname -s)", boot is null ? "Linux" : "Darwin")
+            .Replace("case \"$0\" in", $"case \"{boot?.InstalledPath ?? RootHelperPath}\" in")
+            .Replace("dark-factory \"$0\"; do", "dark-factory /usr/local/libexec/dark-factory/factory-worker-launch; do");
+        if (boot?.SymlinkPath is { } link)
+        {
+            copy = copy.Replace("[ ! -L \"$trusted\" ]", $"[ \"$trusted\" != '{link}' ] && [ ! -L \"$trusted\" ]");
+        }
         if (options.Identity is { } identity)
         {
             Assert.Matches("^[0-9]*$", identity.PinnedUid);
             var cases = string.Concat(identity.UidsByName.Select(kv => $"        '-u {kv.Key}') echo '{kv.Value}' ;;\n"));
             var fakeId = "id() {\n    case \"$*\" in\n"
-                + $"        -u) echo '{identity.Uid}' ;;\n"
+                + $"        -u) if [ \"${{SAFE_HELPER_DROPPED:-}}\" = 1 ]; then echo 450; else echo '{identity.Uid}'; fi ;;\n"
                 + $"        -un) echo '{identity.User}' ;;\n"
                 + cases
                 + "        *) echo \"id: $*: no such user\" >&2; return 1 ;;\n    esac\n}\n";
             copy = copy
                 .Replace("\nset -eu\n", "\nset -eu\n" + fakeId)
                 .Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={identity.User}\n")
-                .Replace("\nsandbox_uid=\n", $"\nsandbox_uid={identity.PinnedUid}\n");
+                .Replace("\nsandbox_uid=\n", $"\nsandbox_uid={identity.PinnedUid}\n")
+                .Replace("\nsandbox_owner=\n", "\nsandbox_owner=df-test-owner\n");
         }
         if (options.Mutate is { } mutate)
         {
