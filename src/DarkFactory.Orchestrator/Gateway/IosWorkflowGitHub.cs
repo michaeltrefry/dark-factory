@@ -11,8 +11,9 @@ namespace DarkFactory.Orchestrator.Gateway;
 /// Real REST transport for the remote iOS check. The supplied client is OutboundHttp.GitHubApi(); gate installation tokens
 /// stay here, never in dispatch inputs, archives or runner environments. No client of the owner's gh login is used.
 /// </summary>
-public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIosWorkflowGitHub
+public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp, bool gui = false) : IIosWorkflowGitHub
 {
+    private string WorkflowPath => gui ? RemoteGuiWorkflow.Path : RemoteIosWorkflow.Path;
     public static readonly IReadOnlyDictionary<string, string> ReadPermissions = new Dictionary<string, string>
         { ["contents"] = "read", ["actions"] = "read" };
     public static readonly IReadOnlyDictionary<string, string> DispatchPermissions = new Dictionary<string, string>
@@ -30,7 +31,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
         using var commit = await JsonAsync($"{Root(repo)}/commits/{Uri.EscapeDataString(branch)}", token, ct);
         var sha = commit.RootElement.GetProperty("sha").GetString()!;
         if (!RemoteIosWorkflow.Sha(sha)) throw new InvalidDataException("No immutable default commit.");
-        using var request = GitHubApp.Request(HttpMethod.Get, $"{Root(repo)}/contents/{RemoteIosWorkflow.Path}?ref={sha}", "Bearer", token);
+        using var request = GitHubApp.Request(HttpMethod.Get, $"{Root(repo)}/contents/{WorkflowPath}?ref={sha}", "Bearer", token);
         request.Headers.Accept.Clear();
         request.Headers.Accept.ParseAdd("application/vnd.github.raw+json");
         using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
@@ -46,9 +47,10 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
         var phase = "validation";
         try
         {
-            if (!RemoteIosWorkflow.Trusted(workflow)) throw new InvalidDataException("Unsealed dispatch.");
+            if (!(gui ? RemoteGuiWorkflow.Trusted(workflow) : RemoteIosWorkflow.Trusted(workflow))) throw new InvalidDataException("Unsealed dispatch.");
             var inputs = new Dictionary<string, string> { ["nonce"] = correlation, ["base"] = input.Base,
                 ["head"] = input.Head, ["tests"] = JsonSerializer.Serialize(input.Tests) };
+            if (gui) inputs["source_repository"] = input.SourceRepository ?? throw new InvalidDataException("Missing trusted source repository.");
             if (input.Execution is { } execution)
             {
                 if (Encoding.UTF8.GetByteCount(execution) > RemoteIosNewTests.MaxExecutionBytes) throw new InvalidDataException("Oversized execution descriptor.");
@@ -81,7 +83,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
                 if (Encoding.UTF8.GetByteCount(payload) > 65535) throw new InvalidDataException("Oversized workflow dispatch inputs.");
             }
             using var request = GitHubApp.Request(HttpMethod.Post,
-                $"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(RemoteIosWorkflow.Path)}/dispatches", "Bearer", token.Token);
+                $"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(WorkflowPath)}/dispatches", "Bearer", token.Token);
             request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
             ct.ThrowIfCancellationRequested();
             mayHaveSent = true; // From this exact boundary onward, a lost answer never proves an unsent dispatch.
@@ -102,7 +104,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
 
     public async Task CancelAsync(RepoRef repo, IosWorkflowRun run, CancellationToken ct)
     {
-        if (run.Id <= 0 || run.Event != "workflow_dispatch" || run.Path != RemoteIosWorkflow.Path || run.Attempt != 1
+        if (run.Id <= 0 || run.Event != "workflow_dispatch" || run.Path != WorkflowPath || run.Attempt != 1
             || !RemoteIosWorkflow.Sha(run.HeadSha) || !System.Text.RegularExpressions.Regex.IsMatch(run.Title, "^factory-ios-[0-9a-f]{32}$"))
             throw new InvalidDataException("Uncorrelated iOS cancellation.");
         var token = await gateApp.CreateInstallationTokenAsync(repo, ct, DispatchPermissions);
@@ -114,7 +116,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
 
     public async Task<IReadOnlyList<IosWorkflowRun>> RunsAsync(RepoRef repo, CancellationToken ct)
     {
-        using var json = await JsonAsync($"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(RemoteIosWorkflow.Path)}/runs?event=workflow_dispatch&per_page=100",
+        using var json = await JsonAsync($"{Root(repo)}/actions/workflows/{System.IO.Path.GetFileName(WorkflowPath)}/runs?event=workflow_dispatch&per_page=100",
             await ReadToken(repo, ct), ct);
         // Bounded to one page; a very busy repo can miss the correlation, which is error, never an unrelated success.
         return json.RootElement.GetProperty("workflow_runs").Deserialize<IosWorkflowRun[]>() ?? throw new InvalidDataException("No workflow runs.");
@@ -137,7 +139,7 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp) : IIos
                 : throw new InvalidDataException("Unexpected single-side artifact.");
             using var single = await SideResult(side);
             var result = single.RootElement;
-            RemoteIosNewTests.EnvironmentOf(result);
+            RemoteIosNewTests.EnvironmentOf(result, gui);
             if (!result.TryGetProperty("execution", out var execution) || execution.ValueKind != JsonValueKind.Object || execution.GetProperty("status").GetString() == "unused")
                 throw new InvalidDataException("Missing executed side evidence.");
             return result.GetRawText();

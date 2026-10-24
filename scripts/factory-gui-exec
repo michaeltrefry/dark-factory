@@ -1,0 +1,321 @@
+#!/usr/bin/python3 -I
+"""Root-installed boundary for dedicated TRUSTED CI, never a malicious-code sandbox.
+No setup is performed. Only the configured collector may call this fixed helper;
+repository commands are always demoted to the existing lwrunner account first.
+"""
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+CONFIG = pathlib.Path('/etc/dark-factory/gui-executor.json')
+
+
+def protected(path, owner, directory=False):
+    node = path.lstat()
+    if node.st_uid != owner or node.st_mode & 0o077 or not (stat.S_ISDIR(node.st_mode) if directory else stat.S_ISREG(node.st_mode)):
+        raise ValueError('protected collector path has unsafe ownership or mode')
+    # POSIX modes alone do not close an inherited macOS ACL.
+    listing = subprocess.run(['/bin/ls', '-led', str(path)], capture_output=True, check=True, timeout=5).stdout.decode()
+    if any(' deny ' not in line for line in listing.splitlines()[1:]):
+        raise ValueError('protected collector path has an ACL')
+
+
+def configuration(cleanup=False):
+    protected(CONFIG, 0)
+    raw = CONFIG.read_bytes()
+    if len(raw) > 8192:
+        raise ValueError('oversized GUI configuration')
+    config = json.loads(raw)
+    keys = {'collectorUid', 'sourceUid', 'sourceUser', 'runnerRoot', 'developer', 'xcode', 'build', 'runtime', 'deviceType', 'trustedRepositories', 'stateDirectory', 'retiredRunnerRoots', 'collectorRepository', 'runnerName'}
+    if set(config) != keys or config['sourceUser'] != 'lwrunner':
+        raise ValueError('invalid GUI configuration schema')
+    collector, source = config['collectorUid'], config['sourceUid']
+    if type(collector) is not int or type(source) is not int or min(collector, source) < 500 or collector == source:
+        raise ValueError('collector and lwrunner must be distinct non-root users')
+    if os.geteuid() != 0 or os.environ.get('SUDO_UID') != str(collector) or pwd.getpwnam('lwrunner').pw_uid != source:
+        raise ValueError('GUI helper caller or source identity refused')
+    home = pathlib.Path(pwd.getpwuid(collector).pw_dir)
+    protected(home, collector, True)
+    runner = pathlib.Path(config['runnerRoot'])
+    if not runner.is_relative_to(home) or runner.resolve() != runner:
+        raise ValueError('runner credentials must be in the private collector home')
+    protected(runner, collector, True)
+    for filename in ('.runner', '.credentials', '.credentials_rsaparams'):
+        protected(runner / filename, collector)
+    if (runner / '.runner').stat().st_size > 8192:
+        raise ValueError('oversized collector registration')
+    registration = json.loads((runner / '.runner').read_text())
+    if (registration.get('agentName') != config['runnerName'] or config['runnerName'] != 'lensworks-guest'
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', config['collectorRepository'])
+            or str(registration.get('gitHubUrl', '')).rstrip('/').lower() != ('https://github.com/' + config['collectorRepository']).lower()):
+        raise ValueError('collector registration does not match the configured central runner')
+    state = pathlib.Path(config['stateDirectory'])
+    if not state.is_relative_to(home) or state.resolve() != state:
+        raise ValueError('GUI lease must be inside the private collector home')
+    protected(state, collector, True)
+    for value in ('xcode', 'build', 'runtime', 'deviceType'):
+        if not isinstance(config[value], str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,150}', config[value]):
+            raise ValueError('invalid pinned GUI environment')
+    developer = pathlib.Path(config['developer'])
+    if not developer.is_absolute() or developer.resolve() != developer or developer.stat().st_uid != 0:
+        raise ValueError('Xcode must be a root-owned installation')
+    repos = config['trustedRepositories']
+    if not isinstance(repos, list) or not repos or len(repos) > 100 or any(not isinstance(r, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', r) for r in repos):
+        raise ValueError('invalid trusted repository allowlist')
+    # The old runner service MUST have been relocated before this boundary is usable.
+    source_home = pathlib.Path(pwd.getpwuid(source).pw_dir)
+    for relative in ('.credentials', '.credentials_rsaparams', '.config/gh/hosts.yml', '.ssh/id_rsa', '.ssh/id_ed25519'):
+        if not cleanup and ((source_home / relative).exists() or (source_home / relative).is_symlink()):
+            raise ValueError('execution account still holds private authentication files')
+    retired = config['retiredRunnerRoots']
+    if not isinstance(retired, list) or not retired or len(retired) > 16:
+        raise ValueError('former source runner locations must be inventoried')
+    for directory in retired:
+        directory = pathlib.Path(directory)
+        if not directory.is_absolute() or not directory.is_relative_to(source_home) or directory.resolve() != directory:
+            raise ValueError('invalid former source runner location')
+        for name in ('.credentials', '.credentials_rsaparams', '.runner', '.service'):
+            if not cleanup and ((directory / name).exists() or (directory / name).is_symlink()):
+                raise ValueError('execution account still holds a runner registration or credential')
+    groups = subprocess.run(['/usr/bin/id', '-Gn', 'lwrunner'], capture_output=True, check=True, timeout=5).stdout.decode().split()
+    if not cleanup and ('admin' in groups or 'wheel' in groups):
+        raise ValueError('execution account has administrative membership')
+    sudo = subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', 'lwrunner'], capture_output=True, timeout=5)
+    if not cleanup and sudo.returncode == 0:
+        raise ValueError('execution account has sudo authority')
+    config['hash'] = hashlib.sha256(raw).hexdigest()
+    return config
+
+
+def workspace(text, collector, allow_missing=False):
+    root = pathlib.Path(text)
+    if root.parent.resolve() != pathlib.Path('/private/tmp') or not re.fullmatch(r'factory-ios-[A-Za-z0-9_-]+', root.name):
+        raise ValueError('GUI workspace path refused')
+    try:
+        node = root.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return root
+        raise
+    if not stat.S_ISDIR(node.st_mode) or node.st_uid != collector or node.st_mode & 0o022:
+        raise ValueError('GUI workspace ownership refused')
+    return root
+
+
+def require_lease(config, root):
+    state = pathlib.Path(config['stateDirectory'])
+    lock = state / 'machine.lock'
+    protected(lock, config['collectorUid'])
+    with open(lock, 'r+b') as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise ValueError('source operations require the shared machine lease')
+    marker = state / 'active.json'
+    protected(marker, config['collectorUid'])
+    if marker.stat().st_size > 1024:
+        raise ValueError('invalid GUI lease journal')
+    value = json.loads(marker.read_text())
+    if value.get('root') is None or pathlib.Path(value['root']).resolve() != root.resolve():
+        raise ValueError('GUI operation does not own the active workspace')
+
+
+def source_tool(config, root, args):
+    home = root / 'home' if (root / 'home').is_dir() else pathlib.Path(pwd.getpwuid(config['sourceUid']).pw_dir)
+    return subprocess.run(['/bin/launchctl', 'asuser', str(config['sourceUid']), '/usr/bin/sudo', '-n', '-u', 'lwrunner',
+        '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'HOME=' + str(home), 'DEVELOPER_DIR=' + config['developer'],
+        *args], capture_output=True, timeout=10)
+
+
+def process_groups():
+    output = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid=,lstart='], capture_output=True, check=True, timeout=5).stdout.decode()
+    rows = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 7 or not fields[0].isdigit() or not fields[1].isdigit():
+            raise ValueError('unreadable privileged command inventory')
+        rows.append((int(fields[0]), int(fields[1]), ' '.join(fields[2:])))
+    return rows
+
+
+@contextlib.contextmanager
+def register_command(root):
+    group = os.getpgrp()
+    leaders = [start for pid, pgid, start in process_groups() if pid == group and pgid == group]
+    if group <= 1 or len(leaders) != 1:
+        raise ValueError('GUI command has no private process group')
+    record = root / ('gui-command-' + str(os.getpid()) + '.json')
+    fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as output:
+            json.dump({'group': group, 'start': leaders[0]}, output)
+            output.flush(); os.fsync(output.fileno())
+        yield
+    finally:
+        record.unlink(missing_ok=True)
+
+
+def stop_commands(root):
+    if not root.exists():
+        return
+    for record in root.glob('gui-command-*.json'):
+        protected(record, 0)
+        if record.stat().st_size > 1024:
+            raise ValueError('invalid GUI command record')
+        value = json.loads(record.read_text())
+        if set(value) != {'group', 'start'} or type(value['group']) is not int or value['group'] <= 1:
+            raise ValueError('invalid GUI command identity')
+        if value['group'] == os.getpgrp():
+            continue  # this cleanup operation's own registered group remains held through return
+        rows = [row for row in process_groups() if row[1] == value['group']]
+        if rows:
+            if not any(pid == value['group'] and start == value['start'] for pid, _, start in rows):
+                raise ValueError('GUI command group identity cannot be proven')
+            os.killpg(value['group'], signal.SIGKILL)
+            for _ in range(20):
+                if not any(pgid == value['group'] for _, pgid, _ in process_groups()):
+                    break
+                time.sleep(0.1)
+            else:
+                raise ValueError('GUI command group did not end')
+        record.unlink(missing_ok=True)
+
+
+def sweep(uid):
+    # Dedicated trusted-CI cleanup, NOT a claim to clear dormant launchd state.
+    # Apple GUI agents may respawn; only root-owned OS binaries under /System
+    # or the three observed per-user agents may remain. Source build products may not.
+    for _ in range(20):
+        subprocess.run(['/usr/bin/pkill', '-KILL', '-u', str(uid)], capture_output=True, timeout=2)
+        rows = subprocess.run(['/bin/ps', '-U', str(uid), '-o', 'pid=,ppid=,comm='], capture_output=True, check=True, timeout=2).stdout.decode().splitlines()
+        remaining = []
+        for row in rows:
+            fields = row.strip().split(None, 2)
+            if len(fields) != 3:
+                raise ValueError('unreadable GUI process inventory')
+            executable = pathlib.Path(fields[2])
+            system = str(executable).startswith('/System/Library/') or str(executable) in ('/usr/sbin/distnoted', '/usr/libexec/lsd', '/usr/sbin/cfprefsd')
+            try:
+                safe = fields[1] == '1' and system and executable.stat().st_uid == 0 and not executable.stat().st_mode & 0o022
+            except OSError:
+                safe = False
+            if not safe:
+                remaining.append(fields[0])
+        if not remaining:
+            return
+        time.sleep(0.1)
+    raise ValueError('GUI cleanup could not stop source processes')
+
+
+def main():
+    operation = sys.argv[1]
+    config = configuration(cleanup=operation in ('check', 'sweep', 'remove', 'device-delete'))
+    if operation == 'check' and len(sys.argv) == 2:
+        print(json.dumps(config))
+        return
+    if len(sys.argv) < 3:
+        raise ValueError('missing GUI workspace')
+    root = workspace(sys.argv[2], config['collectorUid'], allow_missing=operation in ('remove', 'device-delete'))
+    require_lease(config, root)
+    if operation == 'run' or not root.exists():
+        return execute_operation(config, operation, root)
+    with register_command(root):
+        return execute_operation(config, operation, root)
+
+
+def execute_operation(config, operation, root):
+    if operation == 'sweep' and len(sys.argv) == 3:
+        stop_commands(root)
+        sweep(config['sourceUid'])
+    elif operation == 'remove' and len(sys.argv) == 3:
+        stop_commands(root)
+        sweep(config['sourceUid'])
+        subprocess.run(['/bin/rm', '-rf', '--', str(root)], check=True, timeout=30)
+        if root.exists() or root.is_symlink():
+            raise ValueError('GUI workspace removal failed')
+    elif operation == 'device-delete' and len(sys.argv) == 4:
+        if not re.fullmatch('[0-9A-Fa-f-]{36}', sys.argv[3]):
+            raise ValueError('invalid GUI device')
+        stop_commands(root)
+        sweep(config['sourceUid'])
+        inventory = source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'list', 'devices', '-j'])
+        if inventory.returncode or len(inventory.stdout) > 8 * 1024 * 1024:
+            raise ValueError('GUI device inventory could not be read')
+        devices = json.loads(inventory.stdout)['devices']
+        present = any(device.get('udid') == sys.argv[3] for group in devices.values() for device in group)
+        if present:
+            source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'shutdown', sys.argv[3]])
+            deleted = source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'delete', sys.argv[3]])
+            if deleted.returncode:
+                raise ValueError('GUI device cleanup failed')
+    elif operation == 'share' and len(sys.argv) == 4:
+        target = pathlib.Path(sys.argv[3])
+        if target.resolve() != target or not target.is_relative_to(root) or target == root:
+            raise ValueError('GUI share path refused')
+        subprocess.run(['/usr/sbin/chown', '-R', str(config['sourceUid']), str(target)], check=True, timeout=30)
+    elif operation == 'run' and len(sys.argv) == 4:
+        request = pathlib.Path(sys.argv[3])
+        if request.parent != root or not re.fullmatch(r'command-[a-f0-9]{32}.json', request.name):
+            raise ValueError('GUI command file refused')
+        protected(request, config['collectorUid'])
+        if request.stat().st_size > 131072:
+            raise ValueError('oversized GUI command')
+        payload = json.loads(request.read_text())
+        if set(payload) != {'argv', 'cwd', 'environment'} or not isinstance(payload['argv'], list) or not payload['argv']:
+            raise ValueError('invalid GUI command')
+        cwd = pathlib.Path(payload['cwd'])
+        if not cwd.resolve().is_relative_to(root.resolve()):
+            raise ValueError('GUI working directory refused')
+        env = payload['environment']
+        if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) or '\0' in k + v for k, v in env.items()):
+            raise ValueError('invalid GUI environment')
+        # No collector environment, argv credential or command/publication file
+        # reaches the source. Commands may execute trusted repository code only
+        # after sudo has selected the fixed existing lwrunner identity.
+        binding = root / ('binding-' + request.name)
+        fd = os.open(binding, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            with os.fdopen(fd, 'w') as output:
+                os.fchmod(output.fileno(), 0o644)
+                json.dump({'sourceUid': config['sourceUid'], 'collectorUid': config['collectorUid'], 'configurationHash': config['hash']}, output)
+            env = dict(env, FACTORY_GUI_TEST_BINDING=str(binding), FACTORY_GUI_CONFIGURATION_HASH=config['hash'])
+            with register_command(root):
+                signal.alarm(0)  # source deadline belongs to the sealed collector; its group is now journaled
+                result = subprocess.run(['/bin/launchctl', 'asuser', str(config['sourceUid']),
+                    '/usr/bin/sudo', '-n', '-u', 'lwrunner', '/usr/bin/env', '-i',
+                    *[k + '=' + v for k, v in env.items()], *payload['argv']], cwd=cwd,
+                    env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'})
+                return result.returncode
+        finally:
+            binding.unlink(missing_ok=True)
+
+    else:
+        raise ValueError('unknown GUI operation')
+
+
+def deadline_expired(signum, frame):
+    raise TimeoutError('protected GUI operation deadline')
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.alarm(30)  # privileged setup/cleanup never outlives the collector's 40-second window
+    try:
+        sys.exit(main() or 0)
+    except Exception:
+        # Root/configuration errors never disclose private paths, command text,
+        # environment values, credentials or repository output into evidence.
+        print('factory-gui-exec: protected GUI operation refused', file=sys.stderr)
+        sys.exit(70)

@@ -38,7 +38,7 @@ public sealed class RemoteIosSlotTests
                 controls: h.Controls, slots: TestSlots.Of(workerLock), swift: true,
                 gate: new GateStage(h.GitHub, h.Reviewer, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5), null,
                     h.TestRunner, null, FakeCodeGraphRisk.Reader(h.CodeGraph), null,
-                    new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero }));
+                    null, new RemoteIosNewTests(dispatch, gui: GuiRemoteGateTests.Settings) { PollInterval = TimeSpan.Zero }));
             var outcome = await pipeline.RunAsync(77, CancellationToken.None);
             var rows = await h.Rows();
             // Mutations: slot-hosted-enclosing-phase (ios), slot-local-phase-bypass (macOS).
@@ -52,7 +52,7 @@ public sealed class RemoteIosSlotTests
 
     private sealed class SlotDispatch(WorkerLock own, WorkerLock competitor) : IIosWorkflowGitHub
     {
-        private readonly RemoteIosGateTests.Dispatch _inner = new();
+        private readonly RemoteIosGateTests.Dispatch _inner = new() { Gui = true };
         public List<bool> Probes { get; } = [];
         public Task<IosSealedWorkflow?> ReadDefaultWorkflowAsync(RepoRef repo, CancellationToken ct) => _inner.ReadDefaultWorkflowAsync(repo, ct);
         public async Task DispatchAsync(RepoRef repo, IosSealedWorkflow workflow, IosNewTestsRequest request, string correlation, CancellationToken ct)

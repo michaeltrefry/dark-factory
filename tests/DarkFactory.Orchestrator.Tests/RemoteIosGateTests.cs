@@ -24,21 +24,23 @@ public class RemoteIosGateTests
     internal sealed class Dispatch : IIosWorkflowGitHub
     {
         public readonly List<IosNewTestsRequest> Requests = [];
+        public bool Gui;
+        public readonly List<RepoRef> Repositories = [];
         public string Correlation = "";
         public string? Corrupt;
         public bool Never;
         public bool BasePass;
         public bool Wait;
         public bool FirstBaseBuildFails;
-        public Task<IosSealedWorkflow?> ReadDefaultWorkflowAsync(RepoRef repo, CancellationToken ct) => Task.FromResult<IosSealedWorkflow?>(new("main", Workflow, RemoteIosWorkflow.Text));
+        public Task<IosSealedWorkflow?> ReadDefaultWorkflowAsync(RepoRef repo, CancellationToken ct) => Task.FromResult<IosSealedWorkflow?>(new("main", Workflow, Gui ? RemoteGuiWorkflow.Text : RemoteIosWorkflow.Text));
         public Task DispatchAsync(RepoRef repo, IosSealedWorkflow workflow, IosNewTestsRequest request, string correlation, CancellationToken ct)
         {
-            Requests.Add(request); Correlation = correlation; return Task.CompletedTask;
+            Repositories.Add(repo); Requests.Add(request); Correlation = correlation; return Task.CompletedTask;
         }
         public async Task<IReadOnlyList<IosWorkflowRun>> RunsAsync(RepoRef repo, CancellationToken ct)
         {
             if (Wait) await Task.Delay(Timeout.InfiniteTimeSpan, ct);
-            return Never ? [] : [new(42, "factory-ios-" + Correlation, Workflow, "workflow_dispatch", RemoteIosWorkflow.Path, 1, "completed", "success")];
+            return Never ? [] : [new(42, "factory-ios-" + Correlation, Workflow, "workflow_dispatch", Gui ? RemoteGuiWorkflow.Path : RemoteIosWorkflow.Path, 1, "completed", "success")];
         }
         public Task CancelAsync(RepoRef repo, IosWorkflowRun run, CancellationToken ct) => Task.CompletedTask;
         public Task<string> ResultAsync(RepoRef repo, IosWorkflowRun run, string correlation, CancellationToken ct)
@@ -60,7 +62,7 @@ public class RemoteIosGateTests
             var buildFailed = FirstBaseBuildFails && Requests.Count == 1;
             if (Corrupt == "missing" || buildFailed) files = [];
             return Task.FromResult(JsonSerializer.Serialize(new {
-                version = 1, nonce = correlation, @base = request.Base, head = request.Head, side,
+                version = 1, nonce = correlation, @base = request.Base, head = request.Head, side, guiConfigurationHash = new string(Corrupt == "gui-hash" ? 'b' : 'a', 64),
                 environment = new { runtime = RemoteIosNewTests.SimulatorRuntime, deviceType = RemoteIosNewTests.SimulatorDeviceType, xcode = "16.4", build = "16F6" },
                 executionHash = Corrupt == "hash" ? "wrong" : Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(request.Execution!))),
                 execution = new { commit = plan.GetProperty("commit").GetString(), root = "/private/tmp/factory-ios-test/" + side,
@@ -69,9 +71,13 @@ public class RemoteIosGateTests
         }
     }
 
-    private static Task<NewTestsResult> Run(FakeTestRunner source, Dispatch dispatch, TimeSpan? timeout = null) =>
-        NewTestsCheck.RunAsync(source, NewTestsCheck.StrategiesFor(true), Repo, Base, Head, "gate-sc-1", null, CancellationToken.None,
-            remoteIos: new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero, CleanupTimeout = TimeSpan.FromMilliseconds(20), Timeout = timeout ?? (dispatch.Never ? TimeSpan.FromMilliseconds(20) : TimeSpan.FromMinutes(1)) });
+    private static Task<NewTestsResult> Run(FakeTestRunner source, Dispatch dispatch, TimeSpan? timeout = null)
+    {
+        dispatch.Gui = true;
+        return NewTestsCheck.RunAsync(source, NewTestsCheck.StrategiesFor(true), Repo, Base, Head, "gate-sc-1", null, CancellationToken.None,
+            remoteIos: new RemoteIosNewTests(new Dispatch()),
+            remoteGui: new RemoteIosNewTests(dispatch, gui: GuiRemoteGateTests.Settings) { PollInterval = TimeSpan.Zero, CleanupTimeout = TimeSpan.FromMilliseconds(20), Timeout = timeout ?? (dispatch.Never ? TimeSpan.FromMilliseconds(20) : TimeSpan.FromMinutes(1)) });
+    }
 
     [Fact]
     public async Task All_discovered_ios_unit_and_ui_tests_run_remotely_with_the_exact_test_overlay()
@@ -178,9 +184,9 @@ public class RemoteIosGateTests
     [Fact]
     public async Task The_real_pipeline_records_remote_per_test_evidence_and_reuses_the_exact_base_head_after_interruption()
     {
-        var dispatch = new Dispatch();
+        var dispatch = new Dispatch { Gui = true };
         var h = new GatePipelineTests.Harness { Swift = true,
-            RemoteIos = new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero } };
+            RemoteGui = new RemoteIosNewTests(dispatch, gui: GuiRemoteGateTests.Settings) { PollInterval = TimeSpan.Zero } };
         var source = Sources();
         h.TestRunner.BaseFiles.Clear();
         foreach (var pair in source.BaseFiles) h.TestRunner.BaseFiles.Add(pair.Key, pair.Value);

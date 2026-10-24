@@ -11,6 +11,7 @@ public sealed record IosNewTestsRequest(string Base, string Head, IReadOnlyList<
 {
     /// <summary>A gate-generated execution plan, not repository commands. Null retains the S1 owner CLI fixture.</summary>
     public string? Execution { get; init; }
+    public string? SourceRepository { get; init; }
     /// <summary>Remaining invocation budget, including hosted queueing, transported independently of the hashed plan.</summary>
     public double ExecutionBudgetSeconds { get; init; }
 }
@@ -63,7 +64,7 @@ public static class RemoteIosWorkflow
 }
 
 /// <summary>A fully bounded remote invocation returning the ordinary per-test result; never treats a job's green check as evidence.</summary>
-public sealed partial class RemoteIosNewTests(IIosWorkflowGitHub github, string? stateDirectory = null)
+public sealed partial class RemoteIosNewTests(IIosWorkflowGitHub github, string? stateDirectory = null, GuiWorkflowSettings? gui = null)
 {
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan Timeout { get; init; } = TimeSpan.FromMinutes(35);
@@ -153,7 +154,7 @@ public sealed partial class RemoteIosNewTests(IIosWorkflowGitHub github, string?
                 Clear();
             }
             var workflow = await github.ReadDefaultWorkflowAsync(repo, token);
-            if (workflow is null || !RemoteIosWorkflow.Trusted(workflow))
+            if (workflow is null || !(gui is null ? RemoteIosWorkflow.Trusted(workflow) : RemoteGuiWorkflow.Trusted(workflow)))
                 throw new RemoteFailure("remote-workflow-untrusted", "Install the exact sealed factory iOS workflow on the target default branch; no workflow dispatched.");
             var nonce = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
             token.ThrowIfCancellationRequested();
@@ -219,13 +220,13 @@ public sealed partial class RemoteIosNewTests(IIosWorkflowGitHub github, string?
             + "Check the factory iOS runs in GitHub Actions and retry to reconcile; remove the owner-side ios-dispatches journal only after confirming that dispatch cannot still run.");
     }
 
-    private static IosWorkflowRun? Correlated(IReadOnlyList<IosWorkflowRun> runs, Outstanding pending)
+    private IosWorkflowRun? Correlated(IReadOnlyList<IosWorkflowRun> runs, Outstanding pending)
     {
         var matches = runs.Where(r => r.Title == "factory-ios-" + pending.Nonce).ToArray();
         if (matches.Length > 1) throw new RemoteFailure("remote-correlation-ambiguous", "Multiple iOS runs match the dispatch correlation; inspect GitHub Actions before retrying.");
         var run = matches.SingleOrDefault();
         if (run is not null && (run.Id <= 0 || run.Event != "workflow_dispatch" || run.HeadSha != pending.Commit
-            || run.Path != RemoteIosWorkflow.Path || run.Attempt != 1))
+            || run.Path != (gui is null ? RemoteIosWorkflow.Path : RemoteGuiWorkflow.Path) || run.Attempt != 1))
             throw new RemoteFailure("remote-provenance-invalid", "The correlated iOS run does not match the sealed default-branch dispatch; no result or cancellation authorized.");
         return run;
     }
@@ -263,13 +264,13 @@ public sealed partial class RemoteIosNewTests(IIosWorkflowGitHub github, string?
         [property: JsonPropertyName("xcode")] string Xcode,
         [property: JsonPropertyName("build")] string Build);
 
-    internal static EnvironmentIdentity EnvironmentOf(JsonElement root)
+    internal static EnvironmentIdentity EnvironmentOf(JsonElement root, bool gui = false)
     {
         var environment = root.GetProperty("environment");
         var identity = new EnvironmentIdentity(environment.GetProperty("runtime").GetString()!,
             environment.GetProperty("deviceType").GetString()!, environment.GetProperty("xcode").GetString()!,
             environment.GetProperty("build").GetString()!);
-        if (identity.Runtime != SimulatorRuntime || identity.DeviceType != SimulatorDeviceType
+        if ((!gui && (identity.Runtime != SimulatorRuntime || identity.DeviceType != SimulatorDeviceType))
             || string.IsNullOrWhiteSpace(identity.Xcode) || string.IsNullOrWhiteSpace(identity.Build))
             throw new InvalidDataException("Unproven iOS environment identity.");
         return identity;

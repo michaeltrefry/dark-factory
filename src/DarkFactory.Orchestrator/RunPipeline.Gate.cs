@@ -26,7 +26,7 @@ public sealed record GateStage(
     ReviewOverlays? Overlays = null,
     CodeGraphRiskReader? Risk = null,
     Prepare.PrepareStage? Prepare = null,
-    RemoteIosNewTests? RemoteIos = null)
+    RemoteIosNewTests? RemoteIos = null, RemoteIosNewTests? RemoteGui = null)
 {
     public static readonly TimeSpan DefaultCiPollInterval = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultCiTimeout = TimeSpan.FromMinutes(30);
@@ -1319,7 +1319,7 @@ public sealed partial class RunPipeline
         {
             result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(swift), run.Repo, pull.BaseSha, pull.HeadSha,
                 NewTestsCheck.RunName(run.Story), line => log.WriteLine($"[gate] {line}"), watch.Token, prepared, Gate.RemoteIos,
-                localExecution: execute => InWorkerPhaseAsync(run.Item, "run the new tests", execute, watch.Token));
+                localExecution: execute => InWorkerPhaseAsync(run.Item, "run the new tests", execute, watch.Token), remoteGui: Gate.RemoteGui);
         }
         catch (Exception) when (watch.Requested is { } requested && !ct.IsCancellationRequested)
         {

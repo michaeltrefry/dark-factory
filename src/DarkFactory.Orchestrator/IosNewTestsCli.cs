@@ -12,6 +12,8 @@ public static class IosNewTestsCli
     {
         var template = new Command("workflow", "Print the sealed workflow to install on the target default branch as .github/workflows/factory-ios-new-tests.yml.");
         template.SetAction(_ => { Console.Write(RemoteIosWorkflow.Text); return 0; });
+        var guiTemplate = new Command("gui-workflow", "Print the sealed workflow to install once on the central trusted GUI collector repository's default branch.");
+        guiTemplate.SetAction(_ => { Console.Write(RemoteGuiWorkflow.Text); return 0; });
         var repo = new Argument<string>("repo");
         var @base = new Argument<string>("base-sha");
         var head = new Argument<string>("head-sha");
@@ -35,7 +37,7 @@ public static class IosNewTestsCli
                 return 1;
             }
         });
-        return new Command("ios-new-tests", "Remote iOS walking skeleton (not the pipeline's general routing).") { template, run };
+        return new Command("ios-new-tests", "Remote iOS walking skeleton (not the pipeline's general routing).") { template, guiTemplate, run };
     }
 
     private static async Task<NewTestsResult> Execute(RepoRef repo, IosNewTestsRequest request, CancellationToken ct)

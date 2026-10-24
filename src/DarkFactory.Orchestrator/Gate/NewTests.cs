@@ -449,9 +449,9 @@ public static class NewTestsCheck
     /// </param>
     public static async Task<NewTestsResult> RunAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
         string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared = null, RemoteIosNewTests? remoteIos = null,
-        Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution = null)
+        Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution = null, RemoteIosNewTests? remoteGui = null)
     {
-        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared, remoteIos, localExecution);
+        var result = await RunCoreAsync(runner, strategies, repo, baseSha, headSha, runName, log, ct, prepared, remoteIos, localExecution, remoteGui);
         return prepared?.Note is { } note ? result with { Reason = $"{result.Reason}; {note}" } : result;
     }
 
@@ -464,7 +464,7 @@ public static class NewTestsCheck
 
     private static async Task<NewTestsResult> RunCoreAsync(IGateTestRunner runner, IReadOnlyList<INewTestStrategy> strategies, RepoRef repo,
         string baseSha, string headSha, string runName, Action<string>? log, CancellationToken ct, Prepare.PreparedCommits? prepared, RemoteIosNewTests? remoteIos,
-        Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution)
+        Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution, RemoteIosNewTests? remoteGui)
     {
         var changes = prepared?.Changes ?? await runner.ChangesAsync(repo, baseSha, headSha, ct);
         var source = new TestSource(runner, repo, baseSha, headSha);
@@ -474,12 +474,21 @@ public static class NewTestsCheck
             var set = await strategy.IdentifyAsync(source, changes, ct);
             if (set.TestFiles.Count > 0 || set.Tests.Count > 0 || set.Unisolable.Count > 0)
             {
-                if (remoteIos is not null && strategy is XcodeNewTests && set.Tests.Count > 0)
+                if ((remoteIos is not null || remoteGui is not null) && strategy is XcodeNewTests && set.Tests.Count > 0)
                 {
                     // A PR may contain both platforms. Partition only the test ids, preserving the complete code-written
                     // base overlay and Swift location metadata for attribution and retries; no iOS test is sent locally.
-                    foreach (var group in set.Tests.GroupBy(t => XcodeNewTests.Build.From(set.Projects[t]).Platform))
-                        found.Add((strategy, set with { Tests = group.ToArray() }));
+                    // One scheme may build/run several test targets. A mixed scheme is GUI as a whole;
+                    // a missing fact holds the whole scheme, never a hosted guess for its unit-test subset.
+                    var placements = set.Tests.GroupBy(t => set.Projects[t], StringComparer.Ordinal).SelectMany(group =>
+                    {
+                        var facts = group.Select(t => set.XcodePlacements.GetValueOrDefault(t, XcodeTestPlacement.Unknown)).ToArray();
+                        var placement = facts.Contains(XcodeTestPlacement.Unknown) ? XcodeTestPlacement.Unknown
+                            : facts.Contains(XcodeTestPlacement.Gui) ? XcodeTestPlacement.Gui : facts[0];
+                        return group.Select(test => (test, placement));
+                    }).ToDictionary(p => p.test, p => p.placement, StringComparer.Ordinal);
+                    foreach (var group in set.Tests.GroupBy(t => placements[t]))
+                        found.Add((strategy, set with { Tests = group.ToArray(), XcodePlacements = placements }));
                 }
                 else found.Add((strategy, set));
             }
@@ -527,14 +536,22 @@ public static class NewTestsCheck
                     Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : baseReplacements,
                 };
             }
-            var ios = remoteIos is not null && strategy is XcodeNewTests && XcodeNewTests.Build.From(set.Projects[set.Tests[0]]).Platform == XcodeProject.IOS;
+            var placement = strategy is XcodeNewTests ? set.XcodePlacements.GetValueOrDefault(set.Tests[0], XcodeTestPlacement.Unknown) : XcodeTestPlacement.Local;
+            var routing = remoteIos is not null || remoteGui is not null;
+            if (routing && strategy is XcodeNewTests && (placement == XcodeTestPlacement.Unknown || (placement == XcodeTestPlacement.Gui && remoteGui is null) || (placement == XcodeTestPlacement.Hosted && remoteIos is null)))
+                return NewTestsResult.Without(baseSha, headSha, NewTestsOutcome.Error,
+                    placement == XcodeTestPlacement.Unknown ? "gui-placement-unknown: The base and head do not prove the same GUI execution requirements. No hosted or local fallback is allowed."
+                        : placement == XcodeTestPlacement.Gui ? "gui-executor-unavailable: Configure the dedicated trusted GUI collector (Gate:Gui); no hosted or local GUI fallback is allowed."
+                        : "hosted-executor-unavailable: The non-GUI iOS executor is unavailable; no local fallback is allowed.");
+            var remote = routing ? placement == XcodeTestPlacement.Gui ? remoteGui : placement == XcodeTestPlacement.Hosted ? remoteIos : null : null;
+            var isRemote = remote is not null;
             async Task<TestRunReport> Run(TestRunSpec spec, IReadOnlyList<string> tests)
             {
-                if (!ios) return await runner.RunAsync(repo, spec, ct);
+                if (!isRemote) return await runner.RunAsync(repo, spec, ct);
                 var recipe = prepared?.Recipes.GetValueOrDefault(spec.Commit);
                 if (recipe is null && prepared?.StepsFor(spec.Commit).Count > 0)
                     return TestRunReport.Failed(TestRunStatus.NoResults, "The declared prepare recipe is missing; private owner-cache steps are never transported.");
-                return await remoteIos!.RunExecutionAsync(repo, baseSha, headSha, spec, tests, set.Projects, recipe, ct);
+                return await remote!.RunExecutionAsync(repo, baseSha, headSha, spec, tests, set.Projects, recipe, ct);
             }
             // Discovery and remote groups need no local sandbox user. A local group's base, head and retries
             // retain one worker phase, so its helper/worktree lifecycle stays protected as before.
@@ -592,7 +609,7 @@ public static class NewTestsCheck
                 var judged = Judge(baseSha, headSha, strategy.Name, set.Tests, evidence, headRun);
                 return set.Notes.Count == 0 ? judged : judged with { Reason = SafeExcerpt($"{judged.Reason} ({string.Join("; ", set.Notes)})", 4000) };
             }
-            results.Add(!ios && localExecution is not null ? await localExecution(ExecuteGroup) : await ExecuteGroup());
+            results.Add(!isRemote && localExecution is not null ? await localExecution(ExecuteGroup) : await ExecuteGroup());
         }
         return results.FirstOrDefault(r => !r.Passed) ?? results[0] with
         {

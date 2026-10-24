@@ -1607,7 +1607,7 @@ def parse_execution(text, request):
         return result
     value = json.loads(text, object_pairs_hook=unique)
     keys = {'side', 'commit', 'overlayFrom', 'overlayPaths', 'deletePaths', 'replacements', 'builds'}
-    if not isinstance(value, dict) or not keys <= set(value) or set(value) - keys - {'prepare'} or value['side'] not in ('base', 'head'):
+    if not isinstance(value, dict) or not keys <= set(value) or set(value) - keys - ({'prepare', 'sourceRepository'} if globals().get('GUI_CONFIG') is not None else {'prepare'}) or value['side'] not in ('base', 'head'):
         raise ValueError('invalid execution descriptor')
     if value['commit'] != request[value['side'].upper()]:
         raise ValueError('execution commit does not match its side')
@@ -1635,8 +1635,10 @@ def parse_execution(text, request):
         raise ValueError('invalid execution builds')
     seen = set()
     for build in builds:
-        if not isinstance(build, dict) or set(build) != {'flag', 'container', 'scheme', 'tests'}:
+        if not isinstance(build, dict) or set(build) != ({'flag', 'container', 'scheme', 'tests', 'platform'} if globals().get('GUI_CONFIG') is not None else {'flag', 'container', 'scheme', 'tests'}):
             raise ValueError('invalid execution build')
+        if globals().get('GUI_CONFIG') is not None and build['platform'] not in ('macOS', 'iOS'):
+            raise ValueError('invalid GUI build platform')
         if build['flag'] not in ('-project', '-workspace'):
             raise ValueError('invalid execution container flag')
         container = repo_path(build['container'])
@@ -1782,7 +1784,8 @@ def execution_main(request, text):
                 # by the restricted principal crosses back as untrusted data.
                 data = package_snapshot(principal, cwd)
                 mirrors = hydrate_packages(root, cwd, data)
-                if (root / 'packages/registry-plan.json').is_file():
+                has_registry = (root / 'packages/registry-plan.json').is_file()
+                if has_registry and globals().get('GUI_CONFIG') is None:
                     try:
                         registry = RegistryMirror(root)
                         principal.registry_endpoints(registry.endpoints)
@@ -1796,21 +1799,24 @@ def execution_main(request, text):
             code, version = principal.run(['/usr/bin/xcodebuild', '-version'], root)
             if code or version.strip() != 'Xcode ' + ENVIRONMENT['xcode'] + '\nBuild version ' + ENVIRONMENT['build']:
                 raise ValueError('pinned Xcode version unavailable')
-            code, inventory = principal.run(['/usr/bin/xcrun', 'simctl', 'list', '-j'], root)
-            if code:
-                raise ValueError('simulator unavailable')
-            device_type, runtime = simulator(json.loads(inventory))
-            code, device = principal.run(['/usr/bin/xcrun', 'simctl', 'create', 'factory-' + request['NONCE'], device_type, runtime], root)
-            device = device.strip()
-            if code or not re.fullmatch('[0-9A-Fa-f-]{36}', device):
-                raise ValueError('simulator creation failed')
+            device = None
+            if any(build.get('platform', 'iOS') == 'iOS' for build in execution['builds']):
+                code, inventory = principal.run(['/usr/bin/xcrun', 'simctl', 'list', '-j'], root)
+                if code:
+                    raise ValueError('simulator unavailable')
+                device_type, runtime = simulator(json.loads(inventory))
+                code, device = principal.run(['/usr/bin/xcrun', 'simctl', 'create', 'factory-' + request['NONCE'], device_type, runtime], root)
+                device = device.strip()
+                if code or not re.fullmatch('[0-9A-Fa-f-]{36}', device):
+                    raise ValueError('simulator creation failed')
             def arguments(build):
                 return ['/usr/bin/xcodebuild', build['flag'], build['container'], '-scheme', build['scheme'],
-                        '-destination', 'platform=iOS Simulator,id=' + device,
-                        '-derivedDataPath', str(derived), '-clonedSourcePackagesDirPath', str(derived / 'SourcePackages'), 'CODE_SIGNING_ALLOWED=NO',
+                        '-destination', 'platform=macOS' if build.get('platform') == 'macOS' else 'platform=iOS Simulator,id=' + device,
+                        '-derivedDataPath', str(derived), '-clonedSourcePackagesDirPath', str(derived / 'SourcePackages'),
+                        *(['CODE_SIGN_IDENTITY=-', 'DEVELOPMENT_TEAM=', 'PROVISIONING_PROFILE=', 'PROVISIONING_PROFILE_SPECIFIER='] if globals().get('GUI_CONFIG') is not None else ['CODE_SIGNING_ALLOWED=NO']),
                         '-disableAutomaticPackageResolution', '-skipPackageUpdates',
                         '-skipMacroValidation', '-skipPackagePluginValidation']
-            if mirrors or registry or has_binary:
+            if mirrors or registry or has_binary or has_registry:
                 for build in execution['builds']:
                     # Only this restricted principal evaluates Package.swift.
                     # Local mirrors contain the exact lockfile commits.

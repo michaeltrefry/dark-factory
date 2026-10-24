@@ -16,6 +16,8 @@ public sealed partial class RemoteIosNewTests
     public async Task<TestRunReport> RunExecutionAsync(RepoRef repo, string baseSha, string headSha, TestRunSpec spec,
         IReadOnlyList<string> tests, IReadOnlyDictionary<string, string> projects, PrepareRecipe? prepare, CancellationToken ct)
     {
+        if (gui is not null && !gui.Allows(repo))
+            return TestRunReport.Failed(TestRunStatus.NoResults, "gui-source-refused: The repository is not in Gate:Gui:TrustedRepos.");
         var elapsed = System.Diagnostics.Stopwatch.StartNew();
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(Timeout);
@@ -30,7 +32,7 @@ public sealed partial class RemoteIosNewTests
                 || (side == "base" && spec.OverlayFrom != headSha)) throw new InvalidDataException("Invalid overlay commit.");
             var builds = tests.GroupBy(t => projects[t], StringComparer.Ordinal).Select(g => {
                 var b = XcodeNewTests.Build.From(g.Key);
-                if (b.Platform != XcodeProject.IOS) throw new InvalidDataException("Non-iOS execution plan.");
+                if (gui is null && b.Platform != XcodeProject.IOS) throw new InvalidDataException("Non-iOS execution plan.");
                 return new { flag = b.Flag, container = b.Container, scheme = b.Scheme, tests = g.ToArray() };
             }).ToArray();
             // Recipe declarations, not TestSteps expanded to an owner's private cache. Every artifact is independently
@@ -43,9 +45,17 @@ public sealed partial class RemoteIosNewTests
             };
             var descriptor = JsonSerializer.Serialize(new { side, commit = spec.Commit, overlayFrom = spec.OverlayFrom,
                 overlayPaths = spec.OverlayPaths, deletePaths = spec.DeletePaths, replacements = spec.Replacements, builds, prepare = recipe });
+            if (gui is not null)
+            {
+                var node = System.Text.Json.Nodes.JsonNode.Parse(descriptor)!;
+                node["sourceRepository"] = repo.FullName;
+                foreach (var (build, group) in node["builds"]!.AsArray().Zip(tests.GroupBy(t => projects[t], StringComparer.Ordinal)))
+                    build!["platform"] = XcodeNewTests.Build.From(group.Key).Platform;
+                descriptor = node.ToJsonString();
+            }
             if (Encoding.UTF8.GetByteCount(descriptor) > MaxExecutionBytes) throw new InvalidDataException("Oversized iOS execution descriptor.");
-            var request = new IosNewTestsRequest(baseSha, headSha, tests) { Execution = descriptor };
-            var (text, nonce) = await InvokeAsync(repo, request, () => Timeout - elapsed.Elapsed, deadline.Token);
+            var request = new IosNewTestsRequest(baseSha, headSha, tests) { Execution = descriptor, SourceRepository = gui is null ? null : repo.FullName };
+            var (text, nonce) = await InvokeAsync(gui?.Collector ?? repo, request, () => Timeout - elapsed.Elapsed, deadline.Token);
             return ParseExecution(text, nonce, request, spec.Strategy, side, spec.Commit, prepare);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
@@ -57,7 +67,7 @@ public sealed partial class RemoteIosNewTests
         }
     }
 
-    private static TestRunReport ParseExecution(string text, string nonce, IosNewTestsRequest request, INewTestStrategy strategy, string side, string commit, PrepareRecipe? prepare)
+    private TestRunReport ParseExecution(string text, string nonce, IosNewTestsRequest request, INewTestStrategy strategy, string side, string commit, PrepareRecipe? prepare)
     {
         if (Encoding.UTF8.GetByteCount(text) > MaxResultBytes) throw new InvalidDataException("Oversized execution result.");
         using var doc = JsonDocument.Parse(text, new JsonDocumentOptions { MaxDepth = 64 });
@@ -68,8 +78,9 @@ public sealed partial class RemoteIosNewTests
             || root.GetProperty("side").GetString() != side
             || root.GetProperty("executionHash").GetString() != Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(request.Execution!))))
             throw new InvalidDataException("Unbound execution result.");
-        var environment = EnvironmentOf(root);
-        if (environment.Xcode != "16.4" || environment.Build != "16F6") throw new InvalidDataException("Unpinned execution environment.");
+        var environment = EnvironmentOf(root, gui is not null);
+        if (gui is null ? environment.Xcode != "16.4" || environment.Build != "16F6"
+            : root.GetProperty("guiConfigurationHash").GetString() != gui.ConfigurationSha256) throw new InvalidDataException("Unpinned execution environment.");
         var execution = root.GetProperty("execution");
         var sourceRoot = execution.GetProperty("root").GetString()!;
         // A label used only for diagnostics normalization, never an authority to read a local path.
