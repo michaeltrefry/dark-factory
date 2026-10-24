@@ -9,6 +9,9 @@ namespace DarkFactory.Orchestrator.Tests;
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 internal static class SandboxSupport
 {
+    // Synthetic helpers model the same transport boundary; production has no bypass switch.
+    public const string ProtocolPrelude = "if [ \"$1\" = __factory_run ]; then printf 'factory-bootstrap %s\\n' \"$2\"; shift 2; elif [ \"$1\" = __factory_cleanup ]; then printf 'factory-bootstrap %s\\n' \"$2\"; set -- /usr/bin/true; fi\n";
+
     public static readonly Uri Router = new("http://localhost:8080/");
 
     public static string RepoRoot
@@ -173,7 +176,7 @@ public class WorkerSandboxTests
         var sandbox = new WorkerSandbox("_factory", WorkerSandbox.DefaultHelperPath);
 
         Assert.Equal("/usr/bin/sudo", sandbox.SudoPath);
-        Assert.Equal(["-n", "-u", "_factory", "/usr/local/libexec/dark-factory/factory-worker-launch", "claude", "-p", "x"],
+        Assert.Equal(["-n", "-u", "root", "/usr/local/libexec/dark-factory/factory-worker-launch", "claude", "-p", "x"],
             sandbox.BuildLaunchArguments("claude", ["-p", "x"]));
     }
 
@@ -191,7 +194,9 @@ public class WorkerSandboxTests
         Environment.SetEnvironmentVariable("GH_TOKEN", "ghp_owner_should_not_leak");
         try
         {
-            using var p = LocalSandbox().Start(_dir, "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(SandboxSupport.Router, "rk_worker", WorkerModelClass.Low));
+            var sandbox = LocalSandbox();
+            using var p = sandbox.Start(_dir, "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(SandboxSupport.Router, "rk_worker", WorkerModelClass.Low));
+            await sandbox.VerifyStartedAsync(p, CancellationToken.None);
             var output = await p.StandardOutput.ReadToEndAsync();
             await p.WaitForExitAsync();
             WorkerSandbox.Stop(p);
@@ -705,13 +710,13 @@ public class WorkerSandboxTests
     }
 
     [Fact]
-    public void The_helper_is_version_5_and_an_installed_version_4_is_stale()
+    public void The_helper_is_version_6_and_an_installed_version_5_is_stale()
     {
-        Assert.Equal(5, WorkerSandbox.HelperVersion);
+        Assert.Equal(6, WorkerSandbox.HelperVersion);
         Assert.True(SafeHelper.SourceContains($"\nhelper_version={WorkerSandbox.HelperVersion}\n"));
-        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=5\n";
-        var installedV4 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=5", "helper_version=4");
-        Assert.Equal("its helper_version 4 is older than 5", WorkerSandbox.StaleHelperReason(installedV4, "_factory", repo));
+        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=6\n";
+        var installedV4 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=6", "helper_version=5");
+        Assert.Equal("its helper_version 5 is older than 6", WorkerSandbox.StaleHelperReason(installedV4, "_factory", repo));
         Assert.Null(WorkerSandbox.StaleHelperReason(repo.Replace("sandbox_uid=", "sandbox_uid=450"), "_factory", repo));
         // A slot's copy is the same text pinned to its own user: current for that user, and for no other.
         var second = repo.Replace("sandbox_user=_factory", "sandbox_user=_factory2").Replace("sandbox_uid=", "sandbox_uid=451");
@@ -1077,8 +1082,10 @@ public class WorkerSandboxTests
     [Fact]
     public async Task Closing_the_helpers_stdin_kills_the_whole_worker_tree()
     {
-        using var p = LocalSandbox().Start(_dir, "/bin/sh",
+        var sandbox = LocalSandbox();
+        using var p = sandbox.Start(_dir, "/bin/sh",
             ["-c", $"sleep 600 & echo {OwnProcess.ShellRecord("$!")}; echo {OwnProcess.ShellRecord("$$")}; wait"], new Dictionary<string, string>());
+        await sandbox.VerifyStartedAsync(p, CancellationToken.None);
         var child = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
         var shell = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
         Assert.True(child.IsAlive && shell.IsAlive);
@@ -1096,9 +1103,11 @@ public class WorkerSandboxTests
         // Reparented to launchd once the worker exits, so the seam allows the worker's group kill only because the worker
         // registered it (its own child, recorded before it exits).
         var registry = SandboxSupport.LocalRegistry(_dir);
-        using var p = LocalSandbox().Start(_dir, "/bin/sh",
+        var sandbox = LocalSandbox();
+        using var p = sandbox.Start(_dir, "/bin/sh",
             ["-c", $"sleep 600 >/dev/null 2>&1 & r={OwnProcess.ShellRecord("$!")}; echo \"$r\" >>'{registry}'; echo \"$r\""],
             new Dictionary<string, string>());
+        await sandbox.VerifyStartedAsync(p, CancellationToken.None);
         var orphan = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync())!);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await p.WaitForExitAsync(cts.Token);
@@ -1140,7 +1149,7 @@ public class WorkerSandboxTests
     {
         var pidFile = Path.Combine(_dir, "pid");
         var claude = SandboxSupport.Executable(_dir, "slow-claude.sh",
-            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nsleep 600\n");
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\nprintf 'factory-bootstrap %s\\n' \"$6\"\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nsleep 600\n");
         var worker = new ClaudeWorker(claude, SandboxSupport.Router, "k", TimeSpan.FromMinutes(5), LocalSandbox());
         using var cts = new CancellationTokenSource();
         var run = worker.RunAsync(_dir, "p", null, WorkerModelClass.Mid, null, cts.Token);
@@ -1160,7 +1169,7 @@ public class WorkerSandboxTests
         // A "sudo" that ignores its stdin closing, as a wedged helper would. The worker user has no process (no such user), so the
         // second stop — a run of the helper that kills that user's processes — finds nothing to run for.
         var stuckSudo = SandboxSupport.Executable(_dir, "stuck-sudo.sh",
-            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
+            $"#!/bin/sh\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\nprintf 'factory-bootstrap %s\\n' \"$6\"\necho '{{\"type\":\"system\",\"session_id\":\"s\"}}'\nexec /bin/sleep 600 </dev/null\n");
         var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "stuck-root")).FullName);
         var sandbox = new WorkerSandbox("_df_no_such_user", SafeHelper.Create(_dir).Path, stuckSudo) { Lock = workerLock };
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", TimeSpan.FromMinutes(5), sandbox,
@@ -1205,9 +1214,9 @@ public class WorkerSandboxTests
         var sudo = SandboxSupport.Executable(_dir, "wedging-sudo.sh",
             "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -u ] || exit 99\nshift 3\n"
             // The stop of every process of the worker user (a no-op through the helper): the real copy, whose exit sweeps.
-            + "if [ \"$2\" = /usr/bin/true ]; then exec \"$@\"; fi\n"
+            + "if [ \"$2\" = __factory_cleanup ]; then exec \"$@\"; fi\n"
             + $"echo {OwnProcess.ShellRecord("$$")} >> '{registry}'\necho {OwnProcess.ShellRecord("$$")} > '{pidFile}'\n"
-            + "echo '{\"type\":\"system\",\"session_id\":\"s\"}'\nexec /bin/sleep 600 </dev/null\n");
+            + "printf 'factory-bootstrap %s\\n' \"$3\"\necho '{\"type\":\"system\",\"session_id\":\"s\"}'\nexec /bin/sleep 600 </dev/null\n");
         var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "wedged-root")).FullName);
         var sandbox = new WorkerSandbox(Environment.UserName, helper.Path, sudo) { Lock = workerLock };
         var worker = new ClaudeWorker("claude", SandboxSupport.Router, "k", TimeSpan.FromMinutes(5), sandbox,

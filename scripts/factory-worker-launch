@@ -1,12 +1,12 @@
-#!/bin/bash
+#!/bin/bash -p
 # factory-worker-launch — runs one Dark Factory worker command as a sandbox user.
 #
 # Installed root-owned by scripts/setup-worker-user.sh, one copy per sandbox user (a worker slot,
 # Worker:Slots): /usr/local/libexec/dark-factory/factory-worker-launch for the first (_factory),
 # factory-worker-launch-2 for _factory2, and so on. Setup sets sandbox_user and sandbox_uid below in
 # each copy to that copy's own user, and the sudoers rules let the owner run each copy only as its
-# user. The orchestrator runs it with
-#   sudo -n -u _factory factory-worker-launch <program> [args...]
+# root. The orchestrator runs it with
+#   sudo -n -u root factory-worker-launch <program> [args...]
 #
 # Protocol (stdin):
 #   KEY=VALUE lines for the router variables, then one empty line. ANTHROPIC_CUSTOM_HEADERS
@@ -43,10 +43,151 @@ set -eu
 sandbox_user=_factory
 # Pinned by setup-worker-user.sh; empty in the repo, so an uninstalled copy never sweeps.
 sandbox_uid=
+# Installing owner; root accepts only this sudo caller, never a worker.
+sandbox_owner=
 # The orchestrator refuses to start unless the installed helper is this file (EnsureReadyAsync):
 # re-run setup-worker-user.sh after any change here.
 # shellcheck disable=SC2034 # read by the orchestrator, not by this script
-helper_version=5
+helper_version=6
+
+# S3: the privileged prefix never reads stdin or executes the requested program as root.
+# asuser may select a GUI domain when one exists: refuse it both before and after adoption.
+# No GUI login is created, no service is installed, and no loginwindow is exempt from cleanup.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+root_acl_trusted() {
+    local listing
+    listing=$(/bin/ls -lde "$1") || return 1
+    printf '%s\n' "$listing" | /usr/bin/awk '
+        NR == 1 { if ($0 !~ /^[-d]rwxr-xr-x[+@ ]/) exit 1; next }
+        {
+            if ($0 !~ /^[ \t]*[0-9]+: (user|group):[^ \t]+ (inherited )?(allow|deny) /) exit 1
+            sub(/^[ \t]*[0-9]+: /, "")
+            principal = $1; $1 = ""; sub(/^[ \t]+/, "")
+            sub(/^inherited /, "")
+            if ($1 == "deny" || principal == "user:root") next
+            $1 = ""; gsub(/[ \t]/, "")
+            n = split($0, rights, ",")
+            for (i = 1; i <= n; i++)
+                if (rights[i] !~ /^(read|list|search|execute|readattr|readextattr|readsecurity|file_inherit|directory_inherit|only_inherit|limit_inherit|inherited)$/) exit 1
+        }
+        END { if (NR == 0) exit 1 }'
+}
+
+bootstrap_failure() {
+    echo "factory-worker-launch: refusing worker outside its pinned non-GUI user domain: $*" >&2
+    exit 78
+}
+no_gui_domain() {
+    # A successful query proves a GUI domain exists. All other answers are NOT proof of its
+    # absence; the worker's managername and strict user-domain identity below are also required.
+    if /bin/launchctl print "gui/$sandbox_uid" >/dev/null 2>&1; then return 1; fi
+}
+read_user_domain() {
+    /bin/launchctl print "user/$sandbox_uid" 2>/dev/null | /usr/bin/awk -v uid="$sandbox_uid" '
+        BEGIN { depth = 0 }
+        { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+        depth == 0 && line == "user/" uid " = {" { headers++ }
+        depth == 1 && line ~ /^type = / { types++; if (line == "type = user") users++ }
+        depth == 1 && line == "security context = {" { contexts++; security = 1 }
+        security && depth == 2 && line ~ /^uid = / { uids++; if (line == "uid = " uid) own++ }
+        security && depth == 2 && line == "}" { security = 0 }
+        { opens = gsub(/\{/, "{", $0); closes = gsub(/\}/, "}", $0); depth += opens - closes }
+        END { if (depth != 0 || headers != 1 || types != 1 || users != 1 || contexts != 1 || uids != 1 || own != 1) exit 1 }'
+}
+verify_headless_domain() {
+    set -o pipefail
+    [ "$(id -u)" = "$sandbox_uid" ] && [ "$(id -un)" = "$sandbox_user" ] \
+        && [ "$(id -u "$sandbox_user")" = "$sandbox_uid" ] \
+        || bootstrap_failure 'effective identity is not the pinned slot user'
+    [ "$(/bin/launchctl manageruid)" = "$sandbox_uid" ] \
+        && [ "$(/bin/launchctl managername)" = Background ] \
+        || bootstrap_failure 'manager uid/name is not the own Background domain'
+    no_gui_domain && read_user_domain || bootstrap_failure 'GUI or unrecognised user-domain provenance'
+}
+root_cleanup_failure() {
+    echo 'factory-worker-launch: root could not prove worker cleanup; slot remains quarantined (owner must verify cleanup before removing this helper .quarantine file)' >&2
+    exit 78
+}
+root_session_launch() {
+    set -o pipefail
+    case "$sandbox_uid" in '' | *[!0-9]*) bootstrap_failure 'no pinned uid' ;; esac
+    [ "$sandbox_uid" -ge 400 ] && [ "$sandbox_uid" -le 499 ] \
+        && [ "$(id -u "$sandbox_user")" = "$sandbox_uid" ] \
+        && [ -n "$sandbox_owner" ] && [ "${SUDO_USER:-}" = "$sandbox_owner" ] \
+        && [ "$(id -u "$sandbox_owner")" = "${SUDO_UID:-}" ] \
+        && [ "${SUDO_UID:-0}" -gt 0 ] && [ "${SUDO_UID:-0}" != "$sandbox_uid" ] \
+        || bootstrap_failure 'root trampoline identity'
+    case "$0" in
+        /usr/local/libexec/dark-factory/factory-worker-launch | /usr/local/libexec/dark-factory/factory-worker-launch-[2-8]) ;;
+        *) bootstrap_failure 'uninstalled session trampoline path' ;;
+    esac
+    for trusted in / /usr /usr/local /usr/local/libexec /usr/local/libexec/dark-factory "$0"; do
+        [ ! -L "$trusted" ] && [ "$(/usr/bin/stat -f '%u:%Lp' "$trusted")" = '0:755' ] && root_acl_trusted "$trusted" \
+            || bootstrap_failure 'session trampoline path must be root-owned 0755 without links or writable ACLs'
+    done
+    cleanup_only=0
+    if [ "${1:-}" = __factory_cleanup ]; then
+        [ "$#" -eq 2 ] || bootstrap_failure 'cleanup takes only its protocol nonce'
+        cleanup_only=1
+    else
+        no_gui_domain && read_user_domain || bootstrap_failure 'GUI or unrecognised user-domain provenance'
+    fi
+    # Fixed root-owned path, private mode, exclusive create. A crash, signal or failed cleanup
+    # leaves this slot unavailable across processes/restarts. Never follow or overwrite a marker.
+    quarantine="$0.quarantine"
+    if [ "$cleanup_only" -eq 1 ] && [ -f "$quarantine" ] && [ ! -L "$quarantine" ]; then
+        : # Authenticated cleanup only: never caller-selected work while quarantine exists.
+    else
+        ( umask 077; set -C; : >"$quarantine" ) 2>/dev/null || root_cleanup_failure
+    fi
+    if ( exec /bin/launchctl asuser "$sandbox_uid" /usr/bin/sudo -n -u "$sandbox_user" -- "$0" "$@" ); then
+        root_status=0
+    else
+        root_status=$?
+    fi
+    # The original unprivileged uid sweep still kills all user-owned detached workers.
+    # Independently verify both real and effective identities from ONE complete process table;
+    # unlike ps -U, an empty selection cannot hide a failed query behind exit status 1.
+    root_processes=$(/bin/ps -axo pid=,uid=,ruid=,stat=) || root_cleanup_failure
+    printf '%s\n' "$root_processes" | /usr/bin/awk -v uid="$sandbox_uid" '
+        NF == 0 { next }
+        { seen++ }
+        NF != 4 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[A-Za-z][A-Za-z0-9+<_-]*$/ { bad = 1; next }
+        ($2 == uid || $3 == uid) && $4 !~ /^[XZ]/ { bad = 1 }
+        END { if (bad || !seen) exit 1 }' || root_cleanup_failure
+    no_gui_domain && read_user_domain || root_cleanup_failure
+    if [ -e "$quarantine" ]; then /bin/rm -- "$quarantine" || root_cleanup_failure; fi
+    exit "$root_status"
+}
+cleanup_only=0
+[ "${1:-}" != __factory_cleanup ] || cleanup_only=1
+if [ "$(uname -s)" = Darwin ]; then
+    if [ "$(id -u)" = 0 ]; then root_session_launch "$@"; fi
+    if [ "$cleanup_only" -eq 1 ]; then
+        [ "$(id -u)" = "$sandbox_uid" ] && [ "$(id -un)" = "$sandbox_user" ] \
+            && [ "$(id -u "$sandbox_user")" = "$sandbox_uid" ] || bootstrap_failure 'cleanup effective identity'
+    else
+        verify_headless_domain
+    fi
+fi
+# The first stdout line belongs to the helper, before the caller-selected program can run.
+# A program may itself exit 78; a missing handshake or surviving ROOT-owned quarantine,
+# not that exit code or any caller-controlled stderr, makes an infrastructure failure.
+case "${1:-}" in
+    __factory_run | __factory_cleanup)
+        [ "$#" -ge 2 ] || bootstrap_failure 'missing protocol nonce'
+        nonce=$2
+        case "$nonce" in '' | *[!a-f0-9]*) bootstrap_failure 'invalid protocol nonce' ;; esac
+        [ "${#nonce}" -eq 32 ] || bootstrap_failure 'invalid protocol nonce length'
+        if [ "$cleanup_only" -eq 1 ]; then
+            [ "$#" -eq 2 ] || bootstrap_failure 'cleanup takes no program'
+            set -- /usr/bin/true
+        else
+            shift 2
+        fi
+        printf 'factory-bootstrap %s\n' "$nonce"
+        ;;
+esac
 
 usage() {
     echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2

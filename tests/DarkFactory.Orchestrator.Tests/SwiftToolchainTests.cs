@@ -21,7 +21,7 @@ public class SwiftToolchainTests
 
     /// <summary>A fake launch helper as the repo would have it: reads the variable block, logs the program, then runs it as us.</summary>
     private string RepoHelper => "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=" + WorkerSandbox.HelperVersion
-        + "\nwhile IFS= read -r line; do [ -z \"$line\" ] && break; done\necho \"${0##*/} $*\" >> '" + Ran + "'\n"
+        + "\n" + SandboxSupport.ProtocolPrelude + "while IFS= read -r line; do [ -z \"$line\" ] && break; done\necho \"${0##*/} $*\" >> '" + Ran + "'\n"
         + "case \"$1\" in /usr/bin/id) echo \"${0##*/}\" ;; *) exec \"$@\" ;; esac\n";
 
     private static string InstalledFor(string user, string uid, string repo) => repo
@@ -33,10 +33,10 @@ public class SwiftToolchainTests
     /// A fake xcodebuild: <c>-checkFirstLaunchStatus</c> exits <paramref name="firstLaunch"/>, <c>-license check</c> <paramref name="license"/>,
     /// <c>-showsdks</c> lists <paramref name="sdks"/> (as Xcode prints them: <c>-sdk &lt;name&gt;&lt;version&gt;</c>).
     /// </summary>
-    private string Xcodebuild(int firstLaunch = 0, int license = 0, string sdks = "macosx iphonesimulator") => SandboxSupport.Executable(_dir, $"xcodebuild-{Guid.NewGuid():N}", $$"""
+    private string Xcodebuild(int firstLaunch = 0, int license = 0, string sdks = "macosx iphonesimulator", int version = 0) => SandboxSupport.Executable(_dir, $"xcodebuild-{Guid.NewGuid():N}", $$"""
         #!/bin/sh
         case "$1" in
-            -version) echo 'Xcode 26.5' ;;
+            -version) echo 'Xcode 26.5'; exit {{version}} ;;
             -showsdks) for s in {{sdks}}; do printf '\tSDK 26.5\t-sdk %s26.5\n' "$s"; done ;;
             -checkFirstLaunchStatus) [ {{firstLaunch}} -eq 0 ] || echo 'first launch tasks are not done' >&2; exit {{firstLaunch}} ;;
             -license) [ "$2" = check ] || exit 2; [ {{license}} -eq 0 ] || echo 'You have not agreed to the Xcode license agreements.' >&2; exit {{license}} ;;
@@ -74,8 +74,8 @@ public class SwiftToolchainTests
     }
 
     private SwiftToolchain Toolchain(int firstLaunch = 0, int license = 0, int swiftExit = 0, string? wrapper = null, string sdks = "macosx iphonesimulator",
-        string manager = "Aqua", string runtimes = IosRuntimes, string types = IphoneTypes) =>
-        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks), wrapper ?? InstalledWrapper(), LaunchctlPath: Launchctl(manager), XcrunPath: Xcrun(runtimes, types));
+        string manager = "Aqua", string runtimes = IosRuntimes, string types = IphoneTypes, int xcodeExit = 0) =>
+        new(Swift(swiftExit), Xcodebuild(firstLaunch, license, sdks, xcodeExit), wrapper ?? InstalledWrapper(), LaunchctlPath: Launchctl(manager), XcrunPath: Xcrun(runtimes, types));
 
     /// <summary>Two slots, each its own fake helper and user, each with its own toolchain.</summary>
     private WorkerSlots Pool(SwiftToolchain? first, SwiftToolchain? second)
@@ -96,9 +96,31 @@ public class SwiftToolchainTests
     private string[] HelpersRan => File.Exists(Ran) ? File.ReadAllLines(Ran) : [];
 
     [Fact]
-    public async Task Each_slot_probes_swift_xcodebuild_xcodes_first_launch_and_license_and_the_wrapper_as_its_own_user()
+    public async Task Production_remote_ios_readiness_needs_no_local_simulator_sdk_aqua_runtime_or_device_type()
     {
-        var (first, second) = (Toolchain(), Toolchain());
+        var first = Toolchain(sdks: "macosx", manager: "Background", runtimes: "unavailable", types: "unavailable");
+        var second = Toolchain(sdks: "macosx", manager: "System", runtimes: "unavailable", types: "unavailable");
+        var pool = Pool(first, second);
+
+        await ProbeAsync(pool, 1);
+        await ProbeAsync(pool, 2);
+
+        foreach (var (helper, swift) in new[] { ("_dftest", first), ("_dftest2", second) })
+        {
+            Assert.Contains($"{helper} {swift.SwiftPath} --version", HelpersRan);
+            Assert.Contains($"{helper} {swift.XcodebuildPath} -version", HelpersRan);
+            Assert.Contains($"{helper} {swift.XcodebuildPath} -checkFirstLaunchStatus", HelpersRan);
+            Assert.Contains($"{helper} {swift.XcodebuildPath} -license check", HelpersRan);
+            Assert.Contains($"{helper} {swift.XcodebuildPath} -showsdks", HelpersRan);
+            Assert.Contains($"{helper} {swift.WrapperPath}", HelpersRan);
+            Assert.DoesNotContain(HelpersRan, l => l.Contains(swift.LaunchctlPath, StringComparison.Ordinal) || l.Contains(swift.XcrunPath, StringComparison.Ordinal));
+        }
+    }
+
+    [Fact]
+    public async Task Explicit_local_simulator_execution_probes_each_slots_swift_xcode_license_wrapper_and_simulator_prerequisites()
+    {
+        var (first, second) = (Toolchain() with { LocalIosSimulator = true }, Toolchain() with { LocalIosSimulator = true });
         var pool = Pool(first, second);
 
         await ProbeAsync(pool, 1);
@@ -142,9 +164,28 @@ public class SwiftToolchainTests
     [Theory]
     [MemberData(nameof(SecondSlotFailures))]
     public async Task A_slot_whose_swift_toolchain_is_not_usable_fails_the_factory_naming_the_slot_its_user_and_the_fix(string what, string why)
+        => await AssertToolchainFailsAsync(what, why, local: true);
+
+    public static TheoryData<string, string> RemoteSlotFailures => new()
+    {
+        { "xcode", "Xcode's xcodebuild is not usable" },
+        { "first-launch", "Xcode's first launch has not been completed" },
+        { "license", "Xcode's license has not been accepted" },
+        { "swift", "--version` as _dftest2 exited 127" },
+        { "no-sdks", "lists no macOS SDK (-sdk macosx…)" },
+        { "wrapper", "the xcodebuild wrapper" },
+    };
+
+    [Theory]
+    [MemberData(nameof(RemoteSlotFailures))]
+    public async Task Remote_ios_readiness_still_requires_local_swift_xcode_license_macos_sdk_and_wrapper(string what, string why)
+        => await AssertToolchainFailsAsync(what, why, local: false);
+
+    private async Task AssertToolchainFailsAsync(string what, string why, bool local)
     {
         var second = what switch
         {
+            "xcode" => Toolchain(xcodeExit: 127),
             "first-launch" => Toolchain(firstLaunch: 69),
             "license" => Toolchain(license: 69),
             "swift" => Toolchain(swiftExit: 127),
@@ -158,6 +199,7 @@ public class SwiftToolchainTests
             // Installed, current by its text (so start-up passes), but not runnable as the user.
             _ => Toolchain() with { WrapperPath = Path.Combine(_dir, "not-executable") },
         };
+        second = second with { LocalIosSimulator = local };
         if (what == "wrapper")
         {
             File.WriteAllText(second.WrapperPath, File.ReadAllText(Path.Combine(SandboxSupport.RepoRoot, "scripts", "factory-xcodebuild")));
@@ -175,7 +217,7 @@ public class SwiftToolchainTests
             Assert.DoesNotContain(HelpersRan, l => l.StartsWith("_dftest2 ", StringComparison.Ordinal) && l.Contains("simctl", StringComparison.Ordinal));
         }
         Assert.Contains(what == "not-aqua"
-            ? "run the factory inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or as a LaunchDaemon — CLAUDE.md, \"iOS simulator and UI tests as a sandbox user\""
+            ? "Production workers are headless and must not borrow the owner's session; use the sealed remote iOS executor."
             : "sudo scripts/setup-worker-user.sh --slots 2 --swift", ex.Message);
     }
 

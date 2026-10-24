@@ -20,13 +20,15 @@ namespace DarkFactory.Orchestrator.Worker;
 /// <param name="XcodebuildPath">xcodebuild as the probe runs it (the system shim; the wrapper runs the same path).</param>
 /// <param name="WrapperPath">The installed wrapper: what the worker's allow rule names.</param>
 /// <param name="WrapperSource">The wrapper as <c>scripts/factory-xcodebuild</c> has it, which the installed one must equal; null is the copy compiled into this assembly.</param>
+/// <param name="LocalIosSimulator">Explicit local simulator execution only. Production dispatches iOS gate tests remotely and leaves this false.</param>
 public sealed record SwiftToolchain(
     string SwiftPath = SwiftToolchain.DefaultSwiftPath,
     string XcodebuildPath = SwiftToolchain.DefaultXcodebuildPath,
     string WrapperPath = SwiftToolchain.DefaultWrapperPath,
     string? WrapperSource = null,
     string LaunchctlPath = SwiftToolchain.DefaultLaunchctlPath,
-    string XcrunPath = SwiftToolchain.DefaultXcrunPath)
+    string XcrunPath = SwiftToolchain.DefaultXcrunPath,
+    bool LocalIosSimulator = false)
 {
     /// <summary>xcrun, through which the probe lists the user's simulator runtimes and device types (<c>xcrun simctl list … -j</c>; sc-26134).</summary>
     public const string DefaultXcrunPath = "/usr/bin/xcrun";
@@ -114,16 +116,11 @@ public sealed record SwiftToolchain(
     /// <summary>
     /// The probe of one sandbox user (<paramref name="user"/>), each command run as that user through <paramref name="run"/> (its
     /// launch helper, under its slot's lock): Swift answers, xcodebuild answers, Xcode's first launch is done
-    /// (<c>xcodebuild -checkFirstLaunchStatus</c>), its license is accepted (<c>xcodebuild -license check</c>), the SDKs of every
-    /// platform the factory builds for are installed (<c>xcodebuild -showsdks</c>, <see cref="RequiredSdks"/>; it lists the SDKs and
-    /// starts no simulator), and the wrapper runs
-    /// as that user (with no arguments it prints its usage and exits 64, running nothing); and (sc-26132, S0's requirement (1)) that
-    /// the user's processes are in a GUI login session — <c>launchctl managername</c> as that user answers <c>Aqua</c> — since the
-    /// gate's iOS checks run a simulator, which boots, and XCUITest drives, only there: refused here, factory-wide and naming the
-    /// slot's user, rather than every iOS item escalating one by one; then (sc-26134), after that session check since
-    /// CoreSimulator answers a user only in one, that the user can make an iPhone simulator, booting nothing:
-    /// <c>xcrun simctl list runtimes -j</c> lists an available iOS runtime and <c>xcrun simctl list devicetypes -j</c> an iPhone
-    /// device type (<see cref="SimulatorProblem"/>). The first that fails throws, naming the user, the command and the fix.
+    /// (<c>xcodebuild -checkFirstLaunchStatus</c>), its license is accepted (<c>xcodebuild -license check</c>), the local SDKs
+    /// are installed (<c>xcodebuild -showsdks</c>, <see cref="RequiredSdks"/>), and the wrapper runs as that user.
+    /// Production dispatches iOS gate tests remotely, so it needs neither an iOS Simulator SDK nor an Aqua session or local
+    /// CoreSimulator. An explicit <see cref="LocalIosSimulator"/> toolchain additionally requires all three: local execution
+    /// must still fail closed when its simulator prerequisites are absent. The probe boots no simulator.
     /// </summary>
     public async Task EnsureUsableAsync(
         string user, string reinstall, Func<string, string[], Task<(int ExitCode, string Stdout, string Stderr)>> run)
@@ -133,7 +130,7 @@ public sealed record SwiftToolchain(
         await Expect(XcodebuildPath, ["-checkFirstLaunchStatus"], "Xcode's first launch has not been completed; run `sudo xcodebuild -runFirstLaunch`");
         await Expect(XcodebuildPath, ["-license", "check"], "Xcode's license has not been accepted; run `sudo xcodebuild -license accept`");
         var sdks = await Expect(XcodebuildPath, ["-showsdks"], "Xcode's SDKs cannot be listed; reinstall Xcode");
-        if (RequiredSdks.Where(s => !sdks.Contains("-sdk " + s.Sdk, StringComparison.Ordinal)).ToList() is { Count: > 0 } missing)
+        if ((LocalIosSimulator ? RequiredSdks.Concat(LocalSimulatorSdks) : RequiredSdks).Where(s => !sdks.Contains("-sdk " + s.Sdk, StringComparison.Ordinal)).ToList() is { Count: > 0 } missing)
         {
             throw new InvalidOperationException(
                 $"Swift toolchain (Worker:Swift) of {user}: `{XcodebuildPath} -showsdks` as {user} lists no "
@@ -141,24 +138,26 @@ public sealed record SwiftToolchain(
                 + ": install " + string.Join(" and ", missing.Select(s => s.Fix))
                 + $", then re-run `{reinstall} --swift` to check it.");
         }
-        var manager = await run(LaunchctlPath, ["managername"]);
-        if (manager.ExitCode != 0 || manager.Stdout.Trim() != "Aqua")
+        if (LocalIosSimulator)
         {
-            throw new InvalidOperationException(
-                $"Swift toolchain (Worker:Swift) of {user}: `{LaunchctlPath} managername` as {user} answers "
-                + $"'{Clip(manager.ExitCode == 0 ? manager.Stdout : $"exit {manager.ExitCode}: {manager.Stderr}")}', not 'Aqua', so the gate's iOS "
-                + "simulator checks cannot run as it (a simulator boots, and XCUITest drives it, only in a GUI login session): run the factory "
-                + "inside the owner's GUI login session (a Terminal or a LaunchAgent of the owner logged in at the console), not from ssh or "
-                + "as a LaunchDaemon — CLAUDE.md, \"iOS simulator and UI tests as a sandbox user\".");
-        }
-        foreach (var (what, args) in new[] { ("runtimes", new[] { "simctl", "list", "runtimes", "-j" }), ("devicetypes", new[] { "simctl", "list", "devicetypes", "-j" }) })
-        {
-            var listed = await run(XcrunPath, args);
-            if (SimulatorProblem(what, listed.ExitCode, listed.Stdout, listed.Stderr) is { } problem)
+            var manager = await run(LaunchctlPath, ["managername"]);
+            if (manager.ExitCode != 0 || manager.Stdout.Trim() != "Aqua")
             {
                 throw new InvalidOperationException(
-                    $"Swift toolchain (Worker:Swift) of {user}: `{XcrunPath} {string.Join(' ', args)}` as {user} {problem}, so the gate's iOS simulator "
-                    + $"checks cannot run as it: install an iOS simulator runtime (`sudo xcodebuild -downloadPlatform iOS`), then re-run `{reinstall} --swift` to check it.");
+                    $"Swift toolchain (Worker:Swift) of {user}: `{LaunchctlPath} managername` as {user} answers "
+                    + $"'{Clip(manager.ExitCode == 0 ? manager.Stdout : $"exit {manager.ExitCode}: {manager.Stderr}")}', not 'Aqua', so the gate's iOS "
+                    + "simulator checks cannot run as it: this explicit local simulator execution needs a GUI session. "
+                    + "Production workers are headless and must not borrow the owner's session; use the sealed remote iOS executor.");
+            }
+            foreach (var (what, args) in new[] { ("runtimes", new[] { "simctl", "list", "runtimes", "-j" }), ("devicetypes", new[] { "simctl", "list", "devicetypes", "-j" }) })
+            {
+                var listed = await run(XcrunPath, args);
+                if (SimulatorProblem(what, listed.ExitCode, listed.Stdout, listed.Stderr) is { } problem)
+                {
+                    throw new InvalidOperationException(
+                        $"Swift toolchain (Worker:Swift) of {user}: `{XcrunPath} {string.Join(' ', args)}` as {user} {problem}, so the gate's iOS simulator "
+                        + $"checks cannot run as it: install an iOS simulator runtime (`sudo xcodebuild -downloadPlatform iOS`), then re-run `{reinstall} --swift` to check it.");
+                }
             }
         }
         var wrapper = await run(WrapperPath, []);
@@ -183,12 +182,17 @@ public sealed record SwiftToolchain(
     }
 
     /// <summary>
-    /// The SDKs a Swift factory builds with (Phase 5: macOS apps, and iOS apps on the simulator), each as <c>xcodebuild -showsdks</c>
+    /// The SDKs every Swift factory needs locally, each as <c>xcodebuild -showsdks</c>
     /// names it after <c>-sdk</c> (a version follows), and how to install it. The same list as <c>setup-worker-user.sh</c>'s.
     /// </summary>
     public static readonly IReadOnlyList<(string Platform, string Sdk, string Fix)> RequiredSdks =
     [
         ("macOS", "macosx", "Xcode (its macOS SDK ships with it)"),
+    ];
+
+    /// <summary>Additional SDKs required only for explicitly local iOS simulator execution, never for remote dispatch.</summary>
+    public static readonly IReadOnlyList<(string Platform, string Sdk, string Fix)> LocalSimulatorSdks =
+    [
         ("iOS Simulator", "iphonesimulator", "the iOS platform (`sudo xcodebuild -downloadPlatform iOS`)"),
     ];
 

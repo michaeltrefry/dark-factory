@@ -14,9 +14,9 @@
 #
 # --swift (sc-26130; for a factory with Worker:Swift=true, which works Swift/Xcode repositories): makes the Swift toolchain
 # check below required for every slot's user - swift, xcodebuild, Xcode's first launch done and its license accepted, and
-# the macOS and iOS Simulator SDKs listed by `xcodebuild -showsdks`, and (sc-26134) a GUI login session (`launchctl
-# managername` is Aqua) in which `xcrun simctl list runtimes -j` lists an available iOS runtime and `xcrun simctl list
-# devicetypes -j` an iPhone device type (no simulator is booted), each run as that user through its own helper; every slot is checked, then the users that failed are named and it exits 1.
+# the macOS SDK listed by `xcodebuild -showsdks`, each run as that user through its own helper.
+# iOS gate tests execute remotely: no local iOS Simulator SDK, Aqua login, runtime or device type is required.
+# Every slot is checked, then the users that failed are named and it exits 1.
 # Without it the same check only reports (a .NET/Rust-only factory needs no Xcode), and is skipped when no Xcode is
 # selected (`xcode-select -p` fails). The xcodebuild wrapper is installed either way.
 #
@@ -40,8 +40,8 @@
 # Creates a hidden role account per slot (default _factory, _factory2, …) whose workers:
 #   - cannot traverse the owner's home (so no ~/.ssh, ~/.config/gh or login keychain),
 #   - get dotnet, git and their own Claude Code install,
-#   - run only through their own root-owned launch helper, which the owner may start as that
-#     worker user without a password (one sudoers.d rule per slot, nothing else).
+#   - run only through their own root-owned launch helper, which the owner may start as root; it adopts the own non-GUI user domain
+#     and drops to that worker before reading stdin or starting a program (one sudoers.d rule per slot, nothing else).
 # The work root (clones + worktrees) is owned by the owner under a root-owned parent and is
 # readable by every worker user; the orchestrator grants write access per worktree, to one slot's user.
 # Re-running it changes nothing that is already in place.
@@ -154,7 +154,7 @@ if [ "$remove_worker_login" -eq 1 ]; then
     exit 0
 fi
 
-[ -n "$owner" ] && [ "$owner" != root ] || { echo "Pass --owner <your user> (or run via sudo from your account)." >&2; exit 64; }
+[[ $owner =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*$ ]] && [ "$owner" != root ] || { echo "Pass --owner <your user> (or run via sudo from your account)." >&2; exit 64; }
 id "$owner" >/dev/null 2>&1 || { echo "No such owner user: $owner" >&2; exit 1; }
 owner_home=$(dscl . -read "/Users/$owner" NFSHomeDirectory | awk '{print $2}')
 case "$work_root/" in
@@ -374,6 +374,34 @@ for slot in $(seq 1 "$slots"); do
     set_acl "user:$worker allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit" "$work_root"
 done
 
+root_acl_trusted() {
+    local listing
+    listing=$(ls -lde "$1") || return 1
+    printf '%s\n' "$listing" | /usr/bin/awk '
+        NR == 1 { if ($0 !~ /^[-d]rwxr-xr-x[+@ ]/) exit 1; next }
+        {
+            if ($0 !~ /^[ \t]*[0-9]+: (user|group):[^ \t]+ (inherited )?(allow|deny) /) exit 1
+            sub(/^[ \t]*[0-9]+: /, "")
+            principal = $1; $1 = ""; sub(/^[ \t]+/, "")
+            sub(/^inherited /, "")
+            if ($1 == "deny" || principal == "user:root") next
+            $1 = ""; gsub(/[ \t]/, "")
+            n = split($0, rights, ",")
+            for (i = 1; i <= n; i++)
+                if (rights[i] !~ /^(read|list|search|execute|readattr|readextattr|readsecurity|file_inherit|directory_inherit|only_inherit|limit_inherit|inherited)$/) exit 1
+        }
+        END { if (NR == 0) exit 1 }'
+}
+
+# Root will execute this file, not merely drop uid. Every existing path component must
+# be trusted BEFORE any install (never repair/chmod through an attacker-owned path).
+trusted_launcher_path() {
+    [ ! -L "$1" ] && [ "$(stat -f '%u:%Lp' "$1")" = '0:755' ] && root_acl_trusted "$1" \
+        || { echo "untrusted launch helper path: $1 (root-owned 0755, no links or writable non-root ACLs required)" >&2; exit 1; }
+}
+for trusted in / /usr /usr/local /usr/local/libexec "$helper_dir"; do
+    if [ -e "$trusted" ] || [ -L "$trusted" ]; then trusted_launcher_path "$trusted"; fi
+done
 # --- 4. Launch helpers (root-owned, one per slot) and one sudoers rule each ------------
 install -d -o root -g wheel -m 0755 "$helper_dir"
 rule=$(mktemp)
@@ -382,21 +410,26 @@ for slot in $(seq 1 "$slots"); do
     uid=${uids[$((slot - 1))]}
     say "Installing $helper"
     # The helper kills every process of sandbox_user when a run ends, so each copy must name its own worker and
-    # pin its uid. The orchestrator compares each installed file with the repo's after these same two edits.
+    # pin its uid and invoking owner. The orchestrator normalizes those pins before comparing the whole file.
+    if [ -e "$helper" ] || [ -L "$helper" ]; then trusted_launcher_path "$helper"; fi
     helper_src=$(mktemp)
     sed -e "s/^sandbox_user=.*/sandbox_user=$worker/" -e "s/^sandbox_uid=.*/sandbox_uid=$uid/" \
+        -e "s/^sandbox_owner=.*/sandbox_owner=$owner/" \
         "$script_dir/factory-worker-launch" >"$helper_src"
     grep -qx "sandbox_user=$worker" "$helper_src" || { echo "Could not set sandbox_user in the helper." >&2; exit 1; }
     grep -qx "sandbox_uid=$uid" "$helper_src" || { echo "Could not set sandbox_uid in the helper." >&2; exit 1; }
+    grep -qx "sandbox_owner=$owner" "$helper_src" || { echo "Could not pin installing owner in the helper." >&2; exit 1; }
     install -o root -g wheel -m 0755 "$helper_src" "$helper"
+    trusted_launcher_path "$helper"
     rm -f "$helper_src"
-    # One rule per slot: this helper, as this worker only (never another slot's helper as this user).
+    # One narrow rule per slot: only this fixed pinned trampoline as root, never arbitrary sudo.
     cat >>"$rule" <<EOF
-# Dark Factory: $owner may run only the worker launch helper $helper, only as $worker.
+# Dark Factory: $owner may run only the worker launch helper $helper, only as root (drops to $worker).
 Defaults!$helper !use_pty, !log_output
-$owner ALL=($worker) NOPASSWD: $helper
+$owner ALL=(root) NOPASSWD: $helper
 EOF
 done
+for trusted in / /usr /usr/local /usr/local/libexec "$helper_dir"; do trusted_launcher_path "$trusted"; done
 visudo -cqf "$rule"
 install -o root -g wheel -m 0440 "$rule" "$sudoers"
 rm -f "$rule"
@@ -472,7 +505,7 @@ check_toolchain() {
     local tool out status failed=0
     for tool in "$@"; do
         # shellcheck disable=SC2086 # tool is a command line
-        if out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" $tool 2>&1); then
+        if out=$(with_open_stdin sudo -u "$owner" sudo -n -u root "$helper" $tool 2>&1); then
             echo "    ok    $tool: $out"
         else
             status=$?
@@ -504,7 +537,7 @@ check_optional_toolchain() {
     shift
     for tool in "$@"; do
         # shellcheck disable=SC2086 # tool is a command line
-        if out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" $tool 2>&1); then
+        if out=$(with_open_stdin sudo -u "$owner" sudo -n -u root "$helper" $tool 2>&1); then
             echo "    ok    $tool: $out"
         else
             status=$?
@@ -515,73 +548,24 @@ check_optional_toolchain() {
 }
 
 swift_tools=("/usr/bin/swift --version" "/usr/bin/xcodebuild -version" "/usr/bin/xcodebuild -checkFirstLaunchStatus" "/usr/bin/xcodebuild -license check")
-# The SDKs a Swift factory builds with (SwiftToolchain.RequiredSdks): macOS apps, and iOS apps on the simulator.
-swift_sdks="macosx iphonesimulator"
+# The local SDKs a Swift factory needs (SwiftToolchain.RequiredSdks); iOS gate tests execute remotely.
+swift_sdks="macosx"
 
 # check_swift_sdks - `xcodebuild -showsdks` as the worker through the helper must list every SDK of $swift_sdks.
-# It lists SDKs and starts no simulator (CoreSimulator: check_swift_simulator). Returns 1 naming each one missing.
+# It lists SDKs and starts no simulator. Returns 1 naming each one missing.
 check_swift_sdks() {
     local out sdk missing=0
-    if ! out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" /usr/bin/xcodebuild -showsdks 2>&1); then
+    if ! out=$(with_open_stdin sudo -u "$owner" sudo -n -u root "$helper" /usr/bin/xcodebuild -showsdks 2>&1); then
         echo "    FAIL  /usr/bin/xcodebuild -showsdks: $out" >&2
         return 1
     fi
     for sdk in $swift_sdks; do
         case "$out" in
             *"-sdk $sdk"*) echo "    ok    SDK $sdk" ;;
-            *) echo "    FAIL  /usr/bin/xcodebuild -showsdks lists no $sdk SDK (iphonesimulator: sudo xcodebuild -downloadPlatform iOS)" >&2; missing=1 ;;
+            *) echo "    FAIL  /usr/bin/xcodebuild -showsdks lists no $sdk SDK (install Xcode and select it with sudo xcode-select -s /Applications/Xcode.app)" >&2; missing=1 ;;
         esac
     done
     [ "$missing" -eq 0 ]
-}
-
-# simctl_lists <runtimes|devicetypes> - reads `xcrun simctl list <what> -j` on stdin; succeeds when it lists an available iOS
-# runtime (a runtime object with "platform": "iOS" and "isAvailable": true) or an iPhone device type ("productFamily":
-# "iPhone"). Only each list entry's own fields count (brace depth 2), not those of the objects nested in it.
-simctl_lists() {
-    awk -v what="$1" '
-        { text = text $0 " " }
-        END {
-            depth = 0; entry = ""; found = 0
-            for (i = 1; i <= length(text); i++) {
-                c = substr(text, i, 1)
-                if (c == "{") { depth++; if (depth == 2) entry = ""; continue }
-                if (c == "}") {
-                    if (depth == 2) {
-                        if (what == "runtimes") { if (entry ~ /"platform"[ ]*:[ ]*"iOS"/ && entry ~ /"isAvailable"[ ]*:[ ]*true/) found = 1 }
-                        else if (entry ~ /"productFamily"[ ]*:[ ]*"iPhone"/) found = 1
-                    }
-                    depth--
-                    continue
-                }
-                if (depth == 2) entry = entry c
-            }
-            exit found ? 0 : 1
-        }'
-}
-
-# check_swift_simulator - as the worker through the helper, booting nothing (sc-26134): its processes are in a GUI (Aqua) login
-# session (`launchctl managername`), and only then - CoreSimulator answers a user only in one - `xcrun simctl list runtimes -j`
-# lists an available iOS runtime and `xcrun simctl list devicetypes -j` an iPhone device type. Returns 1 naming what failed.
-check_swift_simulator() {
-    local out what
-    out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" /bin/launchctl managername 2>&1)
-    if [ "$out" != Aqua ]; then
-        echo "    FAIL  /bin/launchctl managername is '$out', not 'Aqua': run this script from the owner's GUI login session (a Terminal at the console), not over ssh" >&2
-        return 1
-    fi
-    echo "    ok    /bin/launchctl managername: Aqua"
-    for what in runtimes devicetypes; do
-        if ! out=$(with_open_stdin sudo -u "$owner" sudo -n -u "$worker" "$helper" /usr/bin/xcrun simctl list "$what" -j 2>&1); then
-            echo "    FAIL  /usr/bin/xcrun simctl list $what -j: $out" >&2
-            return 1
-        fi
-        if ! printf '%s\n' "$out" | simctl_lists "$what"; then
-            echo "    FAIL  /usr/bin/xcrun simctl list $what -j lists no $([ "$what" = runtimes ] && echo 'available iOS simulator runtime' || echo 'iPhone simulator device type') (sudo xcodebuild -downloadPlatform iOS)" >&2
-            return 1
-        fi
-        echo "    ok    /usr/bin/xcrun simctl list $what -j"
-    done
 }
 
 # --swift: the slots whose Swift toolchain failed, collected across every slot and named at the end.
@@ -608,7 +592,7 @@ for slot in $(seq 1 "$slots"); do
     # under its own home.
     if [ "$swift" -eq 1 ]; then
         say "Checking the Swift toolchain as $worker through the helper (--swift: required)"
-        if ! check_toolchain "${swift_tools[@]}" || ! check_swift_sdks || ! check_swift_simulator; then
+        if ! check_toolchain "${swift_tools[@]}" || ! check_swift_sdks; then
             swift_failed_users="$swift_failed_users $worker (worker slot $slot);"
         fi
     elif ! xcode-select -p >/dev/null 2>&1; then
@@ -628,9 +612,7 @@ which Worker:Swift=true needs (each FAIL line above names the command). By comma
   swift / xcodebuild -version: install Xcode and select it (sudo xcode-select -s /Applications/Xcode.app).
   xcodebuild -checkFirstLaunchStatus: sudo xcodebuild -runFirstLaunch
   xcodebuild -license check: sudo xcodebuild -license accept
-  xcodebuild -showsdks without iphonesimulator: sudo xcodebuild -downloadPlatform iOS
-  launchctl managername not Aqua: run this script from the owner's GUI login session (a Terminal at the console)
-  xcrun simctl list without an available iOS runtime or an iPhone device type: sudo xcodebuild -downloadPlatform iOS
+  xcodebuild -showsdks without macosx: install Xcode and select it (sudo xcode-select -s /Applications/Xcode.app).
 Then re-run this script with --swift (or set Worker:Swift=false if the factory works no Swift repository).
 EOF
     exit 1

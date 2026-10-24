@@ -213,7 +213,7 @@ public class SlotPoolTests
         var sudo = SandboxSupport.FakeSudo(_root);
         return new WorkerSlots([.. Enumerable.Range(1, count).Select(n => new WorkerSlot(n, new WorkerSandbox(TestSlots.Pool(_root, count).All[n - 1].User,
             SandboxSupport.Executable(_root, $"fake-helper-{n}.sh",
-                $"#!/bin/sh\nwhile IFS= read -r line; do [ -z \"$line\" ] && break; done\necho {n} >> '{Ran}'\nexec \"$@\"\n"), sudo)
+                $"#!/bin/sh\n{SandboxSupport.ProtocolPrelude}while IFS= read -r line; do [ -z \"$line\" ] && break; done\necho {n} >> '{Ran}'\nexec \"$@\"\n"), sudo)
         { Lock = WorkerLock.For(_root, n) }))])
         {
             ListAcl = (path, _) => Task.FromResult(listing(path)),
@@ -567,7 +567,7 @@ public class SlotPoolTests
     public static TheoryData<string, string> BadSecondHelpers => new()
     {
         { "missing", "cannot read the launch helper" },
-        { "stale", "its helper_version 3 is older than 5" },
+        { "stale", "its helper_version 3 is older than 6" },
         { "edited", "its text differs from the repo helper" },
         { "other-user", "its sandbox_user is not _dftest2" }, // slot 1's helper copied over slot 2's: pinned to another user
         { "unpinned", "it has no pinned sandbox_uid" },
@@ -619,7 +619,7 @@ public class SlotPoolTests
         // Slot 1's helper answers as its user; slot 2's answers as someone else (its sudoers rule or its pin is wrong).
         var sudo = SandboxSupport.FakeSudo(_root);
         var repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=" + WorkerSandbox.HelperVersion
-            + "\nwhile IFS= read -r line; do [ -z \"$line\" ] && break; done\necho \"$0\" >> '" + Ran + "'\n"
+            + "\n" + SandboxSupport.ProtocolPrelude + "while IFS= read -r line; do [ -z \"$line\" ] && break; done\necho \"$0\" >> '" + Ran + "'\n"
             + "case \"$1\" in /usr/bin/id) echo \"${0##*/}\" ;; *) exec \"$@\" ;; esac\n";
         var first = SandboxSupport.Executable(_root, "_dftest", InstalledFor("_dftest", "450", repo));
         var second = SandboxSupport.Executable(_root, "someone-else", InstalledFor("_dftest2", "451", repo));
