@@ -15,7 +15,7 @@ namespace DarkFactory.Orchestrator.Tests;
 /// in its namespace) proves this lookup gave the worker nothing; a lookup that succeeds proves nothing about the receiver —
 /// GUI and user domains share one flat lookup namespace — and the send right is released without a single message having
 /// been sent, recorded as "succeeded, receiver identity unverified". Whether that satisfies "cannot obtain" is the
-/// owner's decision, recorded with the verbatim output; the probe never claims it.
+/// owner's decision on the evidence, never an automatic pass: an unidentified successful lookup is INCONCLUSIVE.
 /// </para>
 /// </summary>
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
@@ -112,6 +112,26 @@ internal static class MachLookupProbe
             Assert.Equal(outcome.LookedUp, released.Contains(outcome.Service));
         }
         return outcomes.Select(o => released.Contains(o.Service) ? o with { ReleasedWithoutSend = true } : o).ToList();
+    }
+
+    /// <summary>Collection is not acceptance: unknown receivers and a missing owner baseline are INCONCLUSIVE.</summary>
+    public static string? AcceptanceProblem(IReadOnlyList<Outcome> owner, IReadOnlyList<IReadOnlyList<Outcome>> workers)
+    {
+        bool Complete(IReadOnlyList<Outcome> rows) => rows.Count == Services.Length
+            && rows.Select(o => o.Service).Order().SequenceEqual(Services.Order());
+        if (!Complete(owner) || owner.Any(o => o.Uid <= 0 || !o.LookedUp || !o.ReleasedWithoutSend)
+            || owner.Select(o => o.Uid).Distinct().Count() != 1)
+            return "INCONCLUSIVE AC2: the owner's own session did not successfully resolve every service; no meaningful owner baseline";
+        if (workers.Count == 0) return "INCONCLUSIVE AC2: no worker evidence";
+        foreach (var worker in workers)
+        {
+            if (!Complete(worker) || worker.Any(o => o.Uid <= 0 || o.Uid == owner[0].Uid)
+                || worker.Select(o => o.Uid).Distinct().Count() != 1)
+                return "INCONCLUSIVE AC2: incomplete evidence or worker identity is not different from the owner";
+            if (worker.Any(o => o.LookedUp))
+                return "INCONCLUSIVE AC2: a worker lookup succeeded with an unidentified receiver; release-without-send is not isolation proof";
+        }
+        return null;
     }
 
     private static (string Service, int Uid, int Number)? ParseLine(string line, string middle)

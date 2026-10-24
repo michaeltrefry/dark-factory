@@ -128,6 +128,46 @@ public class SetupScriptTests
         Assert.DoesNotContain(run.Calls, c => Changes(c));
     }
 
+    [Theory]
+    [InlineData("/", "writeattr")]
+    [InlineData("/usr", "chown")]
+    [InlineData("/usr/local", "writesecurity")]
+    [InlineData("/usr/local/libexec", "unknown_right")]
+    [InlineData(SafeHelper.RootHelperDirectory, "add_file,delete_child")]
+    [InlineData(WholeScriptRun.HelperPath, "write")]
+    [InlineData(WholeScriptRun.HelperPath + "-8", "delete")]
+    [InlineData("/usr/local/libexec/dark-factory/factory-xcodebuild", "append")]
+    [InlineData("/usr/local/libexec/dark-factory/factory-prepare", "writeextattr")]
+    public async Task Setup_refuses_nonroot_acl_mutation_before_any_install_or_account_change(string path, string rights)
+    {
+        var run = new WholeScriptRun(_dir, aclPath: path, aclRights: rights);
+        var (code, output) = await run.RunAsync();
+        Assert.Multiple(
+            () => Assert.Equal(1, code),
+            () => Assert.Contains("Session trampoline parent " + path, output),
+            () => Assert.DoesNotContain(run.Calls, Changes));
+    }
+
+    [Fact]
+    public async Task Setup_refuses_unreadable_trusted_acl_before_any_change()
+    {
+        var run = new WholeScriptRun(_dir, aclPath: "/usr", aclUnreadable: true);
+        var (code, _) = await run.RunAsync();
+        Assert.Multiple(
+            () => Assert.Equal(1, code),
+            () => Assert.DoesNotContain(run.Calls, Changes));
+    }
+
+    [Fact]
+    public async Task Setup_accepts_only_readonly_nonroot_acl_rights_on_trusted_paths()
+    {
+        var run = new WholeScriptRun(_dir, aclPath: "/usr", aclRights: "read,execute,readattr,readextattr,readsecurity");
+        var (code, output) = await run.RunAsync();
+        Assert.Multiple(
+            () => Assert.True(code == 0, output),
+            () => Assert.Contains(run.Calls, c => c.StartsWith("install ", StringComparison.Ordinal)));
+    }
+
     // ---- Worker slots (sc-25989): --slots <n> sets up n users, each with a helper copy pinned to itself ----
 
     [Fact]
@@ -747,7 +787,8 @@ public class SetupScriptTests
         /// <param name="writablePath">A path the fake <c>stat -f %Lp</c> gives mode 775 (every other: 755).</param>
         public WholeScriptRun(string dir, string uid = "450", string secondUid = "451", string? swiftFailsFor = null,
             string? sdksMissingFor = null, bool xcodeSelected = true, string? notAquaFor = null, string? noRuntimeFor = null, string? noIphoneFor = null,
-            string existingHome = "/Users/_dftest", string? homeVolume = null, string? writablePath = null)
+            string existingHome = "/Users/_dftest", string? homeVolume = null, string? writablePath = null,
+            string? aclPath = null, string aclRights = "writesecurity", bool aclUnreadable = false)
         {
             _dir = dir;
             InstalledHelper = Path.Combine(dir, "installed-helper");
@@ -828,6 +869,14 @@ public class SetupScriptTests
                     %Lp) [ "$3" = '{{writablePath ?? "/nonexistent"}}' ] && echo 775 || echo 755 ;;
                     *) echo root ;;
                 esac
+                """);
+            SandboxSupport.Executable(bin, "ls", $$"""
+                #!/bin/sh
+                echo "ls $*" >>'{{_log}}'
+                printf 'drwxr-xr-x+ 2 root wheel 64 Jan 1 00:00 %s\n' "$2"
+                if [ "$2" = '{{aclPath}}' ]; then
+                    {{(aclUnreadable ? "exit 1" : $"printf '%s\\n' ' 0: user:outsider allow {aclRights}'")}}
+                fi
                 """);
             SandboxSupport.Executable(bin, "diskutil", $$"""
                 #!/bin/sh
@@ -930,13 +979,19 @@ public class SetupScriptTests
 
         public async Task<(int ExitCode, string Output)> RunAsync(params string[] flags)
         {
-            var script = Path.Combine(SandboxSupport.RepoRoot, "scripts", "setup-worker-user.sh");
+            var source = Path.Combine(SandboxSupport.RepoRoot, "scripts", "setup-worker-user.sh");
+            // The fake filesystem has every trusted executable already installed, independent of this host.
+            // All metadata commands are fakes; this does not run a privileged command or installed helper.
+            var script = Path.Combine(_dir, "setup-copy");
+            File.WriteAllText(script, File.ReadAllText(source)
+                .Replace("[ -e \"$trusted\" ] || [ -L \"$trusted\" ]", "true")
+                .Replace("script_dir=$(cd \"$(dirname \"$0\")\" && pwd)", $"script_dir='{Path.GetDirectoryName(source)}'"));
             var bin = Path.Combine(_dir, "bin");
             var args = string.Join(' ', flags.Select(f => $"'{f}'"));
             // Refuse to run unless every privileged command resolves to its fake.
             var (exitCode, stdout, stderr) = await BashAsync(_dir, $$"""
                 export PATH='{{bin}}':/usr/bin:/bin
-                for c in sudo id uname dscl chown chmod install visudo mkdir stat diskutil security pkill killall pgrep rm xcode-select; do
+                for c in sudo id uname dscl chown chmod install visudo mkdir stat ls diskutil security pkill killall pgrep rm xcode-select; do
                     [ "$(command -v "$c")" = '{{bin}}'/"$c" ] || { echo "fake $c not first on PATH" >&2; exit 99; }
                 done
                 /bin/bash '{{script}}' --owner owner --worker _dftest --work-root '{{_dir}}/work/root' {{args}} 2>&1

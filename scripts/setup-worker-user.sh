@@ -159,10 +159,33 @@ fi
 id "$owner" >/dev/null 2>&1 || { echo "No such owner user: $owner" >&2; exit 1; }
 # A root sudoers entry must never resolve through an owner/worker-writable ancestor. Refuse
 # unsafe existing parents rather than silently changing system directory permissions.
-for trusted in /usr/local /usr/local/libexec "$helper_dir"; do
+# Mode bits alone do not prove trust: ACL security/ownership rights can grant write access.
+# Unknown ACL syntax and non-root rights fail closed, including inheritance-only entries.
+root_acl_trusted() {
+    local listing
+    listing=$(ls -lde "$1") || return 1
+    printf '%s\n' "$listing" | awk '
+        NR == 1 { if ($0 !~ /^[-d]rwxr-xr-x[+@ ]/) exit 1; next }
+        {
+            if ($0 !~ /^[ \t]*[0-9]+: (user|group):[^ \t]+ (inherited )?(allow|deny) /) exit 1
+            sub(/^[ \t]*[0-9]+: /, "")
+            principal = $1; $1 = ""; sub(/^[ \t]+/, "")
+            sub(/^inherited /, "")
+            if ($1 == "deny" || principal == "user:root") next
+            $1 = ""; gsub(/[ \t]/, "")
+            n = split($0, rights, ",")
+            for (i = 1; i <= n; i++)
+                if (rights[i] !~ /^(read|list|search|execute|readattr|readextattr|readsecurity|file_inherit|directory_inherit|only_inherit|limit_inherit|inherited)$/) exit 1
+        }
+        END { if (NR == 0) exit 1 }'
+}
+for trusted in / /usr /usr/local /usr/local/libexec "$helper_dir" \
+    "$helper" "$helper-2" "$helper-3" "$helper-4" "$helper-5" "$helper-6" "$helper-7" "$helper-8" \
+    "$xcodebuild_wrapper" "$prepare_tool"; do
     if [ -e "$trusted" ] || [ -L "$trusted" ]; then
         [ ! -L "$trusted" ] && [ "$(stat -f %Su "$trusted")" = root ] && [ "$(stat -f %Lp "$trusted")" = 755 ] \
-            || { echo "Session trampoline parent $trusted must be a root-owned 0755 directory without links; nothing was installed." >&2; exit 1; }
+            && root_acl_trusted "$trusted" \
+            || { echo "Session trampoline parent $trusted must be a root-owned 0755 directory without links; nothing was installed. ACLs must grant no non-root mutation rights." >&2; exit 1; }
     fi
 done
 owner_home=$(dscl . -read "/Users/$owner" NFSHomeDirectory | awk '{print $2}')

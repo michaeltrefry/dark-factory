@@ -35,8 +35,19 @@ internal sealed record FakeGuiSession(string ManagerUid = "450", string ManagerN
     public string Listing => Domain ?? "gui/450 = {\n\ttype = login\n\tcreator = loginwindow[400001]\n\tsecurity context = {\n\t\tuid = 450\n\t\tasid = 100004\n\t}\n}\n";
 }
 
+internal sealed record FakeRootTrampoline(string InstalledPath = "/usr/local/libexec/dark-factory/factory-worker-launch",
+    string? UnsafePath = null, string Rights = "writesecurity", string Metadata = "0:755", bool ListingFails = false)
+{
+    public string RealProcesses { get; init; } = "400001 450 450 S";
+    public string EffectiveProcesses { get; init; } = "400001 450 450 S";
+    public bool ProcessReadFails { get; init; }
+}
+
 internal sealed record SafeHelperOptions
 {
+    // Exercises only the privileged prefix with fake identity, stat, ACL listing and a nonprivileged uid-drop recorder.
+    public FakeRootTrampoline? RootTrampoline { get; init; }
+
     /// <summary>Fake launchd metadata only. Never invokes launchctl or adopts a real bootstrap domain.</summary>
     public FakeGuiSession? GuiSession { get; init; }
 
@@ -85,6 +96,8 @@ internal sealed record SafeHelperOptions
 [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
 internal sealed class SafeHelper
 {
+    public const string RootHelperDirectory = "/usr/local/libexec/dark-factory";
+    public const string RootHelperPath = RootHelperDirectory + "/factory-worker-launch";
     /// <summary>The production signal primitive and process listing: both must be present once, and both are replaced.</summary>
     public const string SignalPrimitive = """
         send_signal() {
@@ -336,6 +349,8 @@ internal sealed class SafeHelper
         var copy = source.Replace(SignalPrimitive, seam).Replace(ListPrimitive, listing)
             .Replace("/bin/launchctl", sessionCommand).Replace("/usr/bin/sudo", "/usr/bin/false")
             .Replace("/bin/ps -ww -p \"$protected_creator\" -o uid=,lstart=,comm=", creatorCommand)
+            .Replace("/bin/ps -ww -U \"$sandbox_uid\" -o pid=,uid=,ruid=,stat=", "/usr/bin/false root-real-metadata")
+            .Replace("/bin/ps -ww -u \"$sandbox_uid\" -o pid=,uid=,ruid=,stat=", "/usr/bin/false root-effective-metadata")
             .Replace("$(uname -s)", session is null ? "Linux" : "Darwin");
         if (options.Identity is { } identity)
         {
@@ -351,6 +366,56 @@ internal sealed class SafeHelper
                 .Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={identity.User}\n")
                 .Replace("\nsandbox_uid=\n", $"\nsandbox_uid={identity.PinnedUid}\n")
                 .Replace("\nsandbox_owner=\n", "\nsandbox_owner=df-test-owner\n");
+        }
+        if (options.RootTrampoline is { } root)
+        {
+            Assert.NotNull(options.Identity);
+            Assert.Equal("0", options.Identity.Uid);
+            var dir = System.IO.Path.GetDirectoryName(targets)!;
+            var drop = SandboxSupport.Executable(dir, $"uid-drop-{Guid.NewGuid():N}", """
+                #!/bin/sh
+                [ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = _dftest ] && [ "$4" = -- ] || exit 96
+                shift 4
+                printf 'dropped-to=_dftest\npath=%s\n' "$PATH"
+                printf 'arg=<%s>\n' "$@"
+                IFS= read -r protocol || exit 97
+                printf 'protocol=<%s>\n' "$protocol"
+                exit 77
+                """);
+            var adoption = SandboxSupport.Executable(dir, $"bootstrap-recorder-{Guid.NewGuid():N}", $$"""
+                #!/bin/sh
+                if [ "$1" != asuser ]; then exec '{{sessionCommand}}' "$@"; fi
+                [ "$2" = 450 ] && [ "$3" = '{{drop}}' ] || exit 95
+                shift 3
+                exec '{{drop}}' "$@"
+                """);
+            var processes = SandboxSupport.Executable(dir, $"root-process-metadata-{Guid.NewGuid():N}", $$"""
+                #!/bin/sh
+                {{(root.ProcessReadFails ? "exit 1" : ":")}}
+                case "$1" in
+                    -U) printf '%s\n' '{{root.RealProcesses}}' ;;
+                    -u) printf '%s\n' '{{root.EffectiveProcesses}}' ;;
+                    *) exit 98 ;;
+                esac
+                """);
+            var stat = SandboxSupport.Executable(dir, $"trust-stat-{Guid.NewGuid():N}", $$"""
+                #!/bin/sh
+                [ "$3" = '{{root.UnsafePath}}' ] && echo '{{root.Metadata}}' || echo '0:755'
+                """);
+            var acl = SandboxSupport.Executable(dir, $"trust-acl-{Guid.NewGuid():N}", $$"""
+                #!/bin/sh
+                printf 'drwxr-xr-x+ 2 root wheel 64 Jan 1 00:00 %s\n' "$2"
+                if [ "$2" = '{{root.UnsafePath}}' ]; then
+                    {{(root.ListingFails ? "exit 1" : $"printf '%s\\n' ' 0: user:outsider allow {root.Rights}'")}}
+                fi
+                """);
+            copy = copy.Replace(sessionCommand, adoption)
+                .Replace("/usr/bin/false root-real-metadata", processes + " -U")
+                .Replace("/usr/bin/false root-effective-metadata", processes + " -u")
+                .Replace("/usr/bin/false", drop)
+                .Replace("/usr/bin/stat", stat).Replace("/bin/ls -lde", acl + " -lde")
+                .Replace("case \"$0\" in", "case \"" + root.InstalledPath + "\" in")
+                .Replace("dark-factory \"$0\"; do", "dark-factory '" + root.InstalledPath + "'; do");
         }
         if (options.Mutate is { } mutate)
         {

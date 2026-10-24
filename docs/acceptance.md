@@ -1734,14 +1734,18 @@ factory never provisions a credential or logs anyone in by itself.
 
 ### Prerequisites (the owner only; each step needs its own decision)
 
-1. Re-run `sudo scripts/setup-worker-user.sh --slots 2 --swift` (stop `factory work` and close every `_factory*` session
-   first: setup kills every process of each sandbox user). It installs helper_version 6 and the one root rule per slot.
-2. Give each sandbox user a GUI login **by hand** — the owner decides the mechanism and the credential; the least that works
-   on macOS is a password and a `loginwindow`/Fast-User-Switching login, e.g. as root:
-   `dscl . -passwd /Users/_factory '<a throwaway password>'` (and `_factory2`), then log each user in at the Mac's login
-   screen (Fast User Switching keeps the other session alive; `sudo -u _factory /usr/bin/id -u` proves nothing about the
-   domain — only `launchctl asuser <uid> sudo -u _factory /bin/launchctl managername` answering `Aqua` does, and the helper
-   proves more). This widens a hidden role account to a logged-in one: the owner's call, recorded here, never the factory's.
+1. Review, then separately authorize reinstalling the current helper with `sudo scripts/setup-worker-user.sh --slots 2 --swift`.
+   Stop `factory work` and worker commands first; do not assume logging out a required GUI lifecycle is necessary or safe.
+   Setup installs helper_version 6 and the root rules, then runs toolchain probes that themselves require genuine own-user
+   GUI logins. Without those prerequisites installation may have happened while the probe step still fails; a completed
+   install is not live acceptance or proof that a GUI login exists.
+2. Establish each sandbox user's GUI login **only through separately approved, guided owner actions**. No mechanism is
+   claimed verified here. A password, shell/visibility changes, Fast User Switching, or a console-session limit setting
+   must each be reviewed before making that concrete change; do not put credentials in commands, argv, transcripts or docs.
+   The currently reported accounts (uids 498 and 496, `IsHidden=false`, no password/shell) have UNKNOWN GUI state. macOS's
+   reported maximum of two console sessions and the effect of changing that setting are also unverified: do not assume the
+   owner and both slots can remain logged in simultaneously. `launchctl asuser` adopts an existing bootstrap; it creates no
+   GUI login. The helper's own uid/manager/provenance checks, not a successful `sudo id` or `managername` alone, decide entry.
 3. Nothing else changes: no TCC grant, no `launchctl asuser` config, no launchd edits, no DevToolsSecurity change.
 
 ### The live probe (AC1/AC3 and the AC2 evidence)
@@ -1756,8 +1760,8 @@ FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 Worker__Swift=true \
 - AC1: the helper refuses (exit 78, nothing launched) whenever the worker is not in its own uid's Aqua login — proven by
   `WorkerGuiSessionTests` (13 fake-domain cases: shared-owner domain, `Background`, mismatched provenance uid/type/creator,
   pid 1, duplicate metadata, unknown format) and by this live probe running only through the installed helper.
-- AC3: the probe's helper runs sweep the slot's own processes; the proven `loginwindow` creator and the other slot's login
-  survive. `WorkerGuiSessionTests` proves the sweep's creator re-check refuses on a reused pid or a changed creator.
+- AC3: fake tests exercise own-uid cleanup and the exact creator exemption, including changed provenance with a registered
+  detached test worker and durable quarantine. Preservation of real own-Aqua/other-slot logins remains live-unverified.
 - AC2, honestly bounded: the probe (a tiny lookup-only C program the test compiles with clang owner-side and runs as each
   user through the helper) does `bootstrap_look_up` for `com.apple.pasteboard.1`, `com.apple.distnoted` and
   `com.apple.windowserver`, and on success releases the send right with `mach_port_deallocate` — **no message is ever sent**,
@@ -1766,9 +1770,34 @@ FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 Worker__Swift=true \
   - `succeeded-unverified: receiver identity unknown, nothing sent — not AC2 evidence by itself` — a send right existed, so
     nothing about isolation is proven: GUI and user domains share one flat lookup namespace, and no public API names a Mach
     service's receiver without sending it a message (xpc credentials exist only after a message is exchanged).
-  Whether a succeeded lookup still satisfies "cannot obtain" — the receiver's own uid/audit-token checks being the only
-  barrier — is **the owner's decision on the recorded outcomes**; the factory records both tiers and claims neither as more
-  than it is.
+  Collection and acceptance are separate. A pass requires a successful owner lookup baseline for **all three** services
+  and actual refusal of each lookup from every distinct worker uid. All-successful worker lookups (even with every send
+  right released), an all-refused owner baseline, incomplete evidence or the owner's uid reported as the worker yield
+  **INCONCLUSIVE AC2 (skipped, never passed)**. Authenticated different-receiver proof could establish isolation, but this
+  lookup-only probe does not collect it. No owner-service messages are authorized. AC2 remains open pending genuine GUI
+  prerequisites and explicit owner authorization for live evidence; fake tests and skipped runs are not live acceptance.
+
+### Cleanup quarantine (owner recovery only)
+
+A changed/unprovable login creator is protected: the helper refuses the uid sweep and exits 78, which is NOT proof that
+reparented or detached workers died. Before every helper launch the orchestrator durably writes an owner-only
+`<slot lock path>.cleanup-unproven` marker under that slot's lock. A completed helper clears its marker only after the exit
+callback observes a non-78 result **after root's independent cleanup proof**. Root pins the exact pre-launch GUI tuple and
+creator start identity, waits for the unprivileged helper, then verifies both again and requires each real/effective-uid
+process view to contain only that exact creator (and revalidates identity afterwards). Unknown metadata, any leftover or
+changed provenance returns 78 regardless of the child's exit. Root sends no signals and never reads the protocol or runs
+the requested program. Only the exact single-argument read-only session-status query skips post-cleanup proof.
+An exit 78, missing callback or owner process death leaves the marker in place across processes
+and restarts. Exhausting the sweep's twenty passes also exits 78. Reinstalling the helper or taking the lock never clears it.
+A pending marker while the slot lock is held means busy, not quarantined. Once the lock is free, unassigned work skips and
+reports that slot; a named slot or all slots quarantined refuses explicitly, never silently waits forever or switches an
+item's assigned uid. A held assigned item is not escalated and does not stop intake for independent slots; best-effort
+sweeps leave quarantined leftovers without running a helper, so they cannot take down another slot's phase. Other slots remain usable.
+
+Recovery is an explicit owner decision, not an automatic retry: stop the factory processes using that slot; independently
+verify no worker process of that uid remains (detached/reparented processes included), preserving only independently proven
+login lifecycle processes; establish the user's valid own Aqua login; only then explicitly remove that slot's marker.
+Do not delete it merely because the helper exited. This session made no host recovery/setup changes and ran no live probe.
 
 ### Rollback
 

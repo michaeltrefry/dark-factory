@@ -185,26 +185,43 @@ public sealed class WorkerSlots : IWorkerSandbox
         {
             var one = slot is { } number ? Slot(number) : All[0];
             await EnsureLocksClosedAsync(ct);
-            return one.Lock is null ? await phase(one) : await one.Lock.HoldAsync(() => phase(one), ct, whileWaiting, retry, report, reportEvery);
+            return one.Lock is null ? await phase(one) : await one.Lock.HoldAsync(() =>
+            {
+                one.Sandbox.RequireCleanupProven();
+                return phase(one);
+            }, ct, whileWaiting, retry, report, reportEvery);
         }
         await EnsureLocksClosedAsync(ct);
         var candidates = (order ?? []).Where(n => n >= 1 && n <= Count).Concat(Enumerable.Range(1, Count)).Distinct().Select(n => All[n - 1]).ToList();
         var every = reportEvery ?? WorkerLock.ReportEvery;
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var reported = TimeSpan.Zero;
+        var reportedQuarantines = new HashSet<int>();
         while (true)
         {
             ct.ThrowIfCancellationRequested();
             var why = "";
+            var quarantined = 0;
             foreach (var candidate in candidates)
             {
-                var (got, result, busy) = await candidate.Lock!.TryHoldAsync(() => phase(candidate));
+                // Only judge the marker after taking this slot's lock: a running helper also has
+                // a pending marker, which is not a quarantine until its phase has ended.
+                var (got, result, busy) = await candidate.Lock!.TryHoldAsync(async () =>
+                {
+                    if (candidate.Sandbox.QuarantinePath is { } marker && File.Exists(marker))
+                        return (Quarantined: true, Result: default(T));
+                    return (Quarantined: false, Result: await phase(candidate));
+                });
                 if (got)
                 {
-                    return result!;
+                    if (!result.Quarantined) return result.Result!;
+                    quarantined++;
+                    if (reportedQuarantines.Add(candidate.Number)) (report ?? Console.Error.WriteLine)($"[sandbox] leaving quarantined worker slot {candidate.Number} ({candidate.Sandbox.User}): {candidate.Sandbox.QuarantinePath}; owner cleanup proof required");
+                    continue;
                 }
                 why = busy;
             }
+            if (quarantined == candidates.Count) candidates[0].Sandbox.RequireCleanupProven();
             var waited = System.Diagnostics.Stopwatch.GetElapsedTime(started);
             if (waited - reported >= every)
             {
@@ -497,10 +514,17 @@ public sealed class WorkerSlots : IWorkerSandbox
                 await phase(slot);
                 return true;
             }
-            if (await slot.Lock.TryHoldAsync(() => phase(slot)))
+            var (got, removed, _) = await slot.Lock.TryHoldAsync(async () =>
             {
+                if (slot.Sandbox.QuarantinePath is { } marker && File.Exists(marker))
+                {
+                    Report($"[cleanup] leaving {path}: worker {slot} is quarantined ({marker}); owner cleanup proof required");
+                    return false;
+                }
+                await phase(slot);
                 return true;
-            }
+            });
+            if (got && removed) return true;
         }
         return false;
     }

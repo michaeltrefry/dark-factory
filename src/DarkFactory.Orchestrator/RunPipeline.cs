@@ -1292,6 +1292,13 @@ public sealed partial class RunPipeline(
         {
             return await OutcomeAsync(item, ex.Message, ct);
         }
+        catch (FactoryUnavailableException ex) when (ex.InnerException is SandboxCleanupUnprovenException)
+        {
+            // This item's assigned uid is held for explicit owner recovery. Do not escalate it,
+            // and do not stop intake from dispatching work in the other, independent slots.
+            log.WriteLine($"[sandbox] {item.ExternalId} held: {ex.Message}");
+            return await OutcomeAsync(item, ex.Message, CancellationToken.None);
+        }
         catch (Exception ex) when (ex is not FactoryUnavailableException)
         {
             // Includes an OperationCanceledException nobody asked for, e.g. an HttpClient timeout.

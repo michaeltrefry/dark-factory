@@ -72,6 +72,85 @@ public class SlotPoolTests
     }
 
     [Fact]
+    public async Task Quarantined_slots_are_skipped_but_named_and_all_quarantined_requests_refuse_explicitly()
+    {
+        var pool = TestSlots.Pool(_root, 2);
+        File.WriteAllText(pool.All[0].Sandbox.QuarantinePath!, "unproven");
+        var reports = new List<string>();
+        var chosen = await pool.HoldAsync(null, s => Task.FromResult(s.Number), CancellationToken.None, report: reports.Add);
+        Assert.True(chosen == 2 && reports.Any(r => r.Contains("quarantined worker slot 1")), "unassigned work must use another slot and report the quarantine");
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.HoldAsync(1, _ => Task.FromResult(0), CancellationToken.None));
+        File.WriteAllText(pool.All[1].Sandbox.QuarantinePath!, "unproven");
+        await Assert.ThrowsAsync<FactoryUnavailableException>(() => pool.HoldAsync(null, _ => Task.FromResult(0), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_live_pending_cleanup_marker_is_busy_not_quarantined_and_waits_for_proven_completion()
+    {
+        var pool = TestSlots.Pool(_root, 2);
+        var entered = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+        var marker = pool.All[0].Sandbox.QuarantinePath!;
+        var first = pool.HoldAsync(1, async _ =>
+        {
+            File.WriteAllText(marker, "active helper");
+            entered.SetResult();
+            await release.Task;
+            File.Delete(marker);
+            return 1;
+        }, CancellationToken.None);
+        await entered.Task;
+        // Slot 2 is unavailable for this wait, so a marker checked without its lock would falsely quarantine all slots.
+        File.WriteAllText(pool.All[1].Sandbox.QuarantinePath!, "unproven");
+        var waits = new ConcurrentQueue<string>();
+        var next = pool.HoldAsync(null, s => Task.FromResult(s.Number), CancellationToken.None,
+            retry: Poll, reportEvery: TimeSpan.Zero, report: waits.Enqueue);
+        await Eventually(() => waits.Any(r => r.Contains("still waiting")), "active marker must wait, not fail the factory");
+        release.SetResult();
+        await first;
+        Assert.Equal(1, await next.WaitAsync(Soon));
+    }
+
+    [Fact]
+    public async Task A_best_effort_sweep_leaves_quarantined_slots_and_goes_on_without_starting_a_helper()
+    {
+        var reports = new List<string>();
+        var slots = TestSlots.Pool(_root, 2);
+        var pool = new WorkerSlots(slots.All)
+        {
+            ListAcl = (_, _) => Task.FromResult(SharedListing("_dftest")), Report = reports.Add,
+        };
+        File.WriteAllText(pool.All[0].Sandbox.QuarantinePath!, "unproven");
+        var called = false;
+        var leftover = Directory.CreateDirectory(Path.Combine(_root, "leftover")).FullName;
+        var removed = await pool.TryHoldForAsync(leftover, _ => { called = true; return Task.CompletedTask; }, CancellationToken.None);
+        Assert.True(!removed && !called && reports.Any(r => r.Contains("quarantined")), "a quarantined leftover must not fail another slot's sweep or run any helper");
+    }
+
+    [Fact]
+    public async Task A_quarantined_assigned_item_is_held_not_escalated_or_a_factory_wide_failure()
+    {
+        var pool = TestSlots.Pool(_root, 2);
+        var h = new Harness();
+        var item = await h.Ledger.GetOrCreateAsync(ItemNaming.Shortcut.Source, "sc-77", "seed", Sandbox.FullName, null, CancellationToken.None);
+        await h.Ledger.RecordAsync(item, WorkState.Implement, null, null, CancellationToken.None);
+        await h.Ledger.CheckpointAsync(item, RunPipeline.Steps.Slot, null, "1 _dftest", CancellationToken.None);
+        File.WriteAllText(pool.All[0].Sandbox.QuarantinePath!, "unproven");
+        var worker = new FakeWorker(ReportsModel(ImplementerModel));
+        RunOutcome? outcome = null;
+        var exception = await Record.ExceptionAsync(async () => outcome = await Pipeline(h, pool, new SlotProbe(pool), worker, TextWriter.Null).RunAsync(77, CancellationToken.None));
+        Assert.Multiple(
+            () => Assert.Null(exception),
+            () => Assert.Equal(WorkState.Implement, outcome?.State),
+            () => Assert.Contains("quarantined", outcome?.Error),
+            () => Assert.Empty(worker.Calls));
+        var sibling = new Harness();
+        var probe = new SlotProbe(pool);
+        var other = await Pipeline(sibling, pool, probe, new FakeWorker(ReportsModel(ImplementerModel)), TextWriter.Null).RunAsync(77, CancellationToken.None);
+        Assert.True(other.State == WorkState.Review && probe.Of("IWorker.RunAsync").All(n => n == 2), "independent unassigned work must still run in slot 2");
+    }
+
+    [Fact]
     public async Task Two_flows_hold_two_slots_at_once_and_a_third_waits_for_the_first_that_frees()
     {
         var pool = TestSlots.Pool(_root, 2);

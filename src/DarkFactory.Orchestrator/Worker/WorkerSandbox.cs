@@ -59,6 +59,9 @@ public sealed class WorktreeWritersException(string path, string user, string wh
     public string Path => path;
 }
 
+/// <summary>A persisted slot hold, not proof that every other sandbox user is unavailable.</summary>
+internal sealed class SandboxCleanupUnprovenException() : Exception("sandbox cleanup unproven");
+
 /// <summary>
 /// Runs workers as a dedicated macOS user (E5) through the root-owned launch helper
 /// (<c>scripts/factory-worker-launch</c>), which <c>scripts/setup-worker-user.sh</c> installs — one copy per sandbox user, pinned
@@ -84,6 +87,78 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// the work root's); null only for a sandbox a test builds over its own helper copy, which shares its user with no other run.
     /// </summary>
     public WorkerLock? Lock { get; init; }
+
+    // Owner-written, before launch, under the slot lock. It survives either process dying and is
+    // deliberately NOT cleared by setup or by acquiring the lock in a new process.
+    internal string? QuarantinePath => Lock is null ? null : Lock.Path + ".cleanup-unproven";
+    // Runtime state is not part of this record's value identity (slots compare sandbox settings).
+    private sealed class CleanupState
+    {
+        public HashSet<Process> Pending { get; } = new(ReferenceEqualityComparer.Instance);
+        public bool Failed;
+    }
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<WorkerSandbox, CleanupState> CleanupStates = new();
+    private HashSet<Process> CleanupPending => CleanupStates.GetOrCreateValue(this).Pending;
+    private bool CleanupFailed
+    {
+        get => CleanupStates.GetOrCreateValue(this).Failed;
+        set => CleanupStates.GetOrCreateValue(this).Failed = value;
+    }
+
+    internal void RequireCleanupProven()
+    {
+        if (QuarantinePath is { } path && File.Exists(path))
+        {
+            throw new WorkSources.FactoryUnavailableException(
+                $"Worker slot for {User} is quarantined: cleanup is unproven ({path}). No helper or worker was started. "
+                + "The owner must stop factory processes using this slot, independently verify this uid has no worker processes "
+                + "(including detached ones) and establish its own valid Aqua login, then explicitly remove this marker. "
+                + "Acquiring a lock, restarting the factory or reinstalling the helper is not recovery proof; other slots remain usable.",
+                new SandboxCleanupUnprovenException());
+        }
+    }
+
+    private void BeginCleanupProof()
+    {
+        if (QuarantinePath is not { } path || CleanupPending.Count != 0) return;
+        RequireCleanupProven();
+        try
+        {
+            using var marker = new FileStream(path, new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None,
+                UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+            });
+            marker.Write(Encoding.UTF8.GetBytes($"Cleanup pending for {User}; owner recovery proof required if left behind.\n"));
+            marker.Flush(flushToDisk: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new WorkSources.FactoryUnavailableException($"Cannot persist cleanup intent for {User} at {path}; no helper was started", ex);
+        }
+        CleanupFailed = false;
+    }
+
+    private void CompleteCleanupProof(Process process)
+    {
+        lock (CleanupStates.GetOrCreateValue(this))
+        {
+            if (!CleanupPending.Remove(process)) return;
+            // Root independently proves exact creator identity and no real/effective-uid workers
+            // before returning any other status. 78 (or no callback) never clears the marker.
+            CleanupFailed |= process.ExitCode == 78;
+            if (CleanupPending.Count == 0 && !CleanupFailed && QuarantinePath is { } path)
+            {
+                try { File.Delete(path); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    CleanupFailed = true;
+                    throw new WorkSources.FactoryUnavailableException($"Cannot persist proven cleanup for {User}; slot marker remains at {path}", ex);
+                }
+            }
+            if (CleanupFailed) Console.Error.WriteLine($"[sandbox] {User}: cleanup unproven; slot quarantined at {QuarantinePath}. Owner recovery proof required.");
+        }
+    }
 
     /// <summary>
     /// What the owner runs to (re)install this sandbox's helper: <see cref="ReinstallCommand"/>, with <c>--slots n</c> when the
@@ -143,7 +218,8 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         Stop(process);
         if (await ExitsWithinAsync(process, grace ?? StopGrace))
         {
-            process.Dispose();
+            try { CompleteCleanupProof(process); }
+            finally { process.Dispose(); }
             return true;
         }
         var pid = process.Id;
@@ -152,6 +228,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             try
             {
                 await process.WaitForExitAsync(CancellationToken.None);
+                CompleteCleanupProof(process);
             }
             finally
             {
@@ -247,7 +324,23 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
         psi.Environment.Clear();
         psi.Environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin";
 
-        var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {SudoPath}.");
+        Process process;
+        // A late exit callback and a rescue helper can overlap inside the same held slot.
+        // Reserve/create the durable marker and register the new process atomically with completion.
+        lock (CleanupStates.GetOrCreateValue(this))
+        {
+            BeginCleanupProof();
+            try
+            {
+                process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {SudoPath}.");
+                if (QuarantinePath is not null) CleanupPending.Add(process);
+            }
+            catch
+            {
+                CleanupFailed = true; // never clear uncertain launch intent from another helper's callback
+                throw;
+            }
+        }
         try
         {
             // Straight to the pipe, so the writer never holds unsent bytes that would throw again on Close.
