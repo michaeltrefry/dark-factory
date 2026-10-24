@@ -219,6 +219,9 @@ public record NewTestSet(IReadOnlyList<ChangedFile> TestFiles, IReadOnlyList<str
     /// <summary>Each new test's project file, by test id.</summary>
     public IReadOnlyDictionary<string, string> Projects { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
 
+    /// <summary>Xcode execution requirements, agreed at the base and head. Missing facts are never proof of non-GUI execution.</summary>
+    public IReadOnlyDictionary<string, XcodeTestPlacement> XcodePlacements { get; init; } = new Dictionary<string, XcodeTestPlacement>(StringComparer.Ordinal);
+
     /// <summary>
     /// Test files the base run gets with this content instead of the head's, by path (each also one of
     /// <see cref="TestFiles"/>): a file that holds production code too, where only the PR's test code may be applied to
