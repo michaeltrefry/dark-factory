@@ -567,7 +567,7 @@ public class SlotPoolTests
     public static TheoryData<string, string> BadSecondHelpers => new()
     {
         { "missing", "cannot read the launch helper" },
-        { "stale", "its helper_version 3 is older than 5" },
+        { "stale", "its helper_version 3 is older than 6" },
         { "edited", "its text differs from the repo helper" },
         { "other-user", "its sandbox_user is not _dftest2" }, // slot 1's helper copied over slot 2's: pinned to another user
         { "unpinned", "it has no pinned sandbox_uid" },

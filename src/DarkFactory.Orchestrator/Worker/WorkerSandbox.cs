@@ -168,7 +168,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     public const string ReinstallCommand = "sudo scripts/setup-worker-user.sh";
 
     /// <summary>The <c>helper_version</c> of <c>scripts/factory-worker-launch</c>: an installed helper below it is stale.</summary>
-    public const int HelperVersion = 5;
+    public const int HelperVersion = 6;
 
     /// <summary>
     /// The oldest Claude Code the worker user may run: 2.1.291, the release the confined triage session was built and checked
@@ -194,7 +194,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
 
     /// <summary><c>sudo -n -u &lt;user&gt; &lt;helper&gt; &lt;program&gt; args…</c>.</summary>
     public IReadOnlyList<string> BuildLaunchArguments(string program, IEnumerable<string> args) =>
-        ["-n", "-u", User, HelperPath, program, .. args];
+        ["-n", "-u", "root", HelperPath, program, .. args];
 
     /// <summary>The one variable whose value may span lines: one header per line (the router key, the model class).</summary>
     public const string MultiLineVariable = "ANTHROPIC_CUSTOM_HEADERS";
@@ -286,10 +286,12 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
 
     /// <summary>
     /// The pids of a <c>ps -o pid=,ppid=,command=</c> listing that are a worker's leftovers: every process but a
-    /// <see cref="RespawnedAgents"/> agent whose parent is launchd. A line that does not read as pid, ppid and command counts
-    /// (fail closed: the helper is then run).
+    /// <see cref="RespawnedAgents"/> agent whose parent is launchd and — with <paramref name="guiCreator"/> — the one pid the
+    /// helper has PROVEN to be that user's own <c>loginwindow</c> login creator (sc-26789: <see cref="StopAllLockedAsync"/>
+    /// obtains it only from the helper's verified session status, never from this listing). A line that does not read as pid,
+    /// ppid and command counts (fail closed: the helper is then run).
     /// </summary>
-    public static IReadOnlyList<string> Leftovers(string listing)
+    public static IReadOnlyList<string> Leftovers(string listing, string? guiCreator = null)
     {
         var leftovers = new List<string>();
         foreach (var raw in listing.Split('\n'))
@@ -301,7 +303,8 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             }
             var parts = line.Split((char[]?)null, 3, StringSplitOptions.RemoveEmptyEntries);
             var agent = parts.Length == 3 && parts[1] == "1" && RespawnedAgents.Contains(parts[2].Trim());
-            if (!agent)
+            var creator = parts.Length == 3 && parts[0] == guiCreator;
+            if (!agent && !creator)
             {
                 leftovers.Add(parts[0]);
             }
@@ -322,8 +325,21 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             var listing = await ps.StandardOutput.ReadToEndAsync(ct);
             await ps.StandardError.ReadToEndAsync(ct);
             await ps.WaitForExitAsync(ct);
+            string? guiCreator = null;
+            if (OperatingSystem.IsMacOS() && listing.Contains("/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow", StringComparison.Ordinal))
+            {
+                // Never infer a lifecycle exemption from ps's name/parent alone: ask the pinned helper
+                // to validate its own uid, Aqua manager, login-domain creator and kernel start identity.
+                var session = await RunAsync("/", "__factory_session_status", [], ct);
+                var identity = Regex.Match(session.Stdout, @"\Afactory-gui (4[0-9]{2}) ([1-9][0-9]*) ([1-9][0-9]*)\n\z");
+                if (session.ExitCode != 0 || !identity.Success || identity.Groups[3].Value == "1")
+                {
+                    throw new InvalidOperationException($"Cannot prove {User}'s own Aqua login before stopping leftovers: {session.Stderr.Trim()}");
+                }
+                guiCreator = identity.Groups[3].Value;
+            }
             // ps exits 1 for a user with no process (and for one that does not exist): nothing to stop either way.
-            if (ps.ExitCode != 0 || Leftovers(listing).Count == 0)
+            if (ps.ExitCode != 0 || Leftovers(listing, guiCreator).Count == 0)
             {
                 return false;
             }
@@ -409,6 +425,17 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             .Remove(uids[0].Index, uids[0].Length).Insert(uids[0].Index, "sandbox_uid=");
         var userLine = Regex.Match(unpinned, "^sandbox_user=.*$", RegexOptions.Multiline);
         unpinned = unpinned.Remove(userLine.Index, userLine.Length).Insert(userLine.Index, $"sandbox_user={DefaultUser}");
+        // Production's root trampoline is pinned to its invoking owner too. Synthetic test helpers
+        // may have no root half; the production resource always has this third pin.
+        if (source.Contains("\nsandbox_owner=\n", StringComparison.Ordinal))
+        {
+            var owners = Regex.Matches(unpinned, "^sandbox_owner=(.*)$", RegexOptions.Multiline);
+            if (owners.Count != 1 || !Regex.IsMatch(owners[0].Groups[1].Value, "^[a-zA-Z_][a-zA-Z0-9_-]*$"))
+            {
+                return "it has no pinned sandbox_owner";
+            }
+            unpinned = unpinned.Remove(owners[0].Index, owners[0].Length).Insert(owners[0].Index, "sandbox_owner=");
+        }
         var (have, want) = (Sha256(unpinned), Sha256(source));
         return have == want ? null : $"its text differs from the repo helper, scripts/factory-worker-launch (sha256 {have[..12]}…, expected {want[..12]}…)";
     }
@@ -480,6 +507,15 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
             throw new InvalidOperationException(
                 $"The installed launch helper {HelperPath} is stale: it refuses the worker's router variables ({probe.Stderr.Trim()}); "
                 + $"re-run `{Reinstall}` to install the current helper.");
+        }
+        if (probe.ExitCode != 0 && probe.Stderr.Contains("own Aqua login", StringComparison.Ordinal))
+        {
+            // sc-26789 (S3): the helper refuses to run a worker outside the sandbox user's own GUI login domain.
+            // launchctl asuser adopts a bootstrap; it creates no Aqua session, so the owner must log each user in.
+            throw new InvalidOperationException(
+                $"Worker sandbox user '{User}' has no GUI login of its own: the launch helper refuses to run its workers in the "
+                + $"owner's session ({probe.Stderr.Trim()}). Have the owner establish {User}'s own GUI login (sc-26789), then re-run "
+                + $"`{Reinstall}` to check it.");
         }
         if (probe.ExitCode != 0 || probe.Stdout.Trim() != User)
         {

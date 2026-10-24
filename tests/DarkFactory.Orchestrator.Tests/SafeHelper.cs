@@ -26,8 +26,20 @@ internal sealed record FakeIdentity(string User, string Uid, IReadOnlyDictionary
     public static string SlotUid(int slot) => (449 + slot).ToString();
 }
 
+internal sealed record FakeGuiSession(string ManagerUid = "450", string ManagerName = "Aqua", string? Domain = null)
+{
+    public string CreatorIdentity { get; init; } = "450 Tue Oct 20 04:59:11 2026 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow";
+    public string? LaterCreatorIdentity { get; init; }
+    public string? LaterDomain { get; init; }
+
+    public string Listing => Domain ?? "gui/450 = {\n\ttype = login\n\tcreator = loginwindow[400001]\n\tsecurity context = {\n\t\tuid = 450\n\t\tasid = 100004\n\t}\n}\n";
+}
+
 internal sealed record SafeHelperOptions
 {
+    /// <summary>Fake launchd metadata only. Never invokes launchctl or adopts a real bootstrap domain.</summary>
+    public FakeGuiSession? GuiSession { get; init; }
+
     /// <summary>null: the real <c>id</c>, <c>sandbox_user</c> stays <c>_factory</c> (we are not) and <c>sandbox_uid</c> unpinned, so the uid sweep never runs.</summary>
     public FakeIdentity? Identity { get; init; }
 
@@ -219,6 +231,7 @@ internal sealed class SafeHelper
         Assert.Equal(1, Count(source, ListPrimitive));
         Assert.Equal(1, Count(source, "\nsandbox_user=_factory\n"));
         Assert.Equal(1, Count(source, "\nsandbox_uid=\n"));
+        Assert.Equal(1, Count(source, "\nsandbox_owner=\n"));
         Assert.Equal(1, Count(source, "\nset -eu\n"));
 
         var registry = options.Registry ?? System.IO.Path.Combine(System.IO.Path.GetDirectoryName(targets)!, "no-registry");
@@ -306,7 +319,24 @@ internal sealed class SafeHelper
             }
             {{SeamEnd}}
             """;
-        var copy = source.Replace(SignalPrimitive, seam).Replace(ListPrimitive, listing);
+        // Neither root's bootstrap adoption nor a real launchctl is ever reachable from a test copy.
+        // The fake only prints metadata (or the attempted asuser argv), and never executes its arguments.
+        var session = options.GuiSession;
+        var sessionCount = targets + ".domain-reads";
+        var creatorCount = targets + ".creator-reads";
+        var creatorCommand = SandboxSupport.Executable(System.IO.Path.GetDirectoryName(targets)!, $"creator-metadata-{Guid.NewGuid():N}",
+            $"#!/bin/sh\nif [ -f '{creatorCount}' ]; then printf '%s\\n' '{session?.LaterCreatorIdentity ?? session?.CreatorIdentity ?? ""}'; "
+            + $"else touch '{creatorCount}'; printf '%s\\n' '{session?.CreatorIdentity ?? ""}'; fi\n");
+        var sessionCommand = SandboxSupport.Executable(System.IO.Path.GetDirectoryName(targets)!, $"session-metadata-{Guid.NewGuid():N}",
+            "#!/bin/sh\ncase \"$1\" in\n"
+            + $"manageruid) printf '%s\\n' '{session?.ManagerUid ?? "450"}' ;;\n"
+            + $"managername) printf '%s\\n' '{session?.ManagerName ?? "Aqua"}' ;;\n"
+            + $"print) if [ -f '{sessionCount}' ]; then cat <<'DOMAIN'\n{session?.LaterDomain ?? session?.Listing ?? ""}\nDOMAIN\nelse touch '{sessionCount}'; cat <<'DOMAIN'\n{session?.Listing ?? ""}\nDOMAIN\nfi\n;;\n"
+            + "asuser) printf '%s\\n' \"$@\"; exit 77 ;;\n*) exit 1 ;;\nesac\n");
+        var copy = source.Replace(SignalPrimitive, seam).Replace(ListPrimitive, listing)
+            .Replace("/bin/launchctl", sessionCommand).Replace("/usr/bin/sudo", "/usr/bin/false")
+            .Replace("/bin/ps -ww -p \"$protected_creator\" -o uid=,lstart=,comm=", creatorCommand)
+            .Replace("$(uname -s)", session is null ? "Linux" : "Darwin");
         if (options.Identity is { } identity)
         {
             Assert.Matches("^[0-9]*$", identity.PinnedUid);
@@ -319,7 +349,8 @@ internal sealed class SafeHelper
             copy = copy
                 .Replace("\nset -eu\n", "\nset -eu\n" + fakeId)
                 .Replace("\nsandbox_user=_factory\n", $"\nsandbox_user={identity.User}\n")
-                .Replace("\nsandbox_uid=\n", $"\nsandbox_uid={identity.PinnedUid}\n");
+                .Replace("\nsandbox_uid=\n", $"\nsandbox_uid={identity.PinnedUid}\n")
+                .Replace("\nsandbox_owner=\n", "\nsandbox_owner=df-test-owner\n");
         }
         if (options.Mutate is { } mutate)
         {

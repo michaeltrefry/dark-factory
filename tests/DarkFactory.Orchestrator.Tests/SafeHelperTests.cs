@@ -546,7 +546,7 @@ public class SafeHelperTests
             ["WorkerSandboxTests.cs"] =
             [
                 "var sandbox = new WorkerSandbox(\"_factory\", WorkerSandbox." + installedMarkers[0] + ");",
-                "Assert.Equal([\"-n\", \"-u\", \"_factory\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\", \"claude\", \"-p\", \"x\"],",
+                "Assert.Equal([\"-n\", \"-u\", \"root\", \"/usr/local/" + installedMarkers[1] + "/" + helperName + "\", \"claude\", \"-p\", \"x\"],",
                 "() => new WorkerSandbox(Environment.UserName, WorkerSandbox." + installedMarkers[0] + ").ShareAsync(path, CancellationToken.None));",
                 "await new WorkerSandbox(Environment.UserName, WorkerSandbox." + installedMarkers[0] + ").ShareAsync(path, CancellationToken.None);",
                 // The live probes' configured slots (sc-25992), only behind their FACTORY_SANDBOX_LIVE gate (checked below).

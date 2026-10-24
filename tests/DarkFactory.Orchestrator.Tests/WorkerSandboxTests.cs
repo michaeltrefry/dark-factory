@@ -168,12 +168,14 @@ public class WorkerSandboxTests
     private readonly string _dir = Directory.CreateTempSubdirectory("df-sandbox-").FullName;
 
     [Fact]
-    public void Launch_runs_the_helper_as_the_worker_user_through_noninteractive_sudo()
+    public void Launch_runs_the_root_session_trampoline_through_noninteractive_sudo()
     {
         var sandbox = new WorkerSandbox("_factory", WorkerSandbox.DefaultHelperPath);
 
         Assert.Equal("/usr/bin/sudo", sandbox.SudoPath);
-        Assert.Equal(["-n", "-u", "_factory", "/usr/local/libexec/dark-factory/factory-worker-launch", "claude", "-p", "x"],
+        // The installed helper runs as root only: its first half adopts the worker's own Aqua login,
+        // drops the uid, and re-enters itself as the worker (sc-26789: never the owner's bootstrap).
+        Assert.Equal(["-n", "-u", "root", "/usr/local/libexec/dark-factory/factory-worker-launch", "claude", "-p", "x"],
             sandbox.BuildLaunchArguments("claude", ["-p", "x"]));
     }
 
@@ -426,7 +428,8 @@ public class WorkerSandboxTests
         Assert.Equal((UnixFileMode)0b111_101_101, File.GetUnixFileMode(target));
     }
 
-    private const string SelfExclusion = "[ \"$pid\" != \"$$\" ] || continue";
+    // sc-26789: the sweep also spares the proven loginwindow creator (the pin proves both exclusions stay).
+    private const string SelfExclusion = "[ \"$pid\" != \"$$\" ] && [ \"$pid\" != \"$protected_creator\" ] || continue";
 
     /// <summary>
     /// A <see cref="SafeHelper"/> copy whose uid sweep runs (by default as the sandbox role
@@ -705,13 +708,14 @@ public class WorkerSandboxTests
     }
 
     [Fact]
-    public void The_helper_is_version_5_and_an_installed_version_4_is_stale()
+    public void The_helper_is_version_6_and_an_installed_version_5_is_stale()
     {
-        Assert.Equal(5, WorkerSandbox.HelperVersion);
+        Assert.Equal(6, WorkerSandbox.HelperVersion);
         Assert.True(SafeHelper.SourceContains($"\nhelper_version={WorkerSandbox.HelperVersion}\n"));
-        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=5\n";
-        var installedV4 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=5", "helper_version=4");
-        Assert.Equal("its helper_version 4 is older than 5", WorkerSandbox.StaleHelperReason(installedV4, "_factory", repo));
+        Assert.True(SafeHelper.SourceContains("\nsandbox_owner=\n")); // the root trampoline's third pin (sc-26789)
+        const string repo = "#!/bin/bash\nsandbox_user=_factory\nsandbox_uid=\nhelper_version=6\n";
+        var installedV5 = repo.Replace("sandbox_uid=", "sandbox_uid=450").Replace("helper_version=6", "helper_version=5");
+        Assert.Equal("its helper_version 5 is older than 6", WorkerSandbox.StaleHelperReason(installedV5, "_factory", repo));
         Assert.Null(WorkerSandbox.StaleHelperReason(repo.Replace("sandbox_uid=", "sandbox_uid=450"), "_factory", repo));
         // A slot's copy is the same text pinned to its own user: current for that user, and for no other.
         var second = repo.Replace("sandbox_user=_factory", "sandbox_user=_factory2").Replace("sandbox_uid=", "sandbox_uid=451");
@@ -2042,5 +2046,93 @@ public class LiveWorkerSandboxTests
         var error = p.StandardError.ReadToEnd();
         p.WaitForExit();
         Assert.True(p.ExitCode == 0, $"{program} {string.Join(' ', args)}: {error}");
+    }
+
+    /// <summary>
+    /// S3 AC2 (sc-26789): what a worker in its own Aqua login can look up of the owner's per-session Mach services (the
+    /// pasteboard, distnoted, WindowServer) — a lookup only, never a message, so nothing of the owner's session is read or
+    /// changed. The probe runs twice: as the owner (its own session's baseline) and as each sandbox user through the real
+    /// installed helper, which since S3 refuses to run a worker outside that user's own GUI login domain. The evidence has
+    /// exactly two tiers and neither is overstated: a refused lookup gave the worker's domain nothing; a succeeded one says
+    /// nothing about the receiver (GUI and user domains share one flat lookup namespace, and no public API names a Mach
+    /// service's receiver without sending it a message), so its send right is released without a single message and it is
+    /// recorded as unverified — the owner decides whether that satisfies "cannot obtain" (docs/acceptance.md).
+    /// </summary>
+    [Fact]
+    public async Task A_worker_in_its_own_aqua_login_cannot_look_up_the_owners_pasteboard_distnoted_or_windowserver()
+    {
+        var slots = await RequireSlotsAsync();
+        var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
+        // clang compiles the lookup-only probe owner-side; the binary runs as each user through its helper, so it must
+        // live where every sandbox user can read and execute it: the work root, which the owner owns and all read.
+        var compile = Path.Combine(Path.GetTempPath(), $"df-mach-probe-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(compile);
+        try
+        {
+            var probe = await MachLookupProbe.CompileAsync(compile, CancellationToken.None);
+            if (probe is null)
+            {
+                Assert.Skip("No /usr/bin/clang (Xcode Command Line Tools) to compile the lookup probe.");
+            }
+
+            var run = Path.Combine(options.WorkRoot, $"mach-probe-{Guid.NewGuid():N}");
+            File.Copy(probe, run);
+            File.SetUnixFileMode(run, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            try
+            {
+                // The owner's own session first: its lookups succeed (or, for a service with no owner session, the
+                // baseline says so) — the contrast the worker's outcomes are read against, verbatim in the report.
+                var owner = await RunProbeAsync(run, "the owner");
+                Assert.Equal(MachLookupProbe.Services.Length, MachLookupProbe.Parse(owner).Count);
+                foreach (var slot in slots)
+                {
+                    var (code, stdout, stderr) = await slot.Sandbox.RunAsync("/", run, MachLookupProbe.Services, CancellationToken.None);
+                    Assert.True(code == 0, $"Worker {slot}: {stderr}");
+                    Report(slot.ToString(), stdout);
+                    var outcomes = MachLookupProbe.Parse(stdout);
+                    Assert.Equal(MachLookupProbe.Services.Length, outcomes.Count);
+                    Assert.All(outcomes, o => Assert.Equal(o.LookedUp, o.ReleasedWithoutSend)); // nothing was ever sent
+                    foreach (var outcome in outcomes)
+                    {
+                        Console.WriteLine($"[mach-probe] Worker {slot}: {outcome.Service}: {outcome.Tier}");
+                    }
+                }
+                void Report(string who, string output)
+                {
+                    Console.WriteLine($"[mach-probe] {who}:");
+                    foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        Console.WriteLine($"[mach-probe] {line}");
+                    }
+                }
+            }
+            finally
+            {
+                File.Delete(run);
+            }
+        }
+        finally
+        {
+            Directory.Delete(compile, recursive: true);
+        }
+    }
+
+    /// <summary>Runs the probe as this test host user (the owner's own session) and reports its output verbatim.</summary>
+    private static async Task<string> RunProbeAsync(string probe, string who)
+    {
+        using var p = Process.Start(new ProcessStartInfo(probe, MachLookupProbe.Services)
+        {
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        })!;
+        var stdout = await p.StandardOutput.ReadToEndAsync();
+        await p.WaitForExitAsync();
+        Assert.True(p.ExitCode == 0, $"{who}: exit {p.ExitCode}");
+        Console.WriteLine($"[mach-probe] {who}:");
+        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            Console.WriteLine($"[mach-probe] {line}");
+        }
+        return stdout;
     }
 }

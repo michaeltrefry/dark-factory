@@ -1433,10 +1433,10 @@ ledger** and its own work root (`E2e`), and takes every worker slot's lock of th
    strategies run only in a factory with it on. Each slot's user needs Swift, xcodebuild with Xcode's first launch done and its
    licence accepted, the macOS and iOS Simulator SDKs, an iOS Simulator runtime, and the installed `factory-xcodebuild`
    (`CLAUDE.md`, "Swift toolchain", says which of these setup and start-up check).
-3. **For iOS (P5-AT3, P5-AT4, P5-AT7's iOS change): the owner logged in at the console** (an Aqua session), and the tests (or
-   `factory work`) started from that GUI login — Terminal, not ssh. The simulator works as the sandbox user only inside the
-   owner's Aqua session (`CLAUDE.md`, the S0 residual); from ssh the gate's `prepare` step refuses, as the factory's failure, not
-   the item's.
+3. **For iOS (P5-AT3, P5-AT4, P5-AT7's iOS change): an Aqua session at the console** — pre-S3 the owner's (`CLAUDE.md`, the S0
+   residual); since S3 (sc-26789) each sandbox USER's own GUI login (its prerequisite section at the end of this document), and
+   the tests (or `factory work`) still started from the owner's Terminal at the console, not ssh. From ssh the gate's `prepare`
+   step refuses, as the factory's failure, not the item's.
 4. **Both GitHub Apps** (the workers' and the gate's) installed on every repository below, `factory github-repo protect
    <owner/name>` run for each (the gate App as the `pull_request`-mode bypass), and each repository named in `Factory__Repos`
    (e.g. `export Factory__Repos=michaeltrefry/LensWorks`) so the factory may plan and work in it and the freeze's main-red
@@ -1716,3 +1716,63 @@ default.
 Bounds: the safe case waits up to 2 h and the defect case 4 h for the incident to end (Resolved or Escalated). Cost: four
 real implementer sessions (five with the correction), their panels, and two to four high-class assessments. They leave merged
 pull requests, `docs/hotfile-e2e.md` and `HotFileCount` on the sandbox, and clones under `<Factory:WorkRoot>/e2e/`.
+
+## S3 (sc-26789, epic sc-26198) — every sandbox worker in its own Aqua login
+
+S3 changes what a worker runs in: its sandbox user's OWN GUI login domain, never the owner's. The launch helper (helper_version
+6) is now a root session trampoline — the sudoers rule is `owner ALL=(root) NOPASSWD: <slot's helper>` — whose root half
+authenticates the pinned installing owner, adopts the worker's own existing login (`launchctl asuser <uid>`), drops the uid and
+re-enters itself; the unprivileged half proves the landed identity (own uid, `manageruid` = the pinned uid, `managername` =
+Aqua, an authoritative `gui/<uid>` login domain created by `loginwindow`, and the kernel start identity of that creator)
+before it reads the stdin protocol or runs the worker, and the per-uid sweep spares exactly that one proven creator (the
+user's own `loginwindow`), re-proving it at every pass — so a worker exit cleans up its own processes and the respawned
+per-user agents, but never its own Aqua login or another slot's.
+
+**`launchctl asuser` creates no Aqua session.** Without a real GUI login for the worker user the helper refuses every launch
+(exit 78), readiness fails naming the user, and the factory's workers do not run. The login is the owner's to establish — the
+factory never provisions a credential or logs anyone in by itself.
+
+### Prerequisites (the owner only; each step needs its own decision)
+
+1. Re-run `sudo scripts/setup-worker-user.sh --slots 2 --swift` (stop `factory work` and close every `_factory*` session
+   first: setup kills every process of each sandbox user). It installs helper_version 6 and the one root rule per slot.
+2. Give each sandbox user a GUI login **by hand** — the owner decides the mechanism and the credential; the least that works
+   on macOS is a password and a `loginwindow`/Fast-User-Switching login, e.g. as root:
+   `dscl . -passwd /Users/_factory '<a throwaway password>'` (and `_factory2`), then log each user in at the Mac's login
+   screen (Fast User Switching keeps the other session alive; `sudo -u _factory /usr/bin/id -u` proves nothing about the
+   domain — only `launchctl asuser <uid> sudo -u _factory /bin/launchctl managername` answering `Aqua` does, and the helper
+   proves more). This widens a hidden role account to a logged-in one: the owner's call, recorded here, never the factory's.
+3. Nothing else changes: no TCC grant, no `launchctl asuser` config, no launchd edits, no DevToolsSecurity change.
+
+### The live probe (AC1/AC3 and the AC2 evidence)
+
+```sh
+FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 Worker__Swift=true \
+  dotnet test --project tests/DarkFactory.Orchestrator.Tests -- \
+  --filter-method "*A_worker_in_its_own_aqua_login_cannot_look_up_the_owners_pasteboard_distnoted_or_windowserver" \
+  --report-xunit-xml
+```
+
+- AC1: the helper refuses (exit 78, nothing launched) whenever the worker is not in its own uid's Aqua login — proven by
+  `WorkerGuiSessionTests` (13 fake-domain cases: shared-owner domain, `Background`, mismatched provenance uid/type/creator,
+  pid 1, duplicate metadata, unknown format) and by this live probe running only through the installed helper.
+- AC3: the probe's helper runs sweep the slot's own processes; the proven `loginwindow` creator and the other slot's login
+  survive. `WorkerGuiSessionTests` proves the sweep's creator re-check refuses on a reused pid or a changed creator.
+- AC2, honestly bounded: the probe (a tiny lookup-only C program the test compiles with clang owner-side and runs as each
+  user through the helper) does `bootstrap_look_up` for `com.apple.pasteboard.1`, `com.apple.distnoted` and
+  `com.apple.windowserver`, and on success releases the send right with `mach_port_deallocate` — **no message is ever sent**,
+  so nothing of the owner's session is read or changed. Two evidence tiers, printed verbatim in the test output:
+  - `refused` — the lookup gave the worker's domain nothing (this run's primary evidence);
+  - `succeeded-unverified: receiver identity unknown, nothing sent — not AC2 evidence by itself` — a send right existed, so
+    nothing about isolation is proven: GUI and user domains share one flat lookup namespace, and no public API names a Mach
+    service's receiver without sending it a message (xpc credentials exist only after a message is exchanged).
+  Whether a succeeded lookup still satisfies "cannot obtain" — the receiver's own uid/audit-token checks being the only
+  barrier — is **the owner's decision on the recorded outcomes**; the factory records both tiers and claims neither as more
+  than it is.
+
+### Rollback
+
+`sudo scripts/setup-worker-user.sh` re-run from the previous commit's script restores the previous helper and sudoers file
+(it overwrites both), and logging the worker users out (Fast User Switching) ends their sessions; the factory never does
+either by itself. A worker user without a GUI login simply makes the factory refuse to run workers (exit 78), which is the
+pre-S3-safe state for the account but not a return of pre-S3 behaviour.

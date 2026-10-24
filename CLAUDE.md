@@ -357,8 +357,22 @@ out-of-range one refused, `FactoryOptionsTests`).
 
 Worker sandbox (E5): workers run as a hidden sandbox user — `_factory`, or with several worker slots (`Worker:Slots`, sc-25989;
 "Worker slots" under the invariants) one of `_factory`, `_factory2`, … — via
-`sudo -n -u _factory factory-worker-launch claude …` (one NOPASSWD sudoers rule per sandbox user: that user's own copy of the
-helper, as that user only). Everything in this paragraph holds per sandbox user.
+`sudo -n -u root factory-worker-launch claude …` (sc-26789, S3: one NOPASSWD sudoers rule per slot's helper, as ROOT only — the
+helper's first half is the session trampoline: it authenticates the pinned installing owner, adopts the worker's own existing
+GUI login domain via `launchctl asuser` (asuser creates no Aqua session of itself), drops the uid through `sudo -n -u <worker>`
+and re-enters its own trusted file, whose unprivileged half proves the landed identity — own uid, `launchctl manageruid` =
+the pinned uid, `managername` = Aqua, an authoritative `launchctl print gui/<uid>` login domain (type `login`, creator
+`loginwindow[<pid>]`, security-context uid, asid; unknown, duplicate or mismatched metadata refuses, never guesses) and a kernel
+`ps uid,lstart,comm` match of that exact creator pid — before it reads the stdin protocol or runs the worker program. Fail
+closed: a worker NEVER runs in the owner's bootstrap; a sandbox user without its own GUI login refuses (exit 78) at readiness,
+and the factory's workers do not run at all until the owner logs each user in at the GUI. The trampoline paths are pinned
+(`/usr/local/libexec/dark-factory/factory-worker-launch[-n]`, root-owned 0755, no symlinks, `bash -p`: no `BASH_ENV`, no
+exported functions), and the sweep re-proves the login-domain provenance and creator start identity at every pass — a reused
+pid, a changed creator or a changed domain refuses the uid sweep (exit 78) rather than tear down a login it cannot vouch for,
+while the sweep still kills every other process of its own uid, launchd's respawned per-user agents included, and never another
+slot's. The uid sweep spares exactly one proven process: the worker user's own `loginwindow` creator, so the user's own Aqua
+login survives every worker run; `StopAllAsync` asks the helper (`__factory_session_status`) for the proven creator and treats
+only that pid as no leftover — never a parent-1 or command-name rule. Everything in this paragraph holds per sandbox user.
 The owner's home is ACL-denied to it, so `~/.ssh`, `~/.config/gh` and the login keychain are
 unreachable. Router variables go to the helper on stdin; the helper builds the worker env from scratch
 (PATH, HOME from the password database, TMPDIR the user's own `getconf DARWIN_USER_TEMP_DIR` (else a 0700 `~/.tmp`; either only if
@@ -401,8 +415,8 @@ worker phase with sudo's "a password is required". The readiness check has
 two parts (sc-25988), because a run of a helper kills every process of its user and so belongs under that slot's lock.
 What start-up checks, running nothing and taking no lock (`WorkerSlots.EnsureHelpersCurrentAsync` →
 `WorkerSandbox.EnsureHelperCurrentAsync` per slot): EVERY slot's installed helper is
-read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (5), name its own slot's user as `sandbox_user`, pin a uid,
-and, with those two lines undone, have the SHA-256 of the
+read and must have `helper_version` ≥ `WorkerSandbox.HelperVersion` (6), name its own slot's user as `sandbox_user`, pin a uid and the installing owner (`sandbox_owner`, sc-26789),
+and, with those three lines undone, have the SHA-256 of the
 repo's helper (compiled into the orchestrator as a resource) — else `Stale helper: … re-run \`sudo scripts/setup-worker-user.sh\``
 (or `cannot read the launch helper …`), led with several slots by the slot that failed (`Worker slot 2 (_factory2): Stale
 helper: …`) and naming the command with the slot count (`sudo scripts/setup-worker-user.sh --slots 2`:
@@ -415,7 +429,9 @@ each slot is probed before a worker runs in it, by the runs that land there, and
 real router variable names
 (allowlist `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_CUSTOM_HEADERS` may come on several
 stdin lines, one header each, which the helper joins with line breaks — since helper_version 3, sc-25659), which fails if the
-helper refuses a variable, the user is not usable or the probe's stderr has a uid-sweep refusal; and last `<Worker:ClaudePath>
+helper refuses a variable, the user is not usable, the probe's stderr has a uid-sweep refusal, or (sc-26789, S3) the user has no
+GUI login of its own: the helper answers exit 78, and the readiness error says the owner must establish that user's own GUI
+login before the factory's workers run anywhere; and last `<Worker:ClaudePath>
 --version` as that slot's user through its helper, failing with
 `Upgrade _factory's claude: …` (and the `claude update` command) below `WorkerSandbox.MinClaudeVersion` (2.1.291, the release
 the triage confinement — `--setting-sources ""`, `blockReadsOutsideWorkingDirectories`, `dontAsk` — was checked against; an
@@ -449,7 +465,8 @@ exactly one of `WorkerSandbox.RespawnedAgents` (`/usr/sbin/distnoted agent`; and
 `WorkerSandboxTests.Only_a_respawned_apple_agent_under_launchd_is_no_leftover`,
 `The_agents_launchd_starts_after_simctl_under_launchd_are_no_leftover_and_nothing_like_them_is`); without it every stop after a helper run reported
 a leftover worker and ran the helper again, and `A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits` asserted
-nothing-left against a respawn race. The helper is unchanged (still helper_version 5): its sweep kills the agent as before, so a
+nothing-left against a respawn race. Since S3 (sc-26789) the helper's sweep also spares exactly its own proven `loginwindow`
+creator (above), still kills every respawned agent as before, so a
 worker that runs `/usr/sbin/distnoted agent` itself gains nothing past its slot's next helper exit. The agents a simulator run
 starts in that domain (CoreSimulatorService, SimulatorTrampoline, SimLaunchHost, SimStreamProcessorService, `cfprefsd agent`,
 `lsd`, `secd`, …) are killed by the sweep. Two of them do come back (sc-26134, S6's live run, all passing): seconds after the last
@@ -460,22 +477,26 @@ before, the next `StopAllAsync` counted them as a crashed run's worker (a spurio
 live S6 test checks the user's processes once more 15 s after its own last run as that user (only `RespawnedAgents` allowed). The
 others were not seen to come back.
 
-Residual, accepted by the owner 2026-10-15 (sc-26126; the follow-up is epic sc-26198, "iOS gate checks on GitHub-hosted runners +
-isolated worker sessions"; it is not new — it holds for every sandboxed worker since Phase 1, and
-Phase 5's iOS simulator work depends on it): the sandbox user's process lives in the OWNER's launchd bootstrap and audit
-session. `sudo` changes the uid but keeps the caller's Mach bootstrap port and audit session, so a worker started by a factory
-that runs in the owner's GUI login (Terminal, or a LaunchAgent of the owner's) reports `launchctl managername` = `Aqua` (seen in
-every S0 run for both slots) — inferred, since the sandbox users have no login of their own: the owner's `gui/501` login domain
-(`launchctl print gui/501`: session Aqua, asid 100025, created by `loginwindow`; the process's own audit session is readable
-only by root, `launchctl procinfo`), not a domain of its own. So a worker can LOOK UP every Mach service name of the owner's GUI session (the pasteboard, the owner's `distnoted`,
-WindowServer, `pboard`, the owner's per-session agents) and send it messages; whether each service then serves a client of
-another uid is that service's own check (some check the caller's uid or audit token, some do not), which the factory has not
-tested — no probe has run as `_factory` against any of them, and none will without the owner's OK. What it is NOT: the owner's
-files, keychain or credentials (the ACL deny on the owner's home and the separate uid stand), nor the owner's processes (no
-signal crosses uids). What S6 adds: it relies on it — the simulator and XCUITest work only because the sandbox user is in an Aqua
-session (`launchctl managername` Aqua; untested, and per the research failing, from ssh or as a LaunchDaemon). The alternative
-that removes it, `launchctl asuser <uid>` as root in front of the helper's command (the process in the sandbox user's own
-per-user domain, a sudoers/helper change), is untested and may lose the Aqua session the simulator needs.
+REPLACED BY S3 (sc-26789, epic sc-26198): the residual below was the pre-S3 state — a worker lived in the OWNER's launchd
+bootstrap and audit session, because `sudo` keeps the caller's Mach bootstrap port. S3 removes it: each sandbox user gets its
+OWN GUI login (an owner action: the role account needs a password and a `loginwindow`/Fast-User-Switching login; the factory
+never provisions credentials or logs anyone in by itself), and the root session trampoline above runs every worker inside it
+(`launchctl asuser <uid>` + uid drop, proven by manager uid/name, authoritative login-domain provenance and the kernel start
+identity of the loginwindow creator). Fail closed: without that login the factory's workers refuse to run, and
+`WorkerSandboxTests`' live probe (`A_worker_in_its_own_aqua_login_cannot_look_up_the_owners_pasteboard_distnoted_or_windowserver`,
+behind `FACTORY_SANDBOX_LIVE=1`) records, verbatim, what a worker in its own domain can LOOK UP of the owner's per-session
+services — a lookup only, never a message (`bootstrap_look_up` and, on success, `mach_port_deallocate`: nothing is sent, no
+owner session content is read or changed). Two evidence tiers, neither overstated: a refused lookup gave the worker's domain
+nothing; a succeeded one proves nothing about the receiver — GUI and user domains share one flat lookup namespace and no public
+API names a Mach service's receiver without sending it a message (xpc credentials exist only after a message is exchanged) — so
+its send right is released without a single message and it is recorded `succeeded-unverified: receiver identity unknown,
+nothing sent — not AC2 evidence by itself`. Whether that tier satisfies "cannot obtain" is the owner's decision on the recorded
+outcomes; the factory never claims it. Residual, accepted, of the S3 design: a lookup that succeeds names a capability the
+worker holds for as long as it does not release it, and each service's own uid/audit-token checks (which the factory does not
+exercise, by design: no message is ever sent) are then the only barrier — and the factory's workers still cannot reach the
+owner's files, keychain or credentials (the ACL deny on the owner's home and the separate uid stand), nor the owner's processes
+(no signal crosses uids). What S6 relied on before (the simulator and XCUITest needing an Aqua session) is now met by the
+worker's OWN Aqua login instead of the owner's.
 
 Secrets in the keychain: `security add-generic-password -w` at its interactive prompt truncates at 128 chars
 (Shortcut tokens are longer → 401). Copy the secret, then
@@ -2224,7 +2245,7 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   push is refused (fail closed); and another tool that makes entries writable for others (a prepare step, a build script, a
   raw xcodebuild that build code runs) is not cleaned up: its push is refused as before. Changing the wrapper changed its
   installed copy: `sudo scripts/setup-worker-user.sh [--slots n] --swift` once (start-up refuses a stale wrapper with
-  `Worker:Swift=true`); the launch helper is unchanged (helper_version 5).
+  `Worker:Swift=true`); at sc-26134 the launch helper was unchanged (helper_version 5; S3's session trampoline since raised it to 6, above).
   (2) MCP session files, read isolation: the work root's inherited read entry names every slot's user, so with several slots
   each session directory is made its own slot's user's alone before a session's file is written
   (`WorkerSandbox.RestrictToWorkerAsync`, every slot's, slot 1's `mcp-sessions` included: `chmod -N` — every entry gone, the
@@ -2660,8 +2681,8 @@ Secrets in the keychain: `security add-generic-password -w` at its interactive p
   followed; exit 70 when the parent leads out of the home or the directory is still there). Per-slot caches: the launch helper gives every worker its own user's HOME and TMPDIR, so each slot's
   DerivedData and SwiftPM checkouts are its own; so are SwiftPM's own caches (`~/Library/Caches/org.swift.swiftpm`,
   `~/Library/org.swift.swiftpm`; `SwiftToolchain.SwiftPmCachesOf`) wherever a worker runs `swift build`/`swift test` directly —
-  those allow rules are not this story's (they come with sc-26127's SwiftPM support). `factory-worker-launch` is unchanged
-  (helper_version 5). Checks, only with `Worker:Swift=true` (`WorkerSandbox.Swift`, set on every slot by `WorkerSlots.Create`):
+  those allow rules are not this story's (they come with sc-26127's SwiftPM support). `factory-worker-launch` was unchanged at
+  sc-26130 (helper_version 5; S3's session trampoline since raised it to 6, above). Checks, only with `Worker:Swift=true` (`WorkerSandbox.Swift`, set on every slot by `WorkerSlots.Create`):
   start-up and every run's start read the installed wrapper (must equal the compiled-in `scripts/factory-xcodebuild` by SHA-256;
   runs nothing), and each slot's readiness probe (its first worker phase, under its lock, through its own helper, as its user)
   runs `/usr/bin/swift --version`, `/usr/bin/xcodebuild -version`, `-checkFirstLaunchStatus`, `-license check`, `-showsdks`

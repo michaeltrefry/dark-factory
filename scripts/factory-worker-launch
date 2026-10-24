@@ -1,12 +1,19 @@
-#!/bin/bash
+#!/bin/bash -p
 # factory-worker-launch — runs one Dark Factory worker command as a sandbox user.
 #
 # Installed root-owned by scripts/setup-worker-user.sh, one copy per sandbox user (a worker slot,
 # Worker:Slots): /usr/local/libexec/dark-factory/factory-worker-launch for the first (_factory),
-# factory-worker-launch-2 for _factory2, and so on. Setup sets sandbox_user and sandbox_uid below in
-# each copy to that copy's own user, and the sudoers rules let the owner run each copy only as its
-# user. The orchestrator runs it with
-#   sudo -n -u _factory factory-worker-launch <program> [args...]
+# factory-worker-launch-2 for _factory2, and so on. Setup sets sandbox_user, sandbox_uid and
+# sandbox_owner below in each copy to that copy's own user, uid and installing owner, and the
+# sudoers rules let the owner run each copy only as ROOT. The orchestrator runs it with
+#   sudo -n -u root factory-worker-launch <program> [args...]
+# whose first half (sc-26789, S3) adopts that user's own EXISTING GUI login (launchctl asuser: it
+# creates no Aqua session of itself), drops the uid and re-enters this same file, whose
+# unprivileged half proves the landed identity — own uid and user, manageruid/managername of the
+# pinned uid and Aqua, an authoritative gui/<uid> login domain created by loginwindow and the
+# kernel start identity of that creator — before it reads the stdin protocol or runs the program.
+# Without that proof the worker never starts (exit 78): a worker never runs in the owner's
+# bootstrap, and a sandbox user without its own GUI login refuses everything.
 #
 # Protocol (stdin):
 #   KEY=VALUE lines for the router variables, then one empty line. ANTHROPIC_CUSTOM_HEADERS
@@ -43,10 +50,90 @@ set -eu
 sandbox_user=_factory
 # Pinned by setup-worker-user.sh; empty in the repo, so an uninstalled copy never sweeps.
 sandbox_uid=
+# Pinned to the installing owner; only that owner may invoke the root trampoline.
+sandbox_owner=
 # The orchestrator refuses to start unless the installed helper is this file (EnsureReadyAsync):
 # re-run setup-worker-user.sh after any change here.
 # shellcheck disable=SC2034 # read by the orchestrator, not by this script
-helper_version=5
+helper_version=6
+
+# Root does nothing with the caller's protocol or requested program. The installed, pinned helper
+# is the sole sudoers command; it adopts an EXISTING login, drops uid, then re-enters this same
+# trusted file. asuser does not create Aqua: the unprivileged half proves that independently.
+# bash -p ignores BASH_ENV and exported functions, including those of an invoking worker.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+if [ "$(uname -s)" = Darwin ] && [ "$(id -u)" = 0 ]; then
+    case "$sandbox_uid" in '' | *[!0-9]*) echo 'factory-worker-launch: no pinned session uid' >&2; exit 78 ;; esac
+    [ "$sandbox_uid" -ge 400 ] && [ "$sandbox_uid" -le 499 ] \
+        && [ "$(id -u "$sandbox_user")" = "$sandbox_uid" ] \
+        && [ -n "$sandbox_owner" ] && [ "${SUDO_USER:-}" = "$sandbox_owner" ] \
+        && [ "$(id -u "$sandbox_owner")" = "${SUDO_UID:-}" ] \
+        && [ "${SUDO_UID:-0}" -gt 0 ] && [ "${SUDO_UID:-0}" != "$sandbox_uid" ] \
+        || { echo 'factory-worker-launch: refusing root session trampoline identity' >&2; exit 78; }
+    case "$0" in
+        /usr/local/libexec/dark-factory/factory-worker-launch | /usr/local/libexec/dark-factory/factory-worker-launch-[2-8]) ;;
+        *) echo 'factory-worker-launch: refusing uninstalled session trampoline path' >&2; exit 78 ;;
+    esac
+    for trusted in /usr/local /usr/local/libexec /usr/local/libexec/dark-factory "$0"; do
+        [ ! -L "$trusted" ] && [ "$(/usr/bin/stat -f '%u:%Lp' "$trusted")" = '0:755' ] \
+            || { echo 'factory-worker-launch: session trampoline must be root-owned 0755 without links' >&2; exit 78; }
+    done
+    exec /bin/launchctl asuser "$sandbox_uid" /usr/bin/sudo -n -u "$sandbox_user" -- "$0" "$@"
+fi
+
+session_failure() {
+    echo "factory-worker-launch: refusing worker outside its own Aqua login ($sandbox_user uid $sandbox_uid): $*. Have the owner establish this user's own GUI login; bootstrap adoption alone does not create one" >&2
+    exit 78
+}
+
+# Only launchd's own login-domain creator is exempt from the uid sweep. NOT every agent under
+# launchd, a command name, or descendants of loginwindow: repository code must not gain persistence.
+# The print format is not a stable API. Unknown/duplicate identity fields refuse, never guess.
+read_gui_identity() {
+    /bin/launchctl print "gui/$sandbox_uid" 2>/dev/null | /usr/bin/awk -v uid="$sandbox_uid" '
+        BEGIN { depth = 0 }
+        { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+        depth == 0 && line == "gui/" uid " = {" { headers++ }
+        depth == 1 && line ~ /^type = / { types++; if (line == "type = login") login++ }
+        depth == 1 && line ~ /^creator = / { creators++;
+            if (line ~ /^creator = loginwindow\[[0-9]+\]$/) { creator = line; sub(/^.*\[/, "", creator); sub(/\]$/, "", creator) } }
+        depth == 1 && line == "security context = {" { contexts++; security = 1 }
+        security && depth == 2 && line ~ /^uid = / { uids++; if (line == "uid = " uid) own++ }
+        security && depth == 2 && line ~ /^asid = / { asids++; asid = line; sub(/^asid = /, "", asid) }
+        security && depth == 2 && line == "}" { security = 0 }
+        { opens = gsub(/\{/, "{", $0); closes = gsub(/\}/, "}", $0); depth += opens - closes }
+        END { if (depth == 0 && headers == 1 && types == 1 && login == 1 && creators == 1 && creator + 0 > 1 \
+                   && contexts == 1 && uids == 1 && own == 1 && asids == 1 && asid ~ /^[0-9]+$/ && asid + 0 > 0)
+                  print uid, asid, creator; else exit 1 }'
+}
+
+creator_identity() {
+    /bin/ps -ww -p "$protected_creator" -o uid=,lstart=,comm= | /usr/bin/awk -v uid="$sandbox_uid" '
+        NF == 7 && $1 == uid && $7 == "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow" { $1 = $1; print }'
+}
+
+protected_creator=
+gui_identity=
+creator_stamp=
+verify_gui_session() {
+    [ "$(id -u)" = "$sandbox_uid" ] && [ "$(id -un)" = "$sandbox_user" ] \
+        || session_failure 'effective identity is not the pinned slot user'
+    [ "$(/bin/launchctl manageruid)" = "$sandbox_uid" ] && [ "$(/bin/launchctl managername)" = Aqua ] \
+        || session_failure 'bootstrap manager uid/name do not match the slot uid and Aqua'
+    gui_identity=$(read_gui_identity) || session_failure 'unrecognised or mismatched login-domain provenance'
+    protected_creator=${gui_identity##* }
+    creator_stamp=$(creator_identity)
+    [ -n "$creator_stamp" ] || session_failure 'login-domain creator is not a live own-uid system loginwindow'
+}
+if [ "$(uname -s)" = Darwin ]; then
+    verify_gui_session
+    # Owner-side StopAllAsync asks which exact lifecycle process is not a crashed worker. This
+    # read-only query starts no worker and performs no sweep; it still proves the complete identity.
+    if [ "${1:-}" = __factory_session_status ]; then
+        printf 'factory-gui %s\n' "$gui_identity"
+        exit 0
+    fi
+fi
 
 usage() {
     echo "usage: factory-worker-launch <program> [args...] (router variables on stdin)" >&2
@@ -222,9 +309,17 @@ kill_sandbox_user() {
     [ "$is_sandbox_user" -eq 1 ] && [ "$uid_sweep_ok" -eq 1 ] || return 0
     local pass pid fresh signalled=" "
     for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if [ -n "$protected_creator" ]; then
+            # Re-check both provenance and kernel process start identity at every pass. A reused
+            # pid or a changed login creator is not the login this run proved before worker entry.
+            if [ "$(read_gui_identity 3>&-)" != "$gui_identity" ] || [ "$(creator_identity 3>&-)" != "$creator_stamp" ]; then
+                echo 'factory-worker-launch: login creator changed during worker cleanup; refusing an unproven uid sweep' >&3
+                return 1
+            fi
+        fi
         fresh=()
         for pid in $(list_uid_procs 3>&- | outside_tree "$$" 3>&-); do
-            [ "$pid" != "$$" ] || continue
+            [ "$pid" != "$$" ] && [ "$pid" != "$protected_creator" ] || continue
             case "$signalled" in *" $pid "*) continue ;; esac
             signalled="$signalled$pid "
             fresh+=("$pid")
@@ -279,5 +374,5 @@ wait "$worker" 2>/dev/null || status=$?
 # redirected wait on the next put that report on the helper's real stderr.
 { send_signal "$watcher" || true; wait "$watcher" || true; } 2>/dev/null
 send_signal -KILL -- "-$worker" || true # nothing the worker started outlives the run
-kill_sandbox_user
+kill_sandbox_user || status=78
 exit "$status"

@@ -110,7 +110,22 @@ public class SetupScriptTests
         var installed = File.ReadAllText(run.InstalledHelper); // only read: never run
         Assert.Contains("\nsandbox_user=_dftest\n", installed);
         Assert.Contains("\nsandbox_uid=450\n", installed);
+        Assert.Contains("\nsandbox_owner=owner\n", installed); // the root trampoline runs only for the installing owner (sc-26789)
         Assert.Null(Worker.WorkerSandbox.StaleHelperReason(installed, "_dftest"));
+    }
+
+    [Fact]
+    public async Task Setup_refuses_to_install_the_root_trampoline_under_a_writable_parent_and_installs_nothing()
+    {
+        // sc-26789: the helper's root half is a sudoers command, so its directory chain may not be writable by anyone
+        // but root. A parent that already fails the check is refused, never silently repaired by setup.
+        var run = new WholeScriptRun(_dir, writablePath: "/usr/local");
+
+        var (exitCode, output) = await run.RunAsync();
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("Session trampoline parent /usr/local must be a root-owned 0755 directory without links; nothing was installed", output);
+        Assert.DoesNotContain(run.Calls, c => Changes(c));
     }
 
     // ---- Worker slots (sc-25989): --slots <n> sets up n users, each with a helper copy pinned to itself ----
@@ -137,9 +152,10 @@ public class SetupScriptTests
         // The paths are the ones the orchestrator derives for the slots.
         Assert.Contains(calls, c => c.StartsWith("install ") && c.EndsWith(" " + Worker.WorkerSlots.HelperOf(WholeScriptRun.HelperPath, 1)));
         Assert.Contains(calls, c => c.StartsWith("install ") && c.EndsWith(" " + Worker.WorkerSlots.HelperOf(WholeScriptRun.HelperPath, 2)));
-        // One sudoers rule per slot: that slot's helper, as that slot's user only.
+        // One root rule per slot (sc-26789): the pinned session trampoline runs as root only — its first
+        // half adopts the worker's own Aqua login, drops the uid, and re-enters itself as that worker.
         Assert.Equal(
-            [$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}", $"owner ALL=(_dftest2) NOPASSWD: {WholeScriptRun.HelperPath}-2"],
+            [$"owner ALL=(root) NOPASSWD: {WholeScriptRun.HelperPath}", $"owner ALL=(root) NOPASSWD: {WholeScriptRun.HelperPath}-2"],
             run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
         // Each user: its home made its own and closed, the owner's home denied, the work root readable.
         foreach (var user in new[] { "_dftest", "_dftest2" })
@@ -151,10 +167,10 @@ public class SetupScriptTests
             // Its own Claude Code install, and the toolchain checked through its own helper as itself.
             Assert.Contains(calls, c => c.StartsWith($"sudo -u {user} env -i HOME=/Users/{user} ") && c.Contains("claude.ai/install.sh"));
         }
-        Assert.Contains(calls, c => c.StartsWith($"sudo -u owner sudo -n -u _dftest {WholeScriptRun.HelperPath} "));
-        Assert.Contains(calls, c => c.StartsWith($"sudo -u owner sudo -n -u _dftest2 {WholeScriptRun.HelperPath}-2 "));
-        // Never one slot's helper as the other slot's user.
-        Assert.DoesNotContain(calls, c => c.Contains($"-u _dftest2 {WholeScriptRun.HelperPath} ") || c.Contains($"-u _dftest {WholeScriptRun.HelperPath}-2 "));
+        Assert.Contains(calls, c => c.StartsWith($"sudo -u owner sudo -n -u root {WholeScriptRun.HelperPath} "));
+        Assert.Contains(calls, c => c.StartsWith($"sudo -u owner sudo -n -u root {WholeScriptRun.HelperPath}-2 "));
+        // Never any helper as a worker user directly: the root trampoline is the only rule.
+        Assert.DoesNotContain(calls, c => c.Contains($"-u _dftest {WholeScriptRun.HelperPath}") || c.Contains($"-u _dftest2 {WholeScriptRun.HelperPath}"));
         Assert.Contains("Set Worker__Slots=2", output);
         Assert.Contains("--slots 2 --remove-worker-login", output);
     }
@@ -169,7 +185,7 @@ public class SetupScriptTests
         Assert.True(exitCode == 0, output);
         Assert.Single(run.Calls, c => c.StartsWith("install ") && c.Contains("factory-worker-launch"));
         Assert.Contains(run.Calls, c => c.StartsWith("install ") && c.EndsWith(" " + WholeScriptRun.HelperPath));
-        Assert.Equal([$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
+        Assert.Equal([$"owner ALL=(root) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
         // Nothing is set up for a second user (the only mention of it is the read that finds no such account).
         Assert.DoesNotContain(run.Calls, c => c.Contains("_dftest2") && c != "dscl . -read /Users/_dftest2");
         Assert.DoesNotContain("Worker__Slots", output);
@@ -200,7 +216,7 @@ public class SetupScriptTests
         Assert.True(exitCode == 0, output);
         // Exactly the fixed paths of slots 2 to 8, each by name: no glob, no directory, no -r, and never slot 1's helper.
         Assert.Equal(HelperRemovals(2), Removals(run.Calls.Skip(before)));
-        Assert.Equal([$"owner ALL=(_dftest) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
+        Assert.Equal([$"owner ALL=(root) NOPASSWD: {WholeScriptRun.HelperPath}"], run.Sudoers.Split('\n').Where(l => l.Contains("NOPASSWD")));
         // The rules are replaced before the helpers go.
         var calls = run.Calls.Skip(before).ToList();
         Assert.True(calls.FindIndex(c => c.StartsWith("install ") && c.EndsWith("/sudoers.d/dark-factory")) < calls.FindIndex(c => c.StartsWith("rm ")), output);
@@ -541,7 +557,7 @@ public class SetupScriptTests
 
     public static TheoryData<string, string> SimulatorFailures => new()
     {
-        { "not-aqua", "FAIL  /bin/launchctl managername is 'Background', not 'Aqua': run this script from the owner's GUI login session" },
+        { "not-aqua", "FAIL  /bin/launchctl managername is 'Background', not 'Aqua': the worker user needs a GUI login OF ITS OWN" },
         { "no-runtime", "FAIL  /usr/bin/xcrun simctl list runtimes -j lists no available iOS simulator runtime (sudo xcodebuild -downloadPlatform iOS)" },
         { "no-iphone", "FAIL  /usr/bin/xcrun simctl list devicetypes -j lists no iPhone simulator device type (sudo xcodebuild -downloadPlatform iOS)" },
     };
@@ -562,7 +578,7 @@ public class SetupScriptTests
         Assert.Equal(1, exitCode);
         Assert.Contains(why, output);
         Assert.Contains("The Swift toolchain is not usable by: _dftest2 (worker slot 2)\n", output);
-        Assert.Contains(what == "not-aqua" ? "launchctl managername not Aqua: run this script from the owner's GUI login session"
+        Assert.Contains(what == "not-aqua" ? "launchctl managername not Aqua: the worker user needs a GUI login of its own (sc-26789"
             : "xcrun simctl list without an available iOS runtime or an iPhone device type: sudo xcodebuild -downloadPlatform iOS", output);
         Assert.Contains("ok    /usr/bin/xcrun simctl list devicetypes -j", output); // slot 1's passed
         if (what == "not-aqua")
@@ -655,9 +671,9 @@ public class SetupScriptTests
         foreach (var (user, helper) in new[] { ("_dftest", WholeScriptRun.HelperPath), ("_dftest2", WholeScriptRun.HelperPath + "-2") })
         {
             Assert.Contains($"Checking the Swift toolchain as {user} through the helper (--swift: required)", output);
-            Assert.All(SwiftChecks, check => Assert.Contains($"sudo -u owner sudo -n -u {user} {helper} {check}", run.Calls));
-            Assert.Equal(SimulatorChecks.Select(check => $"sudo -u owner sudo -n -u {user} {helper} {check}"),
-                run.Calls.Where(c => c.StartsWith($"sudo -u owner sudo -n -u {user} {helper} ", StringComparison.Ordinal) && SimulatorChecks.Any(c.EndsWith)));
+            Assert.All(SwiftChecks, check => Assert.Contains($"sudo -u owner sudo -n -u root {helper} {check}", run.Calls));
+            Assert.Equal(SimulatorChecks.Select(check => $"sudo -u owner sudo -n -u root {helper} {check}"),
+                run.Calls.Where(c => c.StartsWith($"sudo -u owner sudo -n -u root {helper} ", StringComparison.Ordinal) && SimulatorChecks.Any(c.EndsWith)));
         }
     }
 
@@ -684,7 +700,7 @@ public class SetupScriptTests
         var (exitCode, output) = await run.RunAsync("--slots", "2", "--swift");
 
         Assert.Equal(1, exitCode);
-        Assert.All(SwiftChecks, check => Assert.Contains($"sudo -u owner sudo -n -u _dftest2 {WholeScriptRun.HelperPath}-2 {check}", run.Calls));
+        Assert.All(SwiftChecks, check => Assert.Contains($"sudo -u owner sudo -n -u root {WholeScriptRun.HelperPath}-2 {check}", run.Calls));
         Assert.Contains("FAIL  /usr/bin/xcodebuild -showsdks lists no iphonesimulator SDK", output);
         Assert.Contains("ok    SDK macosx", output);
         Assert.Contains("The Swift toolchain is not usable by: _dftest (worker slot 1); _dftest2 (worker slot 2)\n", output);
@@ -711,6 +727,14 @@ public class SetupScriptTests
 
         /// <summary>Where setup installs slot 1's helper (its default).</summary>
         public const string HelperPath = "/usr/local/libexec/dark-factory/factory-worker-launch";
+
+        /// <summary>
+        /// The fragment of the installed helper's path that names slot of <paramref name="user"/>'s copy: the root trampoline
+        /// (sc-26789) names no worker user, so the fake sudo keys a slot's failing answer on its helper path instead.
+        /// </summary>
+        private static string SlotHelper(string? user) => user is null
+            ? "nobody-fails "
+            : user.EndsWith('2') ? "factory-worker-launch-2 " : "factory-worker-launch ";
 
         /// <param name="swiftFailsFor">A worker user (<c>_dftest</c> or <c>_dftest2</c>) whose Xcode first launch the fake helper reports as not done (exit 69).</param>
         /// <param name="sdksMissingFor">A worker user whose <c>xcodebuild -showsdks</c> lists no iOS Simulator SDK.</param>
@@ -755,15 +779,15 @@ public class SetupScriptTests
                     case "$a" in
                         */factory-worker-launch | */factory-worker-launch-[0-9])
                             IFS= read -r _
-                            case "$* " in *"-u {{swiftFailsFor ?? "nobody-fails"}} "*-checkFirstLaunchStatus*) echo "first launch tasks are not done" >&2; exit 69 ;; esac
+                            case "$* " in *"{{SlotHelper(swiftFailsFor)}}"*-checkFirstLaunchStatus*) echo "first launch tasks are not done" >&2; exit 69 ;; esac
                             case "$* " in
-                                *"-u {{sdksMissingFor ?? "nobody-fails"}} "*-showsdks*) printf 'macOS SDKs:\n\tmacOS 26.5\t-sdk macosx26.5\n'; exit 0 ;;
+                                *"{{SlotHelper(sdksMissingFor)}}"*-showsdks*) printf 'macOS SDKs:\n\tmacOS 26.5\t-sdk macosx26.5\n'; exit 0 ;;
                                 *-showsdks*) printf 'macOS SDKs:\n\tmacOS 26.5\t-sdk macosx26.5\niOS Simulator SDKs:\n\tSimulator - iOS 26.5\t-sdk iphonesimulator26.5\n'; exit 0 ;;
-                                *"-u {{notAquaFor ?? "nobody-fails"}} "*"/bin/launchctl managername"*) echo Background; exit 0 ;;
+                                *"{{SlotHelper(notAquaFor)}}"*"/bin/launchctl managername"*) echo Background; exit 0 ;;
                                 *"/bin/launchctl managername"*) echo Aqua; exit 0 ;;
-                                *"-u {{noRuntimeFor ?? "nobody-fails"}} "*"simctl list runtimes -j"*) printf '%s\n' '{{SimRuntimes.Replace("\"isAvailable\" : true", "\"isAvailable\" : false")}}'; exit 0 ;;
+                                *"{{SlotHelper(noRuntimeFor)}}"*"simctl list runtimes -j"*) printf '%s\n' '{{SimRuntimes.Replace("\"isAvailable\" : true", "\"isAvailable\" : false")}}'; exit 0 ;;
                                 *"simctl list runtimes -j"*) printf '%s\n' '{{SimRuntimes}}'; exit 0 ;;
-                                *"-u {{noIphoneFor ?? "nobody-fails"}} "*"simctl list devicetypes -j"*) printf '%s\n' '{{SimDeviceTypes.Replace("\"productFamily\" : \"iPhone\"", "\"productFamily\" : \"iPad\"")}}'; exit 0 ;;
+                                *"{{SlotHelper(noIphoneFor)}}"*"simctl list devicetypes -j"*) printf '%s\n' '{{SimDeviceTypes.Replace("\"productFamily\" : \"iPhone\"", "\"productFamily\" : \"iPad\"")}}'; exit 0 ;;
                                 *"simctl list devicetypes -j"*) printf '%s\n' '{{SimDeviceTypes}}'; exit 0 ;;
                             esac
                             echo "fake 1.0"; exit 0 ;;
