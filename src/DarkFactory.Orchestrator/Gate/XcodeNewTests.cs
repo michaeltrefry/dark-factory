@@ -181,7 +181,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     private static string Parent(string path) => path.LastIndexOf('/') is var slash and >= 0 ? path[..slash] : "";
 
     /// <summary>The way a test's project is built: the container flag and path, and the scheme (<see cref="NewTestSet.Projects"/>'s value).</summary>
-    private sealed record Build(string Flag, string Container, string Scheme, string Platform = XcodeProject.MacOS)
+    internal sealed record Build(string Flag, string Container, string Scheme, string Platform = XcodeProject.MacOS)
     {
         public override string ToString() => Platform == XcodeProject.MacOS ? $"{Flag}\n{Container}\n{Scheme}" : $"{Flag}\n{Container}\n{Scheme}\n{Platform}";
 

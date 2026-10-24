@@ -45,7 +45,7 @@ public sealed class RemoteIosNewTestsTests
     public async Task No_gate_write_authorization_is_error_and_writes_nothing()
     {
         var github = new FakeWorkflow { Authorized = false };
-        var result = await new RemoteIosNewTests(github).RunAsync(Repo, Request, CancellationToken.None);
+        var result = await new RemoteIosNewTests(github) { CleanupTimeout = TimeSpan.FromMilliseconds(20) }.RunAsync(Repo, Request, CancellationToken.None);
         Assert.Equal("error", result.Outcome);
         Assert.Equal(0, github.Dispatches);
         Assert.Equal(0, github.ResultReads);
@@ -63,7 +63,7 @@ public sealed class RemoteIosNewTestsTests
     public async Task Wrong_run_or_result_provenance_never_passes(string corrupt)
     {
         var github = new FakeWorkflow { Corrupt = corrupt };
-        var result = await new RemoteIosNewTests(github) { PollInterval = TimeSpan.Zero, MaxPolls = 1 }.RunAsync(Repo, Request, CancellationToken.None);
+        var result = await new RemoteIosNewTests(github) { PollInterval = TimeSpan.Zero, CleanupTimeout = TimeSpan.FromMilliseconds(20) }.RunAsync(Repo, Request, CancellationToken.None);
         Assert.Equal("error", result.Outcome);
     }
 
@@ -81,8 +81,8 @@ public sealed class RemoteIosNewTestsTests
     [Fact]
     public async Task A_never_reported_run_is_a_bounded_error_not_a_success()
     {
-        var github = new FakeWorkflow();
-        var result = await new RemoteIosNewTests(github) { MaxPolls = 0 }.RunAsync(Repo, Request, CancellationToken.None);
+        var github = new FakeWorkflow { Never = true };
+        var result = await new RemoteIosNewTests(github) { Timeout = TimeSpan.FromMilliseconds(20), CleanupTimeout = TimeSpan.FromMilliseconds(20), PollInterval = TimeSpan.Zero }.RunAsync(Repo, Request, CancellationToken.None);
         Assert.Equal("error", result.Outcome);
         Assert.Equal(1, github.Dispatches);
         Assert.Equal(0, github.ResultReads);
@@ -126,7 +126,7 @@ public sealed class RemoteIosNewTestsTests
     internal sealed class FakeWorkflow : IIosWorkflowGitHub
     {
         public string? Invalid, Corrupt, EnvironmentCorrupt;
-        public bool Authorized = true;
+        public bool Authorized = true, Never;
         public string BaseOutcome = "failed", HeadOutcome = "passed";
         public int Dispatches, ResultReads;
         public IosSealedWorkflow? DispatchedWorkflow;
@@ -144,6 +144,7 @@ public sealed class RemoteIosNewTestsTests
         }
         public Task<IReadOnlyList<IosWorkflowRun>> RunsAsync(RepoRef repo, CancellationToken ct)
         {
+            if (Never) return Task.FromResult<IReadOnlyList<IosWorkflowRun>>([]);
             var json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "ios-remote", "workflow-run.json"));
             // Hosted sandbox CI run recorded read-only on 2026-10-23. The fake dispatch substitutes its own
             // identity (title, SHA, event, path); attempt/status/conclusion remain the real GitHub shape.
@@ -157,6 +158,7 @@ public sealed class RemoteIosNewTestsTests
                 Path = Corrupt == "path" ? "other.yml" : RemoteIosWorkflow.Path,
             }]);
         }
+        public Task CancelAsync(RepoRef repo, IosWorkflowRun run, CancellationToken ct) => Task.CompletedTask;
         public Task<string> ResultAsync(RepoRef repo, IosWorkflowRun run, string correlation, CancellationToken ct)
         {
             ResultReads++;

@@ -13,6 +13,9 @@ public sealed class PreparedCommits(IReadOnlyDictionary<string, IReadOnlyList<Te
 
     public IReadOnlyList<TestStep> StepsFor(string commit) => steps.TryGetValue(commit, out var s) ? s : [];
 
+    /// <summary>The same declared recipes, before owner-cache expansion, for an isolated remote run.</summary>
+    public IReadOnlyDictionary<string, PrepareRecipe> Recipes { get; init; } = new Dictionary<string, PrepareRecipe>(StringComparer.Ordinal);
+
     /// <summary>Whether any commit has a recipe.</summary>
     public bool Any => steps.Values.Any(s => s.Count > 0);
 
@@ -69,6 +72,7 @@ public sealed class PrepareStage(ArtifactFetcher fetcher, TimeSpan? timeout = nu
         Func<ArtifactDownloaded, CancellationToken, Task>? onDownloaded, IReadOnlyList<ChangedFile>? changes, CancellationToken ct)
     {
         changes ??= await runner.ChangesAsync(repo, baseSha, headSha, ct);
+        var recipes = new Dictionary<string, PrepareRecipe>(StringComparer.Ordinal);
         async Task<IReadOnlyList<TestStep>> StepsOf(string commit)
         {
             if (await runner.ReadAsync(repo, commit, PrepareRecipe.Path, ct) is not { } text)
@@ -76,6 +80,7 @@ public sealed class PrepareStage(ArtifactFetcher fetcher, TimeSpan? timeout = nu
                 return [];
             }
             var recipe = PrepareRecipe.Parse(text);
+            recipes[commit] = recipe;
             return PrepareSteps.TestSteps(recipe, await fetcher.EnsureAsync(recipe, onDownloaded, ct));
         }
         static PrepareFailedException Failed(string commit, Exception ex) => new($"{Ci.Short(commit)}'s prepare recipe: {ex.Message}", ex);
@@ -101,6 +106,8 @@ public sealed class PrepareStage(ArtifactFetcher fetcher, TimeSpan? timeout = nu
                 throw Failed(headSha, inner);
             }
             steps[baseSha] = headSteps;
+            recipes.Remove(baseSha);
+            if (recipes.TryGetValue(headSha, out var replacement)) recipes[baseSha] = replacement;
             note = $"base prepared with the head's recipe: the base's own recipe could not be fetched: {ex.Message}";
         }
         catch (Exception ex) when (ex is PrepareRecipeException or ArtifactFetchException)
@@ -118,6 +125,6 @@ public sealed class PrepareStage(ArtifactFetcher fetcher, TimeSpan? timeout = nu
                 throw Failed(headSha, ex);
             }
         }
-        return new PreparedCommits(steps, changes, note);
+        return new PreparedCommits(steps, changes, note) { Recipes = recipes };
     }
 }

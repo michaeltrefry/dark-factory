@@ -17,6 +17,15 @@ on:
       tests:
         required: true
         type: string
+      execution:
+        default: ''
+        type: string
+      execution_budget_seconds:
+        default: ''
+        type: string
+      execution_deadline_unix_seconds:
+        default: ''
+        type: string
 permissions: {}
 jobs:
   sources:
@@ -24,7 +33,26 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      sides: ${{ steps.plan.outputs.sides }}
     steps:
+      - name: Select requested execution side
+        id: plan
+        env:
+          EXECUTION: ${{ inputs.execution }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          execution = os.environ['EXECUTION']
+          sides = ['base', 'head']
+          if execution:
+              side = json.loads(execution)['side']
+              if side not in ('base', 'head'):
+                  raise ValueError('invalid execution side')
+              sides = [side]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sides=' + json.dumps(sides) + '\n')
+          PY
       # No checkout and no repository code in the credentialed job. Only immutable
       # source archives cross into the execution job; the gate token never does.
       - name: Acquire source archives
@@ -77,9 +105,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        side: [base, head]
+        side: ${{ fromJSON(needs.sources.outputs.sides) }}
     runs-on: macos-15
-    timeout-minutes: 30
+    # Hosted hard ceiling only; Python enforces the transported remaining deadline.
+    timeout-minutes: 360
     permissions: {}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -88,7 +117,9 @@ jobs:
           path: sources
       # The embedded collector creates a fresh, non-admin build principal on
       # this disposable VM. Source runs only there, beneath deny-by-default
-      # Seatbelt; the Actions runner retains collection/publication authority.
+      # Seatbelt: no Internet/arbitrary local network, only exact readonly
+      # prefetched registry IPC endpoints if needed. The Actions runner retains
+      # collection/publication authority; no credential reaches source code.
       - name: Run new tests separately on base and head
         shell: /usr/bin/python3 -I {0}
         env:
@@ -97,6 +128,9 @@ jobs:
           BASE: ${{ inputs.base }}
           HEAD: ${{ inputs.head }}
           TESTS: ${{ inputs.tests }}
+          EXECUTION: ${{ inputs.execution }}
+          EXECUTION_BUDGET_SECONDS: ${{ inputs.execution_budget_seconds }}
+          EXECUTION_DEADLINE_UNIX_SECONDS: ${{ inputs.execution_deadline_unix_seconds }}
         run: |
           # FACTORY_RUNNER
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
