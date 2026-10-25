@@ -183,6 +183,8 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// <summary>The way a test's project is built: the container flag and path, and the scheme (<see cref="NewTestSet.Projects"/>'s value).</summary>
     internal sealed record Build(string Flag, string Container, string Scheme, string Platform = XcodeProject.MacOS)
     {
+        // Placement is a scheme property across platforms; execution keeps its original platform below.
+        public (string Flag, string Container, string Scheme) SchemeIdentity => (Flag, Container, Scheme);
         public override string ToString() => Platform == XcodeProject.MacOS ? $"{Flag}\n{Container}\n{Scheme}" : $"{Flag}\n{Container}\n{Scheme}\n{Platform}";
 
         public static Build From(string value) => value.Split('\n') switch

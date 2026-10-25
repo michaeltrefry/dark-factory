@@ -66,6 +66,39 @@ public class GuiRemoteGateTests
         Assert.Empty(source.Runs);
     }
 
+    [Fact]
+    public async Task One_shared_scheme_across_mac_and_ios_promotes_both_platforms_to_gui_without_losing_destinations()
+    {
+        var mac = XcodeProject.Parse("Words.xcodeproj", XcodeFixture.SynchronizedProject).Targets.Single(t => t.Name == "WordsTests");
+        var ios = XcodeProject.Parse("Tally.xcodeproj", XcodeIosFixture.Read(XcodeIosFixture.Pbxproj)).Targets.Single(t => t.Name == "TallyUITests");
+        var workspace = "<Workspace version=\"1.0\"><FileRef location=\"group:Words.xcodeproj\"/><FileRef location=\"group:Tally.xcodeproj\"/></Workspace>";
+        var scheme = $"<Scheme version=\"1.7\"><TestAction buildConfiguration=\"Debug\"><Testables>"
+            + $"<TestableReference skipped=\"NO\"><BuildableReference BlueprintIdentifier=\"{mac.Id}\" BlueprintName=\"WordsTests\" ReferencedContainer=\"container:Words.xcodeproj\"/></TestableReference>"
+            + $"<TestableReference skipped=\"NO\"><BuildableReference BlueprintIdentifier=\"{ios.Id}\" BlueprintName=\"TallyUITests\" ReferencedContainer=\"container:Tally.xcodeproj\"/></TestableReference>"
+            + "</Testables></TestAction></Scheme>";
+        var source = CargoIdentifyTests.Runner([.. XcodeFixture.Files(), .. XcodeIosFixture.Files(),
+            ("Shared.xcworkspace/contents.xcworkspacedata", workspace), ("Shared.xcworkspace/xcshareddata/xcschemes/Unified.xcscheme", scheme)]);
+        source.BaseCommit = RemoteIosGateTests.Base;
+        source.Answer = spec => FakeTestRunner.Report(spec.Steps, spec.OverlayFrom is null ? "passed" : "failed");
+        CargoIdentifyTests.With(source, ("WordsTests/New.swift", "import Testing\n@Test func newMacTest() { #expect(false) }\n"),
+            (XcodeIosFixture.UiTestFile, XcodeIosFixture.UiTest));
+        var gui = new RemoteIosGateTests.Dispatch { Gui = true };
+        var hosted = new RemoteIosGateTests.Dispatch();
+        var result = await NewTestsCheck.RunAsync(source, NewTestsCheck.StrategiesFor(true), new("acme", "not-the-skeleton"),
+            RemoteIosGateTests.Base, RemoteIosGateTests.Head, "gate-sc-1", null, CancellationToken.None,
+            remoteIos: new RemoteIosNewTests(hosted) { PollInterval = TimeSpan.Zero }, remoteGui: new RemoteIosNewTests(gui, gui: Settings) { PollInterval = TimeSpan.Zero });
+        Assert.True(result.Passed, result.Reason);
+        Assert.Empty(source.Runs);
+        Assert.Empty(hosted.Requests);
+        Assert.Equal(2, gui.Requests.Count);
+        Assert.All(gui.Requests, request => {
+            using var descriptor = System.Text.Json.JsonDocument.Parse(request.Execution!);
+            var builds = descriptor.RootElement.GetProperty("builds").EnumerateArray().ToArray();
+            Assert.Equal(new[] { "iOS", "macOS" }, builds.Select(b => b.GetProperty("platform").GetString()).Order(StringComparer.Ordinal));
+            Assert.All(builds, build => { Assert.Equal("Shared.xcworkspace", build.GetProperty("container").GetString()); Assert.Equal("Unified", build.GetProperty("scheme").GetString()); });
+        });
+    }
+
     [Theory]
     [InlineData("gui-hash")]
     [InlineData("hash")]
@@ -155,7 +188,7 @@ public class GuiRemoteGateTests
             await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
             var output = await stdout + await stderr;
             Assert.True(process.ExitCode == 0, output);
-            Assert.Contains("Ran 18 tests", output);
+            Assert.Contains("Ran 23 tests", output);
         }
         finally { owned?.KillIfStillRunning(); Directory.Delete(directory, true); }
     }

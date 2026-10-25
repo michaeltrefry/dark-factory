@@ -344,10 +344,11 @@ public sealed class PrepareGateTests : IDisposable
             + "steps: [{name: copy, argv: [/bin/cp, '${artifact:gen}/Generated.swift', '${worktree}/Tally/Generated.swift']}]\n";
         var runner = WithRecipes(RemoteIosGateTests.Sources(), recipe, recipe);
         var prepared = await Stage().ForCommitsAsync(runner, Repo, RemoteIosGateTests.Base, RemoteIosGateTests.Head, null, CancellationToken.None);
-        var dispatch = new RemoteIosGateTests.Dispatch();
+        var dispatch = new RemoteIosGateTests.Dispatch { Gui = true };
+        var gui = new GuiWorkflowSettings(GuiRemoteGateTests.Settings.Collector, [Repo], GuiRemoteGateTests.Settings.ConfigurationSha256);
         var result = await NewTestsCheck.RunAsync(runner, NewTestsCheck.StrategiesFor(true), Repo,
             RemoteIosGateTests.Base, RemoteIosGateTests.Head, "gate-sc-1", null, CancellationToken.None, prepared,
-            new RemoteIosNewTests(dispatch) { PollInterval = TimeSpan.Zero });
+            remoteGui: new RemoteIosNewTests(dispatch, gui: gui) { PollInterval = TimeSpan.Zero });
         Assert.True(result.Passed, result.Reason);
         Assert.Empty(runner.Runs);
         Assert.Equal(2, dispatch.Requests.Count);

@@ -199,11 +199,18 @@ def sweep(uid):
     # or the three observed per-user agents may remain. Source build products may not.
     for _ in range(20):
         subprocess.run(['/usr/bin/pkill', '-KILL', '-u', str(uid)], capture_output=True, timeout=2)
-        rows = subprocess.run(['/bin/ps', '-U', str(uid), '-o', 'pid=,ppid=,comm='], capture_output=True, check=True, timeout=2).stdout.decode().splitlines()
+        inventory = subprocess.run(['/bin/ps', '-U', str(uid), '-o', 'pid=,ppid=,comm='], capture_output=True, timeout=2)
+        # BSD ps documents status 1 for no matches. Only an entirely empty
+        # answer (stdout AND stderr) proves this case; other failures remain unknown.
+        if inventory.returncode == 1 and not inventory.stdout.strip() and not inventory.stderr.strip():
+            return
+        if inventory.returncode != 0 or inventory.stderr.strip():
+            raise ValueError('GUI process inventory could not be read')
+        rows = inventory.stdout.decode().splitlines()
         remaining = []
         for row in rows:
             fields = row.strip().split(None, 2)
-            if len(fields) != 3:
+            if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit() or int(fields[0]) <= 1:
                 raise ValueError('unreadable GUI process inventory')
             executable = pathlib.Path(fields[2])
             system = str(executable).startswith('/System/Library/') or str(executable) in ('/usr/sbin/distnoted', '/usr/libexec/lsd', '/usr/sbin/cfprefsd')
@@ -221,13 +228,13 @@ def sweep(uid):
 
 def main():
     operation = sys.argv[1]
-    config = configuration(cleanup=operation in ('check', 'sweep', 'remove', 'device-delete'))
+    config = configuration(cleanup=operation in ('check', 'sweep', 'remove', 'device-delete', 'device-reconcile'))
     if operation == 'check' and len(sys.argv) == 2:
         print(json.dumps(config))
         return
     if len(sys.argv) < 3:
         raise ValueError('missing GUI workspace')
-    root = workspace(sys.argv[2], config['collectorUid'], allow_missing=operation in ('remove', 'device-delete'))
+    root = workspace(sys.argv[2], config['collectorUid'], allow_missing=operation in ('remove', 'device-delete', 'device-reconcile'))
     require_lease(config, root)
     if operation == 'run' or not root.exists():
         return execute_operation(config, operation, root)
@@ -245,19 +252,35 @@ def execute_operation(config, operation, root):
         subprocess.run(['/bin/rm', '-rf', '--', str(root)], check=True, timeout=30)
         if root.exists() or root.is_symlink():
             raise ValueError('GUI workspace removal failed')
-    elif operation == 'device-delete' and len(sys.argv) == 4:
-        if not re.fullmatch('[0-9A-Fa-f-]{36}', sys.argv[3]):
-            raise ValueError('invalid GUI device')
+    elif operation in ('device-delete', 'device-reconcile') and len(sys.argv) == 4:
+        by_name = operation == 'device-reconcile'
+        pattern = 'factory-[0-9a-f]{32}' if by_name else '[0-9A-Fa-f-]{36}'
+        if not re.fullmatch(pattern, sys.argv[3]):
+            raise ValueError('invalid owned GUI device identity')
         stop_commands(root)
         sweep(config['sourceUid'])
         inventory = source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'list', 'devices', '-j'])
         if inventory.returncode or len(inventory.stdout) > 8 * 1024 * 1024:
             raise ValueError('GUI device inventory could not be read')
-        devices = json.loads(inventory.stdout)['devices']
-        present = any(device.get('udid') == sys.argv[3] for group in devices.values() for device in group)
-        if present:
-            source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'shutdown', sys.argv[3]])
-            deleted = source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'delete', sys.argv[3]])
+        devices = json.loads(inventory.stdout).get('devices')
+        if not isinstance(devices, dict):
+            raise ValueError('unknown GUI device inventory')
+        matches = []
+        for group in devices.values():
+            if not isinstance(group, list):
+                raise ValueError('unknown GUI device inventory group')
+            for device in group:
+                if (not isinstance(device, dict) or not isinstance(device.get('name'), str)
+                        or not isinstance(device.get('udid'), str) or not re.fullmatch('[0-9A-Fa-f-]{36}', device['udid'])):
+                    raise ValueError('unknown GUI device inventory entry')
+                if device['name' if by_name else 'udid'] == sys.argv[3]:
+                    matches.append(device['udid'])
+        if len(matches) > 1:
+            raise ValueError('owned GUI device identity is ambiguous')
+        if matches:
+            device = matches[0]
+            source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'shutdown', device])
+            deleted = source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'delete', device])
             if deleted.returncode:
                 raise ValueError('GUI device cleanup failed')
     elif operation == 'share' and len(sys.argv) == 4:

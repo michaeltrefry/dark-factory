@@ -1901,9 +1901,15 @@ source processes under the fixed UID, and removes only the verified fresh worksp
 Root-owned Apple GUI agents may remain/respawn; persistent same-user state is the accepted
 trusted-CI residual, not reported as clean-room isolation.
 
-A crash releases the OS lock but keeps its journal. The next job automatically performs bounded
-cleanup/reconciliation of the recorded devices/workspace before starting anything new. Failed
-or unknown cleanup keeps reuse blocked for that invocation; later invocations retry reconciliation.
+A crash releases the OS lock but keeps its journal. Before a factory simulator can be created,
+the journal durably records its exact nonce-generated name, not merely a UDID returned afterwards.
+The next job stops the prior commands and reconciles that intent in the fixed source UID's native
+device inventory, even when creation took effect but its answer was lost. Ambiguous or unreadable
+inventory blocks reuse; unrelated devices are never selected. Recorded UDIDs and workspaces are
+then cleaned idempotently before starting anything new. An empty BSD `ps -U` answer with status 1
+and no stderr is successful quiescence, not an infrastructure failure; actual command failures and
+malformed rows remain unknown. Failed or unknown cleanup keeps reuse blocked for that invocation;
+later invocations retry reconciliation.
 There is no routine human re-arm or approval flag. Malformed protected state or unavailable
 installation authority is a genuine infrastructure error, not permission to discard the journal.
 

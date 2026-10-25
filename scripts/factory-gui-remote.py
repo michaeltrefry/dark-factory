@@ -46,12 +46,23 @@ class GuiLease:
                 if self.marker.stat().st_size > 1024:
                     raise ValueError('invalid GUI cleanup journal')
                 previous = json.loads(self.marker.read_text())
-                if set(previous) != {'root', 'devices'}:
+                if set(previous) != {'root', 'devices', 'deviceIntents'}:
                     raise ValueError('invalid GUI cleanup journal')
                 if not isinstance(previous['devices'], list) or len(previous['devices']) > 10 or any(not isinstance(d, str) or not re.fullmatch('[0-9A-Fa-f-]{36}', d) for d in previous['devices']):
                     raise ValueError('invalid GUI device journal')
+                intents = previous['deviceIntents']
+                if (not isinstance(intents, list) or len(intents) > 10 or len(set(intents)) != len(intents)
+                        or any(not isinstance(name, str) or not re.fullmatch('factory-[0-9a-f]{32}', name) for name in intents)):
+                    raise ValueError('invalid GUI device creation journal')
+                if previous['root'] is None and (previous['devices'] or intents):
+                    raise ValueError('GUI device creation has no workspace authority')
                 if previous['root'] is not None:
                     old = pathlib.Path(previous['root'])
+                    # Intent survives a create whose answer/UDID never arrived.
+                    # Stop the old commands, then reconcile the exact nonce-name
+                    # in the fixed source user's device set before admitting work.
+                    for name in intents:
+                        gui_operation('device-reconcile', old, name, cleanup=True)
                     for device in previous['devices']:
                         gui_operation('device-delete', old, device, cleanup=True)
                     gui_operation('remove', old, cleanup=True)
@@ -63,11 +74,11 @@ class GuiLease:
             self.stream = None
             raise
 
-    def record(self, root, devices=None):
+    def record(self, root, devices=None, device_intents=None):
         temporary = self.directory / ('journal-' + uuid.uuid4().hex)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as output:
-            json.dump({'root': str(root) if root is not None else None, 'devices': devices or []}, output)
+            json.dump({'root': str(root) if root is not None else None, 'devices': devices or [], 'deviceIntents': device_intents or []}, output)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, self.marker)
@@ -107,6 +118,7 @@ class GuiPrincipal:
         self.root = root
         self.uid = GUI_CONFIG['sourceUid']
         self.devices = []
+        self.device_intents = []
         self.home = root / 'home'
         self.worktree = root / os.environ['SIDE']
         self.home.mkdir(mode=0o700)
@@ -136,6 +148,9 @@ class GuiPrincipal:
         environment = dict(self.env)
         if extra_environment:
             environment.update(extra_environment)  # preserve declared recipe env; S5 owns extension
+        if args[:3] == ['/usr/bin/xcrun', 'simctl', 'create'] and len(args) > 3 and re.fullmatch('factory-[0-9a-f]{32}', args[3]):
+            self.device_intents.append(args[3])
+            GUI_LEASE.record(self.root, self.devices, self.device_intents)  # durable BEFORE creation can take effect
         request = self.root / ('command-' + uuid.uuid4().hex + '.json')
         fd = os.open(request, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -151,12 +166,14 @@ class GuiPrincipal:
                 if not re.fullmatch('[0-9A-Fa-f-]{36}', device):
                     raise ValueError('unreadable created GUI device')
                 self.devices.append(device)
-                GUI_LEASE.record(self.root, self.devices)
+                GUI_LEASE.record(self.root, self.devices, self.device_intents)
             return result
         finally:
             request.unlink(missing_ok=True)
 
     def close(self):
+        for name in self.device_intents:
+            gui_operation('device-reconcile', self.root, name, cleanup=True)
         for device in self.devices:
             gui_operation('device-delete', self.root, device, cleanup=True)
         gui_operation('remove', self.root, cleanup=True)
@@ -212,6 +229,9 @@ def main():
     GUI_CONFIG = json.loads(gui_operation('check'))
     if GUI_CONFIG['collectorRepository'].lower() != os.environ.get('GITHUB_REPOSITORY', '').lower() or GUI_CONFIG['runnerName'] != os.environ.get('RUNNER_NAME'):
         raise ValueError('actual GUI collector registration does not match this workflow job')
+    source = os.environ.get('SOURCE_REPOSITORY')
+    if not isinstance(source, str) or source.lower() not in [repo.lower() for repo in GUI_CONFIG['trustedRepositories']]:
+        raise ValueError('GUI source repository is not in the protected allowlist')
     ENVIRONMENT = {key: GUI_CONFIG[key] for key in ('runtime', 'deviceType', 'xcode', 'build')}
     pathlib.Path('result.json').unlink(missing_ok=True)
     with GuiLease(GUI_CONFIG) as lease:

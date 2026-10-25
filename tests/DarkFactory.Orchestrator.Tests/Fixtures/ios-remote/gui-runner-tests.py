@@ -19,6 +19,7 @@ module = runpy.run_path(sys.argv[1], run_name='sealed_gui_fixture')
 g = module['main'].__globals__
 helper = runpy.run_path(sys.argv[2], run_name='root_helper_fixture')
 h = helper['main'].__globals__
+helper_bytes = pathlib.Path(sys.argv[2]).read_bytes()
 TEST = 'WidgetTests/Suite/newTest()'
 
 
@@ -70,7 +71,7 @@ class GuiContracts(unittest.TestCase):
         previous.mkdir()
         marker = self.root / 'active.json'
         device = '11111111-1111-1111-1111-111111111111'
-        marker.write_text(json.dumps({'root': str(previous), 'devices': [device]}))
+        marker.write_text(json.dumps({'root': str(previous), 'devices': [device], 'deviceIntents': []}))
         with mock.patch.dict(g, gui_operation=mock.Mock(side_effect=ValueError('not stopped'))):
             with self.assertRaises(ValueError):
                 with g['GuiLease']({'stateDirectory': str(self.root)}):
@@ -120,7 +121,7 @@ class GuiContracts(unittest.TestCase):
         self.assertNotIn('GITHUB_OUTPUT', environment)
         self.assertEqual(str(self.root / 'home'), environment['HOME'])
 
-    def execute(self, platform='macOS', build_failure=False, cleanup_failure=False, trusted=True):
+    def execute(self, platform='macOS', build_failure=False, cleanup_failure=False, trusted=True, empty_inventory_cleanup=False):
         base, head = '1' * 40, '2' * 40
         plan = {'side': 'base', 'commit': base, 'overlayFrom': head, 'overlayPaths': ['Tests/New.swift'], 'deletePaths': [],
                 'replacements': {}, 'sourceRepository': 'acme/source', 'builds': [{'flag': '-project', 'container': 'Widget.xcodeproj',
@@ -145,6 +146,9 @@ class GuiContracts(unittest.TestCase):
                     {'nodeType': 'Test Case', 'nodeIdentifier': 'Suite/newTest()', 'result': 'Failed'}]}]})
             def close(inner):
                 shutil.rmtree(inner.root)
+                if empty_inventory_cleanup:
+                    with mock.patch.object(subprocess, 'run', side_effect=self.ps_answer()):
+                        h['sweep'](502)
                 if cleanup_failure: raise ValueError('cleanup failed')
         (self.root / 'sources').mkdir()
         for side in ('base', 'head'):
@@ -188,6 +192,137 @@ class GuiContracts(unittest.TestCase):
     def test_failed_cleanup_publishes_no_evidence(self):
         with self.assertRaises(ValueError): self.execute(cleanup_failure=True)
         self.assertFalse((self.root / 'result.json').exists())
+
+    @staticmethod
+    def ps_answer(code=1, output=b'', error=b''):
+        from types import SimpleNamespace
+        def answer(args, **kwargs):
+            result = SimpleNamespace(returncode=code, stdout=output, stderr=error) if args[0] == '/bin/ps' else SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+            if kwargs.get('check') and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, args, output=result.stdout, stderr=result.stderr)
+            return result
+        return answer
+
+    def test_ps_no_matches_exit_one_empty_allows_evidence_and_reuse(self):
+        result, error = None, None
+        try: result = self.execute(empty_inventory_cleanup=True)
+        except Exception as caught: error = caught
+        self.assertIsNone(error, 'an empty successful UID cleanup must not suppress executed evidence')
+        self.assertEqual('ran', result['execution']['status'])
+        state = self.root / 'empty-cleanup-state'
+        state.mkdir()
+        with g['GuiLease']({'stateDirectory': str(state)}): pass
+        with g['GuiLease']({'stateDirectory': str(state)}): pass
+        self.assertFalse((state / 'active.json').exists())
+
+    def test_malformed_or_failed_process_inventory_keeps_reuse_quarantined(self):
+        for index, (code, output, error) in enumerate(((1, b'', b'unknown user'), (2, b'', b'failed'), (0, b'malformed', b''))):
+            with self.subTest(code=code, output=output, error=error):
+                state = self.root / ('bad-inventory-' + str(index))
+                state.mkdir()
+                workspace = self.root / ('bad-work-' + str(index))
+                workspace.mkdir()
+                failure = None
+                try:
+                    with g['GuiLease']({'stateDirectory': str(state)}) as lease:
+                        lease.record(workspace)
+                        with mock.patch.object(subprocess, 'run', side_effect=self.ps_answer(code, output, error)):
+                            h['sweep'](502)
+                except Exception as caught: failure = caught
+                self.assertIsInstance(failure, ValueError)
+                self.assertTrue((state / 'active.json').exists())
+                with mock.patch.dict(g, gui_operation=mock.Mock(side_effect=ValueError('inventory still unknown'))):
+                    with self.assertRaises(ValueError):
+                        with g['GuiLease']({'stateDirectory': str(state)}): self.fail('replacement admitted')
+
+    def test_creation_effect_with_lost_answer_is_reconciled_by_durable_exact_name_before_new_work(self):
+        from types import SimpleNamespace
+        state = self.root / 'creation-state'
+        state.mkdir()
+        workspace = self.root / 'creation-work'
+        workspace.mkdir()
+        name = 'factory-' + 'c' * 32
+        owned = '11111111-1111-1111-1111-111111111111'
+        unrelated = {'name': 'unrelated-existing-device', 'udid': '22222222-2222-2222-2222-222222222222'}
+        inventory = [dict(unrelated)]
+        events = []
+        config = {'stateDirectory': str(state), 'sourceUid': os.getuid(), 'developer': '/usr'}
+        def source_tool(fixed, root, args):
+            self.assertEqual(config['sourceUid'], fixed['sourceUid'])
+            if args[2:4] == ['list', 'devices']:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({'devices': {'runtime': inventory}}).encode())
+            if args[2] == 'delete':
+                self.assertEqual(owned, args[3])
+                inventory[:] = [d for d in inventory if d['udid'] != args[3]]
+                events.append('owned-device-removed')
+            return SimpleNamespace(returncode=0, stdout=b'')
+        def operation(action, root=None, extra=None, cleanup=False):
+            if action == 'device-reconcile':
+                with mock.patch.dict(h, source_tool=source_tool, stop_commands=lambda *a: None, sweep=lambda *a: None), \
+                        mock.patch.object(sys, 'argv', ['helper', action, str(root), extra]):
+                    h['execute_operation'](config, action, root)
+            elif action == 'remove':
+                shutil.rmtree(root)
+                events.append('workspace-removed')
+            return ''
+        def command(args, cwd, **kwargs):
+            payload = json.loads(pathlib.Path(args[-1]).read_text())
+            argv = payload['argv']
+            if argv == ['/bin/launchctl', 'managername']: return 0, 'Aqua'
+            if argv == ['/usr/bin/id', '-u']: return 0, str(os.getuid())
+            journal = json.loads((state / 'active.json').read_text())
+            self.assertEqual([name], journal.get('deviceIntents'), 'creation must be journaled BEFORE simctl can create')
+            inventory.append({'name': name, 'udid': owned})
+            events.append('creation-effect-with-lost-answer')
+            raise ValueError('collector lost the creation answer')
+        with mock.patch.dict(g, GUI_CONFIG=config, gui_operation=operation, command=command):
+            with g['GuiLease'](config) as lease:
+                with mock.patch.dict(g, GUI_LEASE=lease):
+                    principal = g['GuiPrincipal'](workspace)
+                    with self.assertRaises(ValueError):
+                        principal.run(['/usr/bin/xcrun', 'simctl', 'create', name, 'phone', 'runtime'], workspace)
+            self.assertEqual([name], json.loads((state / 'active.json').read_text())['deviceIntents'])
+            with g['GuiLease'](config):
+                events.append('new-work-admitted')
+                self.assertEqual([unrelated], inventory)
+        self.assertEqual(['creation-effect-with-lost-answer', 'owned-device-removed', 'workspace-removed', 'new-work-admitted'], events)
+
+    def test_ambiguous_or_unreadable_creation_intent_inventory_never_deletes_a_device(self):
+        from types import SimpleNamespace
+        name = 'factory-' + 'd' * 32
+        inventories = [{'devices': {'runtime': [{'name': name, 'udid': '1' * 8 + '-1111-1111-1111-' + '1' * 12},
+                                               {'name': name, 'udid': '2' * 8 + '-2222-2222-2222-' + '2' * 12}]}},
+                       {'devices': {'runtime': [{'name': name, 'udid': 'unknown'}]}}, {'devices': ['unknown']}]
+        for inventory in inventories:
+            with self.subTest(inventory=inventory):
+                tool = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(inventory).encode()))
+                with mock.patch.dict(h, source_tool=tool, stop_commands=lambda *a: None, sweep=lambda *a: None), \
+                        mock.patch.object(sys, 'argv', ['helper', 'device-reconcile', str(self.root), name]):
+                    with self.assertRaises(ValueError): h['execute_operation']({'sourceUid': 502}, 'device-reconcile', self.root)
+                self.assertFalse(any(call.args[2][2] == 'delete' for call in tool.call_args_list))
+
+    def test_outer_empty_execution_refuses_source_missing_from_protected_allowlist_before_any_workspace(self):
+        from types import SimpleNamespace
+        class ProtectedHelper:
+            parents = ()
+            def lstat(self): return SimpleNamespace(st_mode=0o100755, st_uid=0)
+            def read_bytes(self): return helper_bytes
+            def __str__(self): return 'protected-helper-fixture'
+        config = {'collectorRepository': 'acme/collector', 'runnerName': 'lensworks-guest', 'trustedRepositories': ['acme/other'],
+                  'runtime': 'runtime', 'deviceType': 'phone', 'xcode': '26.5', 'build': '17F42', 'hash': 'a' * 64}
+        lease = mock.Mock(return_value=contextlib.nullcontext(mock.Mock()))
+        legacy = mock.Mock()
+        environment = {'SOURCE_REPOSITORY': 'acme/source', 'GITHUB_REPOSITORY': 'acme/collector', 'RUNNER_NAME': 'lensworks-guest',
+                       'EXECUTION': '', 'EXECUTION_BUDGET_SECONDS': '60', 'EXECUTION_DEADLINE_UNIX_SECONDS': str(time.time() + 60)}
+        error = None
+        with mock.patch.dict(os.environ, environment), mock.patch.dict(g, GUI_HELPER=ProtectedHelper(), GUI_CONFIG=None,
+                command=lambda args, *a, **k: (0, 'Background' if args[0] == '/bin/launchctl' else 'owned\n'),
+                gui_operation=lambda *a, **k: json.dumps(config), GuiLease=lease, _gui_original_main=legacy):
+            try: g['main']()
+            except ValueError as caught: error = caught
+        self.assertIsNotNone(error, 'the protected source allowlist applies before legacy or typed execution')
+        lease.assert_not_called()
+        legacy.assert_not_called()
 
     def configuration(self, same_uid=False, source_sudo=False, source_credential=False, unknown_key=False, cleanup=False):
         from types import SimpleNamespace

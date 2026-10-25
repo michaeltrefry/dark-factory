@@ -480,7 +480,7 @@ public static class NewTestsCheck
                     // base overlay and Swift location metadata for attribution and retries; no iOS test is sent locally.
                     // One scheme may build/run several test targets. A mixed scheme is GUI as a whole;
                     // a missing fact holds the whole scheme, never a hosted guess for its unit-test subset.
-                    var placements = set.Tests.GroupBy(t => set.Projects[t], StringComparer.Ordinal).SelectMany(group =>
+                    var placements = set.Tests.GroupBy(t => XcodeNewTests.Build.From(set.Projects[t]).SchemeIdentity).SelectMany(group =>
                     {
                         var facts = group.Select(t => set.XcodePlacements.GetValueOrDefault(t, XcodeTestPlacement.Unknown)).ToArray();
                         var placement = facts.Contains(XcodeTestPlacement.Unknown) ? XcodeTestPlacement.Unknown
