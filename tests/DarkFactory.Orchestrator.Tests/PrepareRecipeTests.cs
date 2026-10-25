@@ -58,6 +58,29 @@ public class PrepareRecipeTests
         Assert.Null(recipe.Steps[0].Timeout);
     }
 
+    [Fact]
+    public void Test_environment_is_an_optional_commit_specific_recipe_declaration()
+    {
+        var recipe = PrepareRecipe.Parse("version: 1\nsteps: [{name: setup, argv: [make]}]\ntest_env: {REPO_HELPER: '${worktree}/tools/helper', REPO_MODE: fixture}\n");
+        Assert.Single(recipe.Steps);
+    }
+
+    [Theory]
+    [InlineData("HOME", "fixture")]
+    [InlineData("DYLD_INSERT_LIBRARIES", "fixture")]
+    [InlineData("LD_PRELOAD", "fixture")]
+    [InlineData("REPO_API_TOKEN", "fixture")]
+    [InlineData("TEST_RUNNER_HOME", "fixture")]
+    [InlineData("REPO_HELPER", "/Users/owner/private/helper")]
+    [InlineData("REPO_HELPER", "${worktree}/../helper")]
+    [InlineData("REPO_HELPER", "${artifact:sdk}/helper")]
+    [InlineData("REPO_MODE", "__CURRENT_VALUE__")]
+    public void Test_environment_refusals_name_the_key(string key, string value)
+    {
+        var error = Assert.Throws<PrepareRecipeException>(() => PrepareRecipe.Parse($"version: 1\nsteps: [{{name: setup, argv: [make]}}]\ntest_env: {{{key}: '{value}'}}\n"));
+        Assert.Contains(key, error.Message);
+    }
+
     public static TheoryData<string, string> Refused => new()
     {
         { "not: [valid", "is not valid YAML" },

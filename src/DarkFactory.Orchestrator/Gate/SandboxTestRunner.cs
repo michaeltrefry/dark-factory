@@ -61,12 +61,14 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         {
             throw new ArgumentException($"'{spec.ResultsDirectory}' is not a results directory name.", nameof(spec));
         }
+        Prepare.TestEnvironment.Validate(spec.TestEnvironment);
         var workspace = await git.PrepareCommitAsync(repo, spec.Name, spec.Commit, ct);
         var cleaned = false;
         var retain = false;
+        var environmentValidated = spec.TestEnvironment.Count == 0;
         try
         {
-            var report = await RunInWorktreeAsync(workspace, spec, ct);
+            var report = await RunInWorktreeAsync(workspace, spec, ct, () => environmentValidated = true);
             cleaned = true;
             return await CleanUpAsync(workspace.Path, spec) is { Length: > 0 } cleanup ? report with { Log = report.Log + cleanup } : report;
         }
@@ -79,7 +81,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         {
             if (!retain && !DirectTestProcess.Protected(workspace.Path))
             {
-                if (!cleaned)
+                if (!cleaned && environmentValidated)
                 {
                     await CleanUpAsync(workspace.Path, spec); // only after termination was confirmed
                 }
@@ -115,7 +117,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         return log.ToString();
     }
 
-    private async Task<TestRunReport> RunInWorktreeAsync(Workspace workspace, TestRunSpec spec, CancellationToken ct)
+    private async Task<TestRunReport> RunInWorktreeAsync(Workspace workspace, TestRunSpec spec, CancellationToken ct, Action environmentValidated)
     {
         {
             if (spec.OverlayFrom is { } overlay)
@@ -128,6 +130,8 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             {
                 throw new InvalidOperationException($"The run's results directory {spec.ResultsDirectory} already exists in {Ci.Short(spec.Commit)}'s worktree.");
             }
+            _ = Prepare.TestEnvironment.Resolve(spec.TestEnvironment, workspace.Path); // refuse before any toolchain/recipe command
+            environmentValidated();
             var log = new StringBuilder();
             var deadline = DateTimeOffset.UtcNow + timeout;
             var buildFailed = false;
@@ -140,11 +144,11 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
                 {
                     break;
                 }
-                var (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, step, deadline - DateTimeOffset.UtcNow, ct);
+                var (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, WithTestEnvironment(step, spec.TestEnvironment, workspace.Path), deadline - DateTimeOffset.UtcNow, ct);
                 log.AppendLine($"$ {Describe(step)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 for (var fallback = step.Fallback; !timedOut && exit == TestStep.InvalidCommandLine && fallback is not null; fallback = fallback.Fallback)
                 {
-                    (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, fallback, deadline - DateTimeOffset.UtcNow, ct);
+                    (exit, output, timedOut, captured) = await RunStepAsync(workspace.Path, WithTestEnvironment(fallback, spec.TestEnvironment, workspace.Path), deadline - DateTimeOffset.UtcNow, ct);
                     log.AppendLine($"$ {Describe(fallback)} → {(timedOut ? "timed out" : $"exit {exit}")}").AppendLine(output);
                 }
                 if (timedOut)
@@ -247,6 +251,18 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             .Select(f => (Path.GetRelativePath(info.FullName, f.FullName).Replace(Path.DirectorySeparatorChar, '/'),
                 f.Length <= maxBytes ? File.ReadAllText(f.FullName) : null))
             .ToList();
+    }
+
+    internal static TestStep WithTestEnvironment(TestStep step, IReadOnlyDictionary<string, string> values, string worktree)
+    {
+        if (values.Count == 0 || step.Phase != TestPhase.Test) return step;
+        // Result collectors also have Test phase. They must never receive repository test inputs.
+        var xcode = step.Args.Count >= 2 && step.Args[0] == XcodeNewTests.GateMode && step.Args[1] == "test-without-building";
+        if (!xcode && step.Program is not ("dotnet" or "cargo" or "swift")) return step;
+        var environment = Prepare.TestEnvironment.Resolve(values, worktree);
+        if (xcode)
+            return step with { Args = step.Args.Concat(values.SelectMany(p => new[] { "--test-env", p.Key + "=" + p.Value })).ToArray() };
+        return step with { Program = Prepare.PrepareSteps.EnvPath, Args = environment.Select(p => p.Key + "=" + p.Value).Concat(new[] { step.Program }).Concat(step.Args).ToArray() };
     }
 
     /// <summary>

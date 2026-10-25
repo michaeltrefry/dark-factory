@@ -33,6 +33,42 @@ public class GuiRemoteGateTests
         Assert.All(gui.Requests, request => Assert.Equal("acme/not-the-skeleton", request.SourceRepository));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Commit_owned_environment_is_transported_unexpanded_to_both_remote_executors(bool guiExecution)
+    {
+        var source = RemoteIosGateTests.Sources();
+        if (!guiExecution)
+        {
+            source.BaseFiles[XcodeIosFixture.Pbxproj] = source.BaseFiles[XcodeIosFixture.Pbxproj]
+                .Replace("TEST_HOST = \"$(BUILT_PRODUCTS_DIR)/Tally.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Tally\";", "")
+                .Replace("BUNDLE_LOADER = \"$(TEST_HOST)\";", "");
+            CargoIdentifyTests.With(source, (XcodeIosFixture.UnitTestFile, XcodeIosFixture.UnitTest), (XcodeIosFixture.Counter, XcodeIosFixture.Fixed));
+        }
+        const string prefix = "version: 1\nsteps: [{name: noop, argv: [/bin/echo, ready]}]\ntest_env: ";
+        source.BaseFiles[Prepare.PrepareRecipe.Path] = prefix + "{REPO_MODE: base, REPO_HELPER: '${worktree}/helper'}\n";
+        var previousHead = source.HeadFiles;
+        source.HeadFiles = sha => new Dictionary<string, string>(previousHead(sha), StringComparer.Ordinal)
+        { [Prepare.PrepareRecipe.Path] = prefix + "{REPO_MODE: head, REPO_HELPER: '${worktree}/helper'}\n" };
+        var dispatch = new RemoteIosGateTests.Dispatch { Gui = guiExecution };
+        var remote = new RemoteIosNewTests(dispatch, gui: guiExecution ? Settings : null) { PollInterval = TimeSpan.Zero };
+        var result = await NewTestsCheck.RunAsync(source, NewTestsCheck.StrategiesFor(true), new("acme", "not-the-skeleton"),
+            RemoteIosGateTests.Base, RemoteIosGateTests.Head, "gate-sc-1", null, CancellationToken.None,
+            remoteIos: guiExecution ? null : remote, remoteGui: guiExecution ? remote : null);
+        Assert.True(result.Passed, result.Reason);
+        Assert.Equal(2, dispatch.Requests.Count);
+        Assert.All(dispatch.Requests, request =>
+        {
+            using var descriptor = System.Text.Json.JsonDocument.Parse(request.Execution!);
+            var plan = descriptor.RootElement;
+            var values = plan.GetProperty("testEnvironment");
+            Assert.Equal(plan.GetProperty("side").GetString(), values.GetProperty("REPO_MODE").GetString());
+            Assert.Equal("${worktree}/helper", values.GetProperty("REPO_HELPER").GetString());
+        });
+        Assert.Empty(source.Runs);
+    }
+
     [Fact]
     public async Task No_gui_configuration_never_falls_back_to_hosted_or_local()
     {

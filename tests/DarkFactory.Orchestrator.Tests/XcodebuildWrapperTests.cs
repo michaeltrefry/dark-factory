@@ -29,11 +29,18 @@ public class XcodebuildWrapperTests
             """);
 
     /// <summary>A copy of the repo's wrapper in <paramref name="dir"/> whose xcodebuild is a <c>/bin/sh</c> stub running <paramref name="stubBody"/> in the working directory.</summary>
-    internal static string WrapperCopy(string dir, string stubBody)
+    internal static string WrapperCopy(string dir, string stubBody, string? executablePrefix = null, string[]? trustedExecutableRoots = null)
     {
         var stub = SandboxSupport.Executable(dir, "stub-xcodebuild", "#!/bin/sh\n" + stubBody + "\n");
         var text = File.ReadAllText(RepoWrapper);
         Assert.Equal(1, CountLines(text, RealLine));
+        if (executablePrefix is not null)
+        {
+            Assert.Contains("\nexecutable_prefix=\n", text);
+            text = text.Replace("\nexecutable_prefix=\n", $"\nexecutable_prefix='{executablePrefix}'\n", StringComparison.Ordinal);
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"(?m)^trusted_executable_roots=\(.*\)$",
+                "trusted_executable_roots=(" + string.Join(' ', trustedExecutableRoots!.Select(root => $"'{root}'")) + ")");
+        }
         return SandboxSupport.Executable(dir, "factory-xcodebuild", text.Replace("\n" + RealLine + "\n", $"\nxcodebuild={stub}\n"));
     }
 
@@ -72,6 +79,68 @@ public class XcodebuildWrapperTests
         return (p.ExitCode, await stderr,
             [.. lines.Where(l => l.StartsWith("ARG ", StringComparison.Ordinal)).Select(l => l[4..])],
             SandboxSupport.ParseEnv(string.Join('\n', lines.Where(l => l.StartsWith("ENV ", StringComparison.Ordinal)).Select(l => l[4..]))));
+    }
+
+    [Theory]
+    [InlineData("leaf-owner", false)]
+    [InlineData("parent-owner", false)]
+    [InlineData("homebrew", true)]
+    [InlineData("dotnet", true)]
+    [InlineData("cryptex", true)]
+    public async Task Fixed_executable_links_are_verified_before_xcodebuild_and_forward_the_canonical_destination(string scenario, bool allowed)
+    {
+        var fixture = TestEnvironmentTests.ExecutableFixture(_dir, scenario);
+        var wrapper = WrapperCopy(_dir, $"/usr/bin/env > '{Ran}'\n\"$TEST_RUNNER_REPO_HELPER\"", fixture.Prefix, fixture.Trusted);
+        var run = await TestEnvironmentTests.Run(new(Gate.TestPhase.Test, wrapper,
+            ["--gate", "test-without-building", "-scheme", "App", "-destination", "platform=macOS", "--test-env", "REPO_HELPER=/usr/local/bin/repo-helper"]), _dir);
+        if (allowed)
+        {
+            Assert.True(run.Exit == 0, run.Output);
+            Assert.Equal(fixture.Destination, SandboxSupport.ParseEnv(File.ReadAllText(Ran))["TEST_RUNNER_REPO_HELPER"]);
+        }
+        else
+        {
+            Assert.Equal(64, run.Exit);
+            Assert.Contains("REPO_HELPER", run.Output);
+            Assert.False(File.Exists(Ran)); // not even the stub xcodebuild was launched
+        }
+    }
+
+    [Fact]
+    public async Task Gate_test_environment_reaches_only_the_test_runner_prefixed_and_never_ambient_variables()
+    {
+        var run = await RunAsync(["--gate", "test-without-building", "-scheme", "App", "-destination", "platform=macOS", "--test-env", "REPO_MODE=fixture"],
+            new() { ["TEST_RUNNER_EVIL"] = "ambient", ["REPO_MODE"] = "ambient" });
+        Assert.Equal(0, run.ExitCode);
+        Assert.Equal("fixture", run.Env["TEST_RUNNER_REPO_MODE"]);
+        Assert.DoesNotContain("REPO_MODE", run.Env.Keys);
+        Assert.DoesNotContain("TEST_RUNNER_EVIL", run.Env.Keys);
+        Assert.DoesNotContain("--test-env", run.Args);
+    }
+
+    [Theory]
+    [InlineData("HOME=x")]
+    [InlineData("DYLD_INSERT_LIBRARIES=x")]
+    [InlineData("LD_PRELOAD=x")]
+    [InlineData("REPO_TOKEN=x")]
+    [InlineData("REPO_MODE=__CURRENT_VALUE__")]
+    [InlineData("REPO_HELPER=/Users/owner/helper")]
+    public async Task Gate_test_environment_is_refused_before_xcodebuild_naming_the_key(string pair)
+    {
+        var run = await RunAsync(["--gate", "test-without-building", "-scheme", "App", "-destination", "platform=macOS", "--test-env", pair]);
+        Assert.Equal(64, run.ExitCode);
+        Assert.Contains(pair.Split('=')[0], run.Stderr);
+        Assert.False(File.Exists(Ran));
+    }
+
+    [Theory]
+    [InlineData("build-for-testing")]
+    [InlineData("test")]
+    public async Task Gate_test_environment_is_not_a_build_or_general_worker_environment(string action)
+    {
+        var run = await RunAsync(["--gate", action, "-scheme", "App", "-destination", "platform=macOS", "--test-env", "REPO_MODE=x"]);
+        Assert.Equal(64, run.ExitCode);
+        Assert.False(File.Exists(Ran));
     }
 
     private static string[] Forced(string home, string workingDirectory) =>

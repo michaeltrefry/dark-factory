@@ -113,9 +113,10 @@ class GuiContracts(unittest.TestCase):
             return 0, 'Aqua' if payload['argv'] == ['/bin/launchctl', 'managername'] else str(os.getuid()) if payload['argv'] == ['/usr/bin/id', '-u'] else 'ok'
         with mock.patch.dict(g, GUI_CONFIG=config, GUI_LEASE=mock.Mock(), gui_operation=self.operation, command=command):
             principal = g['GuiPrincipal'](self.root)
-            principal.run(['/usr/bin/true'], self.root, extra_environment={'RECIPE_FLAG': 'kept'})
+            principal.run(['/usr/bin/true'], self.root, extra_environment={'RECIPE_FLAG': 'kept', 'TEST_RUNNER_REPO_MODE':'fixture'})
         environment = payloads[-1]['environment']
         self.assertEqual('kept', environment['RECIPE_FLAG'])
+        self.assertEqual('fixture', environment['TEST_RUNNER_REPO_MODE'])
         self.assertNotIn('GITHUB_TOKEN', environment)
         self.assertNotIn('ACTIONS_RUNTIME_TOKEN', environment)
         self.assertNotIn('GITHUB_OUTPUT', environment)
@@ -124,7 +125,7 @@ class GuiContracts(unittest.TestCase):
     def execute(self, platform='macOS', build_failure=False, cleanup_failure=False, trusted=True, empty_inventory_cleanup=False):
         base, head = '1' * 40, '2' * 40
         plan = {'side': 'base', 'commit': base, 'overlayFrom': head, 'overlayPaths': ['Tests/New.swift'], 'deletePaths': [],
-                'replacements': {}, 'sourceRepository': 'acme/source', 'builds': [{'flag': '-project', 'container': 'Widget.xcodeproj',
+                'testEnvironment': {'REPO_MODE': 'fixture', 'REPO_HELPER': '${worktree}/helper'}, 'replacements': {}, 'sourceRepository': 'acme/source', 'builds': [{'flag': '-project', 'container': 'Widget.xcodeproj',
                 'scheme': 'Widget', 'tests': [TEST], 'platform': platform}], 'prepare': None}
         request = {'BASE': base, 'HEAD': head, 'SIDE': 'base', 'NONCE': 'a' * 32, 'TESTS': json.dumps([TEST])}
         env = {'runtime': 'runtime', 'deviceType': 'phone', 'xcode': '26.5', 'build': '17F42'}
@@ -133,6 +134,10 @@ class GuiContracts(unittest.TestCase):
             def share(self, path): pass
             def run(inner, args, cwd, **kwargs):
                 self.calls.append(args)
+                if 'test-without-building' in args:
+                    self.assertEqual({'TEST_RUNNER_REPO_MODE':'fixture','TEST_RUNNER_REPO_HELPER':str(inner.worktree.resolve()/'helper')},kwargs.get('extra_environment'))
+                else:
+                    self.assertFalse(kwargs.get('extra_environment'), 'repository test inputs reached a build or collector')
                 if args == ['/usr/bin/xcodebuild', '-version']: return 0, 'Xcode 26.5\nBuild version 17F42'
                 if args[:3] == ['/usr/bin/xcrun', 'simctl', 'list']:
                     return 0, json.dumps({'runtimes': [{'identifier': 'runtime', 'isAvailable': True}], 'devicetypes': [{'identifier': 'phone'}]})
