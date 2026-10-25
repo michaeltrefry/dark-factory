@@ -1595,6 +1595,48 @@ def run_prepare(principal, worktree, recipe, artifacts):
     return log
 
 
+def validate_test_environment(values):
+    if not isinstance(values, dict) or len(values) > 32:
+        raise ValueError('test_env: at most 32 variables')
+    reserved = set('PATH HOME TMPDIR TMP TEMP USER LOGNAME SHELL IFS ENV BASH_ENV PS4 SHELLOPTS BASHOPTS CDPATH PWD OLDPWD ZDOTDIR DEVELOPER_DIR SDKROOT XCODE_XCCONFIG_FILE CFFIXED_USER_HOME MSBUILDDISABLENODEREUSE DOTNET_CLI_USE_MSBUILD_SERVER USESHAREDCOMPILATION'.split())
+    prefixes = ('DYLD_', 'LD_', 'ANTHROPIC_', 'OPENAI_', 'ROUTER_', 'FACTORY_', 'GITHUB_', 'ACTIONS_', 'RUNNER_', 'TEST_RUNNER_', 'BASH_FUNC_')
+    secrets = ('TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'AUTH', 'API_KEY', 'PRIVATE_KEY', 'ACCESS_KEY')
+    size = 0
+    for key, value in values.items():
+        if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,127}', key) or key.upper() in reserved or key.upper().startswith(prefixes) or any(s in key.upper() for s in secrets):
+            raise ValueError('test_env.' + str(key) + ': forbidden name')
+        if not isinstance(value, str):
+            raise ValueError('test_env.' + key + ': expected string')
+        size += len(key.encode('utf-8')) + len(value.encode('utf-8'))
+        valid = bool(re.fullmatch(r'(?:(?:/usr/bin|/bin|/usr/local/bin|/opt/homebrew/bin)/[A-Za-z0-9_+.-]+|[A-Za-z0-9 _.,:+@%=-]*)', value))
+        if value.startswith('${worktree}/'):
+            path = value[len('${worktree}/'):]
+            valid = bool(re.fullmatch(r'[A-Za-z0-9_. /-]+', path)) and all(p not in ('', '.', '..') for p in path.split('/'))
+        if size > 8192 or len(value) > 1024 or any(ord(c) < 32 or ord(c) > 126 for c in value) or '__CURRENT_VALUE__' in value or not valid or value.endswith(('/.', '/..')):
+            raise ValueError('test_env.' + key + ': forbidden value or bounds')
+    return values
+
+
+def resolve_test_environment(values, worktree):
+    validate_test_environment(values)
+    result = {}
+    root = worktree.resolve()
+    for key, value in values.items():
+        expanded = value.replace('${worktree}', str(root))
+        if value.startswith('${worktree}/'):
+            probe = root
+            for part in value[len('${worktree}/'):].split('/'):
+                probe = probe / part
+                if probe.is_symlink():
+                    raise ValueError('test_env.' + key + ': symbolic link')
+            if not pathlib.Path(expanded).resolve().is_relative_to(root):
+                raise ValueError('test_env.' + key + ': outside workspace')
+        elif expanded.startswith('/') and (not pathlib.Path(expanded).is_file() or not os.access(expanded, os.X_OK)):
+            raise ValueError('test_env.' + key + ': executable unavailable')
+        result['TEST_RUNNER_' + key] = expanded
+    return result
+
+
 def parse_execution(text, request):
     if len(text.encode('utf-8')) > EXECUTION_LIMIT:
         raise ValueError('execution descriptor exceeds 48 KiB')
@@ -1607,7 +1649,7 @@ def parse_execution(text, request):
         return result
     value = json.loads(text, object_pairs_hook=unique)
     keys = {'side', 'commit', 'overlayFrom', 'overlayPaths', 'deletePaths', 'replacements', 'builds'}
-    if not isinstance(value, dict) or not keys <= set(value) or set(value) - keys - ({'prepare', 'sourceRepository'} if globals().get('GUI_CONFIG') is not None else {'prepare'}) or value['side'] not in ('base', 'head'):
+    if not isinstance(value, dict) or not keys <= set(value) or set(value) - keys - ({'prepare', 'sourceRepository', 'testEnvironment'} if globals().get('GUI_CONFIG') is not None else {'prepare', 'testEnvironment'}) or value['side'] not in ('base', 'head'):
         raise ValueError('invalid execution descriptor')
     if value['commit'] != request[value['side'].upper()]:
         raise ValueError('execution commit does not match its side')
@@ -1661,6 +1703,7 @@ def parse_execution(text, request):
             seen.add(test)
             if len(seen) > 200:
                 raise ValueError('too many execution tests')
+    validate_test_environment(value.get('testEnvironment', {}))
     if value.get('prepare') is not None:
         validate_prepare(value['prepare'])
     return value
@@ -1751,6 +1794,7 @@ def execution_main(request, text):
         apply_execution(root, execution)
         cwd = root / execution['side']
         result['root'] = str(cwd)
+        test_environment = resolve_test_environment(execution.get('testEnvironment', {}), cwd)
         try:
             artifacts = prepare_artifacts(root, recipe) if recipe is not None else {}
         except (ValueError, OSError, subprocess.SubprocessError):
@@ -1844,7 +1888,7 @@ def execution_main(request, text):
                     name = 'xcode-test-' + hashlib.sha256(test.encode('utf-8')).hexdigest()[:16]
                     bundle = derived / (name + '.xcresult')
                     code, output = principal.run(common + ['test-without-building', '-only-testing:' + test,
-                        '-parallel-testing-enabled', 'NO', '-resultBundlePath', str(bundle)], cwd)
+                        '-parallel-testing-enabled', 'NO', '-resultBundlePath', str(bundle)], cwd, extra_environment=resolve_test_environment(execution.get('testEnvironment', {}), cwd))
                     # Principal.run proves uid quiescence even on exit 0 before
                     # the collector reads anything. Never execute a PR helper.
                     report_code, report = principal.run(['/usr/bin/xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path', str(bundle)], root)
@@ -1889,6 +1933,10 @@ def main():
         root = workspace.root
         for side in ('base', 'head'):
             unpack(pathlib.Path('sources') / (side + '.zip'), root / side)
+        # Legacy fixture protocol cannot represent a commit-owned recipe. Never silently ignore one.
+        for side in ('base', 'head'):
+            if (root / side / '.factory/prepare.yaml').exists():
+                raise ValueError('test_env: legacy fixture execution requires the validated recipe descriptor')
         relative = pathlib.Path('e2e-ios/TallyTests/TallyTests.swift')
         source = (root / 'head' / relative).read_text()
         original = (root / 'base' / relative).read_text()

@@ -27,6 +27,8 @@ public sealed partial class RemoteIosNewTests
                 || tests.Count is < 1 or > 200 || tests.Distinct(StringComparer.Ordinal).Count() != tests.Count
                 || tests.Any(t => t.Length > 1000 || t.Any(char.IsControl)))
                 throw new InvalidDataException("Invalid iOS execution identity.");
+            var testEnvironment = prepare?.TestEnvironment ?? spec.TestEnvironment;
+            TestEnvironment.Validate(testEnvironment);
             var side = spec.Commit == baseSha ? "base" : spec.Commit == headSha ? "head" : throw new InvalidDataException("Unknown execution commit.");
             if ((side == "head" && (spec.OverlayFrom is not null || spec.Replacements.Count != 0))
                 || (side == "base" && spec.OverlayFrom != headSha)) throw new InvalidDataException("Invalid overlay commit.");
@@ -45,6 +47,12 @@ public sealed partial class RemoteIosNewTests
             };
             var descriptor = JsonSerializer.Serialize(new { side, commit = spec.Commit, overlayFrom = spec.OverlayFrom,
                 overlayPaths = spec.OverlayPaths, deletePaths = spec.DeletePaths, replacements = spec.Replacements, builds, prepare = recipe });
+            if (testEnvironment.Count > 0)
+            {
+                var node = System.Text.Json.Nodes.JsonNode.Parse(descriptor)!;
+                node["testEnvironment"] = JsonSerializer.SerializeToNode(testEnvironment);
+                descriptor = node.ToJsonString();
+            }
             if (gui is not null)
             {
                 var node = System.Text.Json.Nodes.JsonNode.Parse(descriptor)!;
@@ -59,6 +67,7 @@ public sealed partial class RemoteIosNewTests
             return ParseExecution(text, nonce, request, spec.Strategy, side, spec.Commit, prepare);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (PrepareRecipeException ex) { return TestRunReport.Failed(TestRunStatus.NoResults, ex.Message); }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             // Neither transport bodies nor arbitrary exception text (which may include secrets) become evidence.

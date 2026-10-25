@@ -1206,6 +1206,42 @@ public class XcodeRunnerTests : IDisposable
     }
 
     [Fact]
+    public async Task With_xcode_test_environment_reaches_the_actual_unhosted_test_process_not_just_xcodebuild()
+    {
+        Assert.SkipUnless(HasXcode.Value, "Xcode is not installed");
+        foreach (var (path, content) in XcodeFixture.Files()) Write(path, content);
+        Write("helper", "#!/bin/sh\n[ \"$REPO_MODE\" = fixture ] || exit 7\nexit 0\n");
+        // Run through /bin/sh so git's source fixture needs no executable-mode mutation.
+        const string recipe = "version: 1\nsteps: [{name: noop, argv: [/bin/echo, ready]}]\ntest_env: {REPO_MODE: fixture, REPO_HELPER: '${worktree}/helper'}\n";
+        Write(Prepare.PrepareRecipe.Path, recipe);
+        var baseSha = CommitAndPush("base helper environment", "main");
+        TestGit.Run(_seed, "checkout", "-q", "-b", "factory/sc-5");
+        Write(XcodeFixture.Library, XcodeFixture.Fixed);
+        Write("WordsTests/EnvironmentTests.swift", """
+            import Foundation
+            import Testing
+            @testable import Words
+            @Test func repositoryEnvironment() throws {
+                #expect(ProcessInfo.processInfo.environment["REPO_MODE"] == "fixture")
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                p.arguments = [try #require(ProcessInfo.processInfo.environment["REPO_HELPER"])]
+                try p.run()
+                p.waitUntilExit()
+                #expect(p.terminationStatus == 0)
+                #expect(isBlank("  "))
+            }
+            """);
+        var head = CommitAndPush("environment-dependent test", "factory/sc-5");
+        var yes = await Check(baseSha, head);
+        Assert.True(yes.Passed, yes.Reason);
+        Write(Prepare.PrepareRecipe.Path, "version: 1\nsteps: [{name: noop, argv: [/bin/echo, ready]}]\n");
+        var without = CommitAndPush("remove test environment", "factory/sc-5");
+        var no = await Check(baseSha, without);
+        Assert.Equal(NewTestsOutcome.Rejected, no.Outcome);
+    }
+
+    [Fact]
     public async Task With_xcode_a_new_macos_test_is_run_alone_on_the_base_and_the_head_and_judged_from_its_result_bundle()
     {
         Assert.SkipUnless(HasXcode.Value, "Xcode is not installed");

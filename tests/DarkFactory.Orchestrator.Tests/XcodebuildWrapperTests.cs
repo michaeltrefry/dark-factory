@@ -74,6 +74,43 @@ public class XcodebuildWrapperTests
             SandboxSupport.ParseEnv(string.Join('\n', lines.Where(l => l.StartsWith("ENV ", StringComparison.Ordinal)).Select(l => l[4..]))));
     }
 
+    [Fact]
+    public async Task Gate_test_environment_reaches_only_the_test_runner_prefixed_and_never_ambient_variables()
+    {
+        var run = await RunAsync(["--gate", "test-without-building", "-scheme", "App", "-destination", "platform=macOS", "--test-env", "REPO_MODE=fixture"],
+            new() { ["TEST_RUNNER_EVIL"] = "ambient", ["REPO_MODE"] = "ambient" });
+        Assert.Equal(0, run.ExitCode);
+        Assert.Equal("fixture", run.Env["TEST_RUNNER_REPO_MODE"]);
+        Assert.DoesNotContain("REPO_MODE", run.Env.Keys);
+        Assert.DoesNotContain("TEST_RUNNER_EVIL", run.Env.Keys);
+        Assert.DoesNotContain("--test-env", run.Args);
+    }
+
+    [Theory]
+    [InlineData("HOME=x")]
+    [InlineData("DYLD_INSERT_LIBRARIES=x")]
+    [InlineData("LD_PRELOAD=x")]
+    [InlineData("REPO_TOKEN=x")]
+    [InlineData("REPO_MODE=__CURRENT_VALUE__")]
+    [InlineData("REPO_HELPER=/Users/owner/helper")]
+    public async Task Gate_test_environment_is_refused_before_xcodebuild_naming_the_key(string pair)
+    {
+        var run = await RunAsync(["--gate", "test-without-building", "-scheme", "App", "-destination", "platform=macOS", "--test-env", pair]);
+        Assert.Equal(64, run.ExitCode);
+        Assert.Contains(pair.Split('=')[0], run.Stderr);
+        Assert.False(File.Exists(Ran));
+    }
+
+    [Theory]
+    [InlineData("build-for-testing")]
+    [InlineData("test")]
+    public async Task Gate_test_environment_is_not_a_build_or_general_worker_environment(string action)
+    {
+        var run = await RunAsync(["--gate", action, "-scheme", "App", "-destination", "platform=macOS", "--test-env", "REPO_MODE=x"]);
+        Assert.Equal(64, run.ExitCode);
+        Assert.False(File.Exists(Ran));
+    }
+
     private static string[] Forced(string home, string workingDirectory) =>
         ["-derivedDataPath", SwiftToolchain.DerivedDataOf(home, Physical(workingDirectory)), "-clonedSourcePackagesDirPath", SwiftToolchain.SourcePackagesOf(home),
             "-skipMacroValidation", "-skipPackagePluginValidation",

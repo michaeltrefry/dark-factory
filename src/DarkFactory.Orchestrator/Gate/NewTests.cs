@@ -124,7 +124,10 @@ public sealed record TestRunSpec(
     INewTestStrategy Strategy,
     string ResultsDirectory)
 {
-    /// <summary>Overlaid files written with this content instead of the <see cref="OverlayFrom"/> commit's, by path.</summary>
+    /// <summary>Validated commit-specific declarations, resolved only inside the selected job worktree.</summary>
+    public IReadOnlyDictionary<string, string> TestEnvironment { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>Overlaid files written instead of the overlay commit's, by path.</summary>
     public IReadOnlyDictionary<string, string> Replacements { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
 }
 
@@ -467,6 +470,23 @@ public static class NewTestsCheck
         Func<Func<Task<NewTestsResult>>, Task<NewTestsResult>>? localExecution, RemoteIosNewTests? remoteGui)
     {
         var changes = prepared?.Changes ?? await runner.ChangesAsync(repo, baseSha, headSha, ct);
+        // Validate every commit before any strategy executes, including direct/legacy callers without PrepareStage.
+        var recipes = prepared?.Recipes;
+        if (recipes is null)
+        {
+            var declarations = new Dictionary<string, Prepare.PrepareRecipe>(StringComparer.Ordinal);
+            try
+            {
+                foreach (var commit in new[] { baseSha, headSha }.Distinct(StringComparer.Ordinal))
+                    if (await runner.ReadAsync(repo, commit, Prepare.PrepareRecipe.Path, ct) is { } yaml)
+                        declarations[commit] = Prepare.PrepareRecipe.Parse(yaml);
+            }
+            catch (Prepare.PrepareRecipeException ex)
+            { return NewTestsResult.Without(baseSha, headSha, NewTestsOutcome.Error, ex.Message); }
+            recipes = declarations;
+        }
+        try { foreach (var recipe in recipes.Values) Prepare.TestEnvironment.Validate(recipe.TestEnvironment); }
+        catch (Prepare.PrepareRecipeException ex) { return NewTestsResult.Without(baseSha, headSha, NewTestsOutcome.Error, ex.Message); }
         var source = new TestSource(runner, repo, baseSha, headSha);
         var found = new List<(INewTestStrategy Strategy, NewTestSet Set)>();
         foreach (var strategy in strategies)
@@ -533,6 +553,7 @@ public static class NewTestsCheck
                     Prepare.PrepareSteps.Before(prepared?.StepsFor(commit) ?? [], await strategy.StepsAsync(source, commit, tests, set.Projects, directory, ct)),
                     strategy, directory)
                 {
+                    TestEnvironment = recipes.GetValueOrDefault(commit)?.TestEnvironment ?? new Dictionary<string, string>(),
                     Replacements = from is null ? new Dictionary<string, string>(StringComparer.Ordinal) : baseReplacements,
                 };
             }
@@ -548,7 +569,7 @@ public static class NewTestsCheck
             async Task<TestRunReport> Run(TestRunSpec spec, IReadOnlyList<string> tests)
             {
                 if (!isRemote) return await runner.RunAsync(repo, spec, ct);
-                var recipe = prepared?.Recipes.GetValueOrDefault(spec.Commit);
+                var recipe = recipes.GetValueOrDefault(spec.Commit);
                 if (recipe is null && prepared?.StepsFor(spec.Commit).Count > 0)
                     return TestRunReport.Failed(TestRunStatus.NoResults, "The declared prepare recipe is missing; private owner-cache steps are never transported.");
                 return await remote!.RunExecutionAsync(repo, baseSha, headSha, spec, tests, set.Projects, recipe, ct);

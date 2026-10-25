@@ -1236,6 +1236,22 @@ public sealed partial class RunPipeline
             .LastOrDefault(r => r is not null && r.BaseSha == pull.BaseSha && r.HeadSha == pull.HeadSha);
         if (recorded is not null && recorded.Outcome != NewTestsOutcome.Error)
         {
+            // Old cached evidence must not bypass today's strict environment declaration rules.
+            if (Gate.Tests is { } cachedRunner)
+            {
+                try
+                {
+                    foreach (var commit in new[] { pull.BaseSha, pull.HeadSha }.Distinct(StringComparer.Ordinal))
+                        if (await cachedRunner.ReadAsync(run.Repo, commit, Prepare.PrepareRecipe.Path, ct) is { } yaml)
+                            _ = Prepare.PrepareRecipe.Parse(yaml);
+                }
+                catch (Prepare.PrepareRecipeException ex)
+                {
+                    var refused = NewTestsResult.Without(pull.BaseSha, pull.HeadSha, NewTestsOutcome.Error, ex.Message);
+                    await ledger.CheckpointAsync(run.Item, Steps.NewTests, null, refused.ToDetail(), ct);
+                    return refused;
+                }
+            }
             log.WriteLine($"[gate] new tests ({recorded.Outcome}, recorded): {recorded.Reason}");
             return recorded;
         }

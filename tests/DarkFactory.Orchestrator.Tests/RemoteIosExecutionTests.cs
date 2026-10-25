@@ -103,6 +103,20 @@ class NativePrincipal:
 class Fixtures(unittest.TestCase):
     def parse(self, value):
         return r.parse_execution(json.dumps(value), REQUEST)
+    def test_test_environment_validation_and_job_local_resolution(self):
+        for key, value in [('HOME','x'),('DYLD_INSERT_LIBRARIES','x'),('LD_PRELOAD','x'),('REPO_TOKEN','x'),('TEST_RUNNER_HOME','x'),('HELPER','/Users/owner/helper'),('HELPER','${worktree}/../helper'),('HELPER','${artifact:sdk}/helper'),('MODE','__CURRENT_VALUE__'),('MODE','a\n')]:
+            with self.subTest(key=key,value=value),self.assertRaisesRegex(ValueError,key):
+                r.validate_test_environment({key:value})
+        for values in [{str(i):'x' for i in range(33)}, {'MODE':'x'*1025}, {'V'+str(i):'x'*1024 for i in range(9)}]:
+            with self.assertRaises(ValueError):r.validate_test_environment(values)
+        with tempfile.TemporaryDirectory() as d:
+            root=pathlib.Path(d);worktree=root/'base';worktree.mkdir()
+            values={'REPO_HELPER':'${worktree}/helper','REPO_MODE':'fixture'}
+            resolved=r.resolve_test_environment(values,worktree)
+            self.assertEqual(str(worktree.resolve()/'helper'),resolved['TEST_RUNNER_REPO_HELPER'])
+            (worktree/'helper').symlink_to(root/'owner')
+            with self.assertRaisesRegex(ValueError,'REPO_HELPER'):r.resolve_test_environment(values,worktree)
+
     def test_general_identifiers_and_workspace(self):
         value = descriptor()
         value['builds'][0].update(flag='-workspace', container='App.xcworkspace')
@@ -162,6 +176,7 @@ class Fixtures(unittest.TestCase):
             value['builds'][0]['tests']=[TESTS[0]]
             value['builds'].append(dict(flag='-workspace',container='Other.xcworkspace',scheme='Other',tests=[TESTS[1]]))
         if prepared:value['prepare']=prepare()
+        value['testEnvironment']={'REPO_MODE':side,'REPO_HELPER':'${worktree}/tools/helper'}
         raw=json.dumps(value)
         calls=[]; closed=[];workspaces=[]
         class Principal:
@@ -177,6 +192,10 @@ class Fixtures(unittest.TestCase):
                 r.tempfile.TemporaryDirectory._rmtree(self.root)
             def run(self,args,cwd,extra_environment=None,timeout=r.COMMAND_TIMEOUT):
                 calls.append((args,cwd))
+                if 'test-without-building' in args:
+                    assert extra_environment=={'TEST_RUNNER_REPO_MODE':side,'TEST_RUNNER_REPO_HELPER':str(self.root.resolve()/side/'tools/helper')}
+                elif not args[0].endswith('/tools/gen'):
+                    assert not extra_environment, 'test inputs reached build, toolchain or collector'
                 if args[0].endswith('/tools/gen'):
                     (pathlib.Path(cwd)/'Package.resolved').write_text('{"version":2,"pins":[]}')
                     assert extra_environment['SDK']==str(self.root/'artifacts/sdk')

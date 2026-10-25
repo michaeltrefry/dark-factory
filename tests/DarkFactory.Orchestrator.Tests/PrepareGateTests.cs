@@ -117,6 +117,33 @@ public sealed class PrepareGateTests : IDisposable
 
     [Theory]
     [MemberData(nameof(Stacks))]
+    public async Task Every_stack_keeps_commit_specific_test_environment_separate_from_step_argv(string stack)
+    {
+        var runner = WithRecipes(Runner(stack), Recipe("base") + "test_env: {REPO_MODE: base, REPO_HELPER: '${worktree}/tools/helper'}\n",
+            Recipe("head") + "test_env: {REPO_MODE: head}\n");
+        var prepared = await Stage().ForCommitsAsync(runner, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None);
+        var result = await Check(runner, prepared);
+        Assert.True(result.Passed, result.Reason);
+        Assert.All(runner.Runs, spec =>
+        {
+            Assert.Equal(spec.Commit == FakeTestRunner.BaseSha ? "base" : "head", spec.TestEnvironment["REPO_MODE"]);
+            Assert.DoesNotContain(spec.Steps, step => step.Args.Any(a => a.StartsWith("REPO_MODE=", StringComparison.Ordinal)));
+        });
+    }
+
+    [Theory]
+    [MemberData(nameof(Stacks))]
+    public async Task Direct_callers_refuse_bad_test_environment_before_any_stack_executes(string stack)
+    {
+        var runner = WithRecipes(Runner(stack), Recipe("base"), Recipe("head") + "test_env: {REPO_TOKEN: forbidden}\n");
+        var result = await Check(runner, null);
+        Assert.Equal(NewTestsOutcome.Error, result.Outcome);
+        Assert.Contains("REPO_TOKEN", result.Reason);
+        Assert.Empty(runner.Runs);
+    }
+
+    [Theory]
+    [MemberData(nameof(Stacks))]
     public async Task Without_a_recipe_every_strategys_runs_are_exactly_as_before(string stack)
     {
         var plain = Runner(stack);
@@ -162,11 +189,12 @@ public sealed class PrepareGateTests : IDisposable
     public async Task A_base_whose_recipe_cannot_be_fetched_is_prepared_with_the_heads_only_when_the_pr_changes_the_recipe()
     {
         // Decision A: the PR that fixes a recipe whose artifact vanished is not refused by the recipe it fixes.
-        var fixing = WithRecipes(new FakeTestRunner(), GoneRecipe, Recipe("head-recipe"));
+        var fixing = WithRecipes(new FakeTestRunner(), GoneRecipe, Recipe("head-recipe") + "test_env: {REPO_MODE: head}\n");
 
         var prepared = await Stage().ForCommitsAsync(fixing, Repo, FakeTestRunner.BaseSha, "head1", null, CancellationToken.None);
         var result = await Check(fixing, prepared);
 
+        Assert.All(fixing.Runs, run => Assert.Equal("head", run.TestEnvironment["REPO_MODE"]));
         Assert.Equal(prepared.StepsFor("head1"), prepared.StepsFor(FakeTestRunner.BaseSha));
         Assert.Contains("head-recipe", Assert.Single(prepared.StepsFor(FakeTestRunner.BaseSha)).Args);
         Assert.StartsWith("base prepared with the head's recipe: the base's own recipe could not be fetched: artifact sdk", prepared.Note);

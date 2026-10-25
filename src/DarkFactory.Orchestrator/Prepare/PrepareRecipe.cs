@@ -44,7 +44,10 @@ public sealed class PrepareRecipeException(string message) : Exception(message);
 /// </summary>
 public sealed record PrepareRecipe(IReadOnlyList<PrepareArtifact> Artifacts, IReadOnlyList<PrepareStep> Steps)
 {
-    /// <summary>The recipe's path in a repository (not under the sealed <c>factory/</c>: a repository's own build recipe).</summary>
+    /// <summary>Optional bounded test-process inputs (sc-26791), never applied by worker factory-prepare.</summary>
+    public IReadOnlyDictionary<string, string> TestEnvironment { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>The recipe's repository-relative path.</summary>
     public const string Path = ".factory/prepare.yaml";
 
     /// <summary>The directory holding it (checked not to be a symbolic link before the file is read in a worktree).</summary>
@@ -102,7 +105,7 @@ public sealed record PrepareRecipe(IReadOnlyList<PrepareArtifact> Artifacts, IRe
         {
             throw Fail("must be one YAML mapping");
         }
-        Keys(root, ["version", "artifacts", "steps"], ["version", "steps"], "the top level");
+        Keys(root, ["version", "artifacts", "steps", "test_env"], ["version", "steps"], "the top level");
         if (Scalar(root, "version", "the top level") != Version.ToString(CultureInfo.InvariantCulture))
         {
             throw Fail($"version must be {Version}");
@@ -135,7 +138,19 @@ public sealed record PrepareRecipe(IReadOnlyList<PrepareArtifact> Artifacts, IRe
             }
             steps.Add(step);
         }
-        return new PrepareRecipe(artifacts, steps);
+        var testEnvironment = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        if (Child(root, "test_env") is { } testNode)
+        {
+            if (testNode is not YamlMappingNode map) throw Fail("test_env must be a mapping");
+            foreach (var (key, value) in map.Children)
+            {
+                if (key is not YamlScalarNode { Value: { } k }) throw Fail("test_env has a non-scalar key");
+                if (value is not YamlScalarNode { Value: { } v }) throw Fail($"test_env.{k} must be a plain value");
+                testEnvironment.Add(k, v);
+            }
+        }
+        Prepare.TestEnvironment.Validate(testEnvironment);
+        return new PrepareRecipe(artifacts, steps) { TestEnvironment = testEnvironment };
     }
 
     private static PrepareArtifact ParseArtifact(YamlNode node, string where)

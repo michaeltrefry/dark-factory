@@ -140,6 +140,10 @@ filters=()
 parallel=
 result_bundle=
 quiet=0
+test_env=()
+test_keys=" "
+test_bytes=0
+test_count=0
 
 while [ $# -gt 0 ]; do
     arg=$1
@@ -187,6 +191,39 @@ while [ $# -gt 0 ]; do
             [ -z "$result_bundle" ] || refuse "a second -resultBundlePath"
             relative_path "$2" .xcresult || refuse "the result bundle path '$2' (a relative path inside the working directory ending .xcresult)"
             result_bundle=$2; shift ;;
+        --test-env)
+            [ "$gate" -eq 1 ] && [ "$action" = test-without-building ] && [ $# -ge 2 ] || refuse "test_env only on --gate test-without-building"
+            pair=$2; key=${pair%%=*}; value=${pair#*=}
+            name_re='^[A-Za-z_][A-Za-z0-9_]{0,127}$'
+            [[ $key =~ $name_re ]] && [ "$pair" != "$key" ] || refuse "test_env.$key"
+            upper=$(printf %s "$key" | /usr/bin/tr '[:lower:]' '[:upper:]')
+            case "$upper" in
+                PATH|HOME|TMPDIR|TMP|TEMP|USER|LOGNAME|SHELL|IFS|ENV|BASH_ENV|PS4|SHELLOPTS|BASHOPTS|CDPATH|PWD|OLDPWD|ZDOTDIR|DEVELOPER_DIR|SDKROOT|XCODE_XCCONFIG_FILE|CFFIXED_USER_HOME|MSBUILDDISABLENODEREUSE|DOTNET_CLI_USE_MSBUILD_SERVER|USESHAREDCOMPILATION|DYLD_*|LD_*|ANTHROPIC_*|OPENAI_*|ROUTER_*|FACTORY_*|GITHUB_*|ACTIONS_*|RUNNER_*|TEST_RUNNER_*|BASH_FUNC_*|*TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*CREDENTIAL*|*AUTH*|*API_KEY*|*PRIVATE_KEY*|*ACCESS_KEY*) refuse "test_env.$key" ;;
+            esac
+            case "$test_keys" in *" $key "*) refuse "duplicate test_env.$key" ;; esac
+            test_keys="$test_keys$key "
+            [ "$test_count" -lt 32 ] && [ ${#value} -le 1024 ] || refuse "test_env.$key exceeds bounds"
+            test_bytes=$((test_bytes + ${#key} + ${#value}))
+            [ "$test_bytes" -le 8192 ] || refuse "test_env.$key exceeds byte limit"
+            case "$value" in *'__CURRENT_VALUE__'*) refuse "test_env.$key substitution" ;; esac
+            literal_re='^[A-Za-z0-9 _.,:+@%=-]*$'
+            executable_re='^(/usr/bin|/bin|/usr/local/bin|/opt/homebrew/bin)/[A-Za-z0-9_+.-]+$'
+            workspace_re='^[A-Za-z0-9_. /-]+$'
+            case "$value" in
+                "$work_dir"/*)
+                    rel=${value#"$work_dir"/}
+                    [[ $rel =~ $workspace_re ]] || refuse "test_env.$key workspace path"
+                    case "/$rel/" in */../*|*/./*|*//*) refuse "test_env.$key traversal" ;; esac
+                    probe=$rel
+                    while [ "$probe" != . ]; do
+                        [ ! -L "$probe" ] || refuse "test_env.$key symbolic link"
+                        probe=$(dirname "$probe")
+                    done
+                    resolves_inside "$rel" || refuse "test_env.$key outside workspace" ;;
+                /*) [[ $value =~ $executable_re ]] && [ -f "$value" ] && [ -x "$value" ] || refuse "test_env.$key executable" ;;
+                *) [[ $value =~ $literal_re ]] || refuse "test_env.$key value" ;;
+            esac
+            test_env+=("TEST_RUNNER_$key=$value"); test_count=$((test_count + 1)); shift ;;
         -quiet)
             [ "$quiet" -eq 0 ] || refuse "a second -quiet"
             quiet=1 ;;
@@ -227,6 +264,7 @@ if [ "$clean" -eq 1 ]; then
 fi
 
 env=("HOME=$home" "PATH=/usr/bin:/bin:/usr/sbin:/sbin")
+if [ "$test_count" -gt 0 ]; then env+=("${test_env[@]}"); fi
 tmpdir=${TMPDIR:-}
 tmpdir=${tmpdir%/}
 if [ -n "$tmpdir" ] && [ ! -L "$tmpdir" ] && [ -d "$tmpdir" ] && [ -O "$tmpdir" ]; then
