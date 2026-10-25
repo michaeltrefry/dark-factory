@@ -1,3 +1,4 @@
+using DarkFactory.Orchestrator.Tests.Support;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using DarkFactory.Orchestrator.Gate;
@@ -85,14 +86,15 @@ public class XcodeIosRunnerTests : IDisposable
         }
     }
 
-    /// <summary>The owner's devices named as the gate names its own (dark-factory-gate-…): name and UDID.</summary>
+    /// <summary>The verified lwrunner user's devices named as the gate names its own (dark-factory-gate-…): name and UDID.</summary>
     private static List<(string Name, string Udid)> GateDevices() =>
-        OperatingSystem.IsMacOS()
+        GuiTestExecution.UnavailableReason is null && OperatingSystem.IsMacOS()
             ? Regex.Matches(Output(XcodeNewTests.Xcrun, "simctl", "list", "devices"), @"^    (dark-factory-gate-\S+) \(([0-9A-F-]+)\)", RegexOptions.Multiline)
                 .Select(m => (m.Groups[1].Value, m.Groups[2].Value)).ToList()
             : [];
 
     private static readonly Lazy<string?> Missing = new(() =>
+        GuiTestExecution.UnavailableReason is { } placement ? placement :
         !OperatingSystem.IsMacOS() || Output(XcodeNewTests.Xcodebuild, "-version").Length == 0 ? "Xcode is not installed"
         : !Output(XcodeNewTests.Xcrun, "simctl", "list", "runtimes").Split('\n').Any(l => l.StartsWith("iOS ", StringComparison.Ordinal) && !l.Contains("unavailable"))
             ? "no iOS Simulator runtime is installed"

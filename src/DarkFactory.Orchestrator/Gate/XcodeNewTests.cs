@@ -183,6 +183,8 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
     /// <summary>The way a test's project is built: the container flag and path, and the scheme (<see cref="NewTestSet.Projects"/>'s value).</summary>
     internal sealed record Build(string Flag, string Container, string Scheme, string Platform = XcodeProject.MacOS)
     {
+        // Placement is a scheme property across platforms; execution keeps its original platform below.
+        public (string Flag, string Container, string Scheme) SchemeIdentity => (Flag, Container, Scheme);
         public override string ToString() => Platform == XcodeProject.MacOS ? $"{Flag}\n{Container}\n{Scheme}" : $"{Flag}\n{Container}\n{Scheme}\n{Platform}";
 
         public static Build From(string value) => value.Split('\n') switch
@@ -752,6 +754,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
 
         // Each target with new tests: its scheme and platform at the head and the base, and the base compiling the new files.
         var projects = new Dictionary<string, string>(StringComparer.Ordinal);
+        var placements = new Dictionary<string, XcodeTestPlacement>(StringComparer.Ordinal);
         var notes = new SortedSet<string>(StringComparer.Ordinal);
         var edits = new Dictionary<(string Project, string Target), (List<string> Add, List<string> Remove)>();
         foreach (var group in news.GroupBy(n => (n.Value.Project.Path, n.Value.Target.Name)))
@@ -813,6 +816,10 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
                 {
                     groupProblems.Add($"{label} at the base: {baseName}");
                 }
+                foreach (var test in group)
+                    placements[test.Key] = XcodeTestPlacements.Agree(
+                        baseConfiguration is null ? XcodeTestPlacement.Unknown : baseProject.Project.TestPlacement(baseTarget, baseConfiguration),
+                        project.TestPlacement(target, configuration!));
                 if (baseBuild is not null)
                 {
                     groupProblems.AddRange(PlanExcludes(basePlan, "the base", group.Select(n => n.Key), target.Name));
@@ -918,6 +925,7 @@ public sealed class XcodeNewTests(string wrapperPath = SwiftToolchain.DefaultWra
         return new SwiftNewTestSet(testFiles.Distinct().ToList(), news.Keys.ToList(), problems)
         {
             Projects = projects,
+            XcodePlacements = placements,
             BaseReplacements = replacements,
             Notes = [.. notes],
             Originals = originals,

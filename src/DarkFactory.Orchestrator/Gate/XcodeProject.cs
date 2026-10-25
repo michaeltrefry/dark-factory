@@ -244,6 +244,16 @@ public sealed record XcodeMembership(bool Member, string? Unknown)
     public static XcodeMembership NotKnown(string why) => new(false, why);
 }
 
+/// <summary>Execution destination proven from a test target's platform and host requirements, never its name.</summary>
+public enum XcodeTestPlacement { Unknown, Local, Hosted, Gui }
+
+public static class XcodeTestPlacements
+{
+    /// <summary>A base/head mismatch is not permission to run either side on a less confined executor.</summary>
+    public static XcodeTestPlacement Agree(XcodeTestPlacement baseline, XcodeTestPlacement head) =>
+        baseline == head ? head : XcodeTestPlacement.Unknown;
+}
+
 /// <summary>A native target of an Xcode project: its object id, name and product type.</summary>
 public sealed record XcodeTarget(string Id, string Name, string ProductType, PbxDict Object)
 {
@@ -755,6 +765,35 @@ public sealed class XcodeProject
 
     /// <summary>An iOS Simulator: the destination of an iOS test target (sc-26132; a device never, E3).</summary>
     public const string IOS = "iOS";
+
+    /// <summary>
+    /// The execution location, with no hosted GUI fallback. Unread configuration, conditional host settings and an
+    /// unexplained bundle loader never prove non-GUI execution. Callers must agree this fact at both commits.
+    /// </summary>
+    public XcodeTestPlacement TestPlacement(XcodeTarget target, string configuration)
+    {
+        var (platform, _, _) = TestPlatform(target, configuration);
+        if (platform is null) return XcodeTestPlacement.Unknown;
+        if (target.ProductType == XcodeTarget.UITestBundle) return XcodeTestPlacement.Gui;
+        if (!target.IsUnitTests) return XcodeTestPlacement.Unknown;
+        foreach (var owner in new[] { target.Object, _project })
+        {
+            var config = owner.Str("buildConfigurationList") is { } listId && Object(listId) is { } list
+                ? (list.Strings("buildConfigurations") ?? []).Select(Object).FirstOrDefault(c => c?.Str("name") == configuration) : null;
+            if (config is null || config.Str("baseConfigurationReference") is not null || config.Dict("buildSettings") is not { } settings)
+                return XcodeTestPlacement.Unknown;
+            // Xcode supports SDK/architecture-conditioned settings. Looking up only the unqualified key would
+            // silently miss a host used on the actual simulator, even beside an explicit empty TEST_HOST.
+            if (settings.Entries.Keys.Any(k => k.StartsWith("TEST_HOST[", StringComparison.Ordinal)
+                || k.StartsWith("BUNDLE_LOADER[", StringComparison.Ordinal))) return XcodeTestPlacement.Unknown;
+        }
+        var (host, hostProblem) = SettingOrUnset(target, configuration, "TEST_HOST");
+        if (hostProblem is not null) return XcodeTestPlacement.Unknown;
+        if (!string.IsNullOrWhiteSpace(host)) return XcodeTestPlacement.Gui;
+        var (loader, loaderProblem) = SettingOrUnset(target, configuration, "BUNDLE_LOADER");
+        if (loaderProblem is not null || !string.IsNullOrWhiteSpace(loader)) return XcodeTestPlacement.Unknown;
+        return platform == MacOS ? XcodeTestPlacement.Local : XcodeTestPlacement.Hosted;
+    }
 
     /// <summary>
     /// Where the gate runs the tests of <paramref name="target"/> built in <paramref name="configuration"/> (sc-26131,

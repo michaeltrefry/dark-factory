@@ -1785,3 +1785,146 @@ file/credential identity, no owner/lwrunner GUI service access, detached-worker 
 survival, plus local non-host macOS build/test behavior. This session performs no real sudo/helper run,
 launchd adoption, account/password/shell change, native Mach message, GUI service lookup or simulator
 probe. A skipped or unperformed live proof is not passed acceptance.
+
+## S4: dedicated trusted GUI CI (sc-26790)
+
+**Threat-model amendment, approved by the owner:** reuse the existing persistent `lwrunner`
+account for allowlisted **trusted repository tests**. This is dedicated trusted CI, not a
+sandbox for malicious GUI code. Same-user state outside fresh workspaces (including GUI agents,
+launchd registrations, native tool caches and settings) may persist. We do not claim a UID sweep
+or a fresh HOME clears that state, or that Seatbelt follows broker-launched applications.
+No new GUI user, VM, password, loginwindow exception or per-job approval is required.
+
+Placement is deterministic from both commits and the scheme's test configuration: a macOS or
+iOS `TEST_HOST`, and iOS UI testing, go to this GUI executor; proven nonhosted iOS unit tests go
+to the existing hosted executor; nonhosted macOS stays local. Conditional/unknown host settings
+and disagreements cannot fall back to hosted/local execution. A scheme mixing GUI and non-GUI
+new tests is executed wholly on GUI CI. Other stacks and GPU placement are unchanged.
+
+### One-time deployment (not performed by unit tests or this change)
+
+The existing `lensworks-guest` registration and its generic labels are **not** proof of its OS
+identity. Relocate its credentialed runner service to an **existing trusted non-GUI collector
+principal**, never `lwrunner`. Its HOME, runner installation/work directory, command files,
+registration keys and artifact publication authority must be readable by that collector alone
+(mode 0700, no allowing ACL entries; existing deny ACLs stay). Its `.runner`, `.credentials` and
+`.credentials_rsaparams` are collector-owned 0600. The helper verifies actual `.runner` metadata
+and the workflow checks its real registration name and repository against the protected configuration. Remove the former `lwrunner`
+registration credentials/service, personal credentials and sudo/admin authority. No token is
+forwarded to source execution. The protected helper checks configured former runner locations,
+known private-auth files, collector paths, distinct UIDs, groups and sudo authority every run.
+This is an installation prerequisite, not permission to change accounts in an implementation session.
+
+Install `scripts/factory-gui-exec` unchanged, root-owned 0755, at
+`/usr/local/libexec/dark-factory/factory-gui-exec`, under root-owned non-writable ancestors.
+Install `/etc/dark-factory/gui-executor.json` root-owned 0600 with exactly these fields
+(values must describe the actual existing host; placeholders are not defaults):
+
+```json
+{
+  "collectorUid": 501,
+  "sourceUid": 502,
+  "sourceUser": "lwrunner",
+  "runnerRoot": "/Users/collector/actions-runner",
+  "runnerName": "lensworks-guest",
+  "collectorRepository": "owner/collector",
+  "stateDirectory": "/Users/collector/gui-state",
+  "retiredRunnerRoots": ["/Users/lwrunner/actions-runner"],
+  "developer": "/Applications/Xcode.app/Contents/Developer",
+  "xcode": "26.5",
+  "build": "17F42",
+  "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+  "deviceType": "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
+  "trustedRepositories": ["owner/trusted-repository"]
+}
+```
+
+`stateDirectory` is pre-created collector-owned 0700 inside its private HOME. Grant only that
+collector a NOPASSWD rule for the exact installed helper as root (never grant `lwrunner` sudo,
+`env`, a shell, a generic interpreter, `launchctl` or arbitrary file removal). The helper
+allows a fixed operation set, checks caller `SUDO_UID`, binds the root to a fresh collector-owned
+`/tmp/factory-ios-*`, and demotes every source command to **existing `lwrunner`** after adopting
+its bootstrap. It checks `Aqua` and the actual execution UID before repository commands.
+Only root-owned helper/config paths select identity or Xcode; repository code cannot select a
+privileged principal. This session does not install this rule or run the helper.
+
+Use **one collector registration** on this machine, labelled `factory-gui-collector` as well as
+`self-hosted`, `macOS`, `ARM64`. All existing GUI workflows/jobs on that machine must migrate to
+this same collector protocol before enabling dispatch; leaving generic unrestricted jobs as
+`lwrunner` would defeat serialization and credential separation. The workflow label itself is
+not the identity boundary: the helper checks the real UIDs and paths.
+
+Render the immutable workflow with:
+
+```sh
+dotnet run --project src/DarkFactory.Orchestrator -- ios-new-tests gui-workflow
+```
+
+Install that exact output on the **central collector repository's default branch** as
+`.github/workflows/factory-gui-new-tests.yml`. Do not install the unexpanded template or a
+helper from a source PR. Set that repository's `FACTORY_GUI_TRUSTED_REPOSITORIES` Actions
+variable to the comma-separated trusted public sources, matching the protected configuration.
+Source archives are public immutable codeload revisions: no broader installation token, PAT or
+collector-repository token is used to read another repository. A private source currently errors;
+there is no credential fallback. The gate App needs repository-scoped Contents/Actions read
+and Actions write on the collector repository, not source-repository write authority.
+
+Set the factory's strict settings once:
+
+- `Gate:Gui:CollectorRepo`: central `owner/name`.
+- `Gate:Gui:TrustedRepos`: comma-separated explicit trusted `owner/name` sources.
+- `Gate:Gui:ConfigurationSha256`: lowercase SHA-256 of the exact installed configuration bytes.
+
+All three are required together and checked at startup. The configuration hash binds returned
+Xcode/runtime identity to this deployment. Changing the pinned environment is a deployment
+configuration update, not a per-run operator gate. Missing authority, a missing existing GUI
+login, unavailable Xcode/runtime, or a private source is a bounded error, never a GUI hosted fallback.
+
+### Autonomous execution, evidence and recovery
+
+The existing S2 engine transports each ordinary base/head/retry `TestRunSpec`: exact overlays,
+compiler attribution, prepare artifacts/steps and their existing environment, hash-pinned
+package hydration and native package signature validation. GUI native registry resolution uses
+the declared registry and pinned versions directly (no global hosts-file edits); it remains native
+signature validation, not a trust-policy bypass. macOS uses ad-hoc signing; iOS uses only the
+pinned simulator. Each invocation gets fresh source/HOME/TMPDIR/DerivedData and its own new
+simulator when needed. Reports keep ordinary per-test exit-code/case validation and judging.
+Nonce, sealed workflow commit, source commits, side, execution hash and protected configuration
+hash must match. Missing/mismatched/host-failed evidence is an error with bounded code-written
+diagnostics. Source output is captured, not emitted as Actions command instructions.
+
+A collector-private machine-wide flock serializes base/head/retry jobs across repositories and
+processes. No workflow concurrency group drops older pending jobs: the protected machine lease is the boundary. The active
+journal is written before source starts. Cleanup deletes the invocation's recorded simulator(s),
+terminates journaled privileged command groups only after their leader/start identity matches, then
+source processes under the fixed UID, and removes only the verified fresh workspace.
+Root-owned Apple GUI agents may remain/respawn; persistent same-user state is the accepted
+trusted-CI residual, not reported as clean-room isolation.
+
+A crash releases the OS lock but keeps its journal. Before a factory simulator can be created,
+the journal durably records its exact nonce-generated name, not merely a UDID returned afterwards.
+The next job stops the prior commands and reconciles that intent in the fixed source UID's native
+device inventory, even when creation took effect but its answer was lost. Ambiguous or unreadable
+inventory blocks reuse; unrelated devices are never selected. Recorded UDIDs and workspaces are
+then cleaned idempotently before starting anything new. An empty BSD `ps -U` answer with status 1
+and no stderr is successful quiescence, not an infrastructure failure; actual command failures and
+malformed rows remain unknown. Failed or unknown cleanup keeps reuse blocked for that invocation;
+later invocations retry reconciliation.
+There is no routine human re-arm or approval flag. Malformed protected state or unavailable
+installation authority is a genuine infrastructure error, not permission to discard the journal.
+
+`GuiTestPlacementTests`, `GuiRemoteGateTests` and `gui-runner-tests.py` use fake identity,
+privilege, GUI, simulator and process operations, real archive overlays, real machine lease files,
+and ordinary evidence parsing. They cover overlap, automatic crash reconciliation, blocked reuse,
+fresh workspaces, preservation of declared recipe env, accepted persistent state outside them,
+fixed identity, source allowlisting, both platforms and cleanup failure suppressing publication.
+These are safe contracts, **not live GUI/credential-boundary evidence**. Terminal S6 verifies
+actual collector/service identity, old-registration removal, OS access denials, all existing-job
+participation, both platforms, cancellation/cleanup/recovery and end-to-end factory autonomy.
+
+Native `XcodeIosRunnerTests` additionally enforce this placement before even inventorying simulator
+devices: actual OS user/UID `lwrunner`, own Aqua bootstrap, and the helper's root-owned ephemeral
+collector/configuration binding must agree. An environment assertion alone cannot opt an owner
+run in. Owner full-suite runs report these GUI cases skipped for placement, not passed; non-GUI
+SwiftPM and nonhosted macOS native fixtures remain local and unchanged. The fixed helper emits
+that binding automatically for each source command; no per-job approval or manual opt-in is added.

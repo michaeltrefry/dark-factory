@@ -27,6 +27,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="../../factory/workflows/factory-gui-new-tests.yml" LogicalName="factory-gui-new-tests.yml" />
+    <EmbeddedResource Include="../../scripts/factory-gui-remote.py" LogicalName="factory-gui-remote.py" />
+    <EmbeddedResource Include="../../scripts/factory-gui-exec" LogicalName="factory-gui-exec" />
     <EmbeddedResource Include="../../factory/workflows/factory-ios-new-tests.yml" LogicalName="factory-ios-new-tests.yml" />
     <EmbeddedResource Include="../../scripts/factory-ios-remote.py" LogicalName="factory-ios-remote.py" />
     <EmbeddedResource Include="GitHub/app-manifest.json" LogicalName="app-manifest.json" />

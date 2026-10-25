@@ -1,0 +1,137 @@
+# Install the rendered RemoteGuiWorkflow.Text, not this source template.
+# The sealed collector and fixed-identity helper are factory-owned.
+name: Factory trusted GUI new tests
+run-name: factory-ios-${{ inputs.nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        required: true
+        type: string
+      nonce:
+        required: true
+        type: string
+      base:
+        required: true
+        type: string
+      head:
+        required: true
+        type: string
+      tests:
+        required: true
+        type: string
+      execution:
+        default: ''
+        type: string
+      execution_budget_seconds:
+        default: ''
+        type: string
+      execution_deadline_unix_seconds:
+        default: ''
+        type: string
+permissions: {}
+jobs:
+  sources:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      sides: ${{ steps.plan.outputs.sides }}
+    steps:
+      - name: Select requested execution side
+        id: plan
+        env:
+          EXECUTION: ${{ inputs.execution }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          execution = os.environ['EXECUTION']
+          sides = ['base', 'head']
+          if execution:
+              side = json.loads(execution)['side']
+              if side not in ('base', 'head'):
+                  raise ValueError('invalid execution side')
+              sides = [side]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sides=' + json.dumps(sides) + '\n')
+          PY
+      # Public immutable source only: never mint a cross-repository token or
+      # silently reuse the collector repository's installation authority.
+      - name: Acquire allowlisted public immutable sources
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          TRUSTED_REPOSITORIES: ${{ vars.FACTORY_GUI_TRUSTED_REPOSITORIES }}
+          BASE: ${{ inputs.base }}
+          HEAD: ${{ inputs.head }}
+        run: |
+          python3 -I - <<'PYCODE'
+          import os, re, urllib.request
+          repo = os.environ['SOURCE_REPOSITORY']
+          trusted = [v.strip().lower() for v in os.environ['TRUSTED_REPOSITORIES'].split(',')]
+          if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*', repo) or repo.lower() not in trusted:
+              raise ValueError('source repository is not allowlisted')
+          os.mkdir('sources')
+          for side in ('base', 'head'):
+              sha = os.environ[side.upper()]
+              if not re.fullmatch('[0-9a-f]{40}', sha):
+                  raise ValueError('invalid immutable source commit')
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      return None
+              url = 'https://codeload.' + 'github.com/' + repo + '/zip/' + sha
+              with urllib.request.build_opener(NoRedirect).open(url, timeout=60) as response, open('sources/' + side + '.zip', 'xb') as output:
+                  size = 0
+                  while chunk := response.read(65536):
+                      size += len(chunk)
+                      if size > 100 * 1024 * 1024:
+                          raise ValueError('source archive too large')
+                      output.write(chunk)
+          PYCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: factory-ios-sources
+          path: sources/*.zip
+          retention-days: 1
+          if-no-files-found: error
+  check:
+    needs: sources
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.sources.outputs.sides) }}
+    runs-on: [self-hosted, macOS, ARM64, factory-gui-collector]
+    # Hosted hard ceiling only; Python enforces the transported remaining deadline.
+    timeout-minutes: 360
+    permissions: {}
+    steps:
+      - name: Fresh collector transfer directory
+        run: |
+          rm -rf -- sources
+          rm -f -- result.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: factory-ios-sources
+          path: sources
+      # Dedicated trusted CI: runner/collector is NOT lwrunner. The protected
+      # helper demotes source execution to existing lwrunner. Persistent same-user
+      # GUI state is accepted; fresh workspace and bounded cleanup are still required.
+      - name: Run new tests separately on base and head
+        shell: /usr/bin/python3 -I {0}
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SIDE: ${{ matrix.side }}
+          NONCE: ${{ inputs.nonce }}
+          BASE: ${{ inputs.base }}
+          HEAD: ${{ inputs.head }}
+          TESTS: ${{ inputs.tests }}
+          EXECUTION: ${{ inputs.execution }}
+          EXECUTION_BUDGET_SECONDS: ${{ inputs.execution_budget_seconds }}
+          EXECUTION_DEADLINE_UNIX_SECONDS: ${{ inputs.execution_deadline_unix_seconds }}
+        run: |
+          # FACTORY_RUNNER
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: factory-ios-result-${{ inputs.nonce }}-${{ matrix.side }}
+          path: result.json
+          retention-days: 1
+          if-no-files-found: error

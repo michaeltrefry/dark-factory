@@ -275,13 +275,33 @@ public sealed class IosWorkflowGitHubTests
         Assert.Equal("remote-github-http: GitHub rejected the iOS workflow request (HTTP 403). Check the gate App installation and its repository Actions permissions; no usable executed evidence.", error?.Message);
     }
 
+    [Fact]
+    public async Task Gui_dispatch_uses_only_the_collector_repository_actions_token_never_source_authority()
+    {
+        var api = Api().On("POST " + Root + "/actions/workflows/factory-gui-new-tests.yml/dispatches", request => {
+            var inputs = JsonDocument.Parse(request.Body!).RootElement.GetProperty("inputs");
+            Assert.Equal("other/trusted-public-source", inputs.GetProperty("source_repository").GetString());
+            Assert.DoesNotContain("gate-token", request.Body!);
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        });
+        await Client(api, gui: true).DispatchAsync(Repo, new("main", Commit, RemoteGuiWorkflow.Text),
+            new(Base, Head, ["WidgetTests/Suite/newTest()"]) { Execution = "{}", SourceRepository = "other/trusted-public-source", ExecutionBudgetSeconds = 90 },
+            new string('a', 32), CancellationToken.None);
+        Assert.All(api.Requests.Where(r => r.PathAndQuery.EndsWith("/access_tokens")), request => {
+            var token = JsonDocument.Parse(request.Body!).RootElement;
+            Assert.Equal("ios", Assert.Single(token.GetProperty("repositories").EnumerateArray()).GetString());
+            Assert.Equal("{\"actions\":\"write\"}", token.GetProperty("permissions").GetRawText());
+        });
+        Assert.DoesNotContain(api.Requests, request => request.PathAndQuery.Contains("/repos/other/"));
+    }
+
     private static FakeApi Api() => new FakeApi()
         .On("GET " + Root + "/installation", HttpStatusCode.OK, """{"id":5}""")
         .On("POST /app/installations/5/access_tokens", HttpStatusCode.Created, $$$"""{"token":"gate-token","expires_at":"{{{Now.AddMinutes(30):O}}}"}""");
-    private static IosWorkflowGitHub Client(FakeApi api)
+    private static IosWorkflowGitHub Client(FakeApi api, bool gui = false)
     {
         var http = api.Client("https://api.github.com/");
-        return new(http, new GitHubApp(http, "123", Pem, new FixedTime(Now)));
+        return new(http, new GitHubApp(http, "123", Pem, new FixedTime(Now)), gui);
     }
     private static HttpResponseMessage Zip(string json, string name = "result.json", int count = 1)
     {

@@ -303,7 +303,7 @@ public class GatePipelineTests
                     controls: RunControls ?? Controls,
                     controlPollInterval: ControlPoll,
                     gate: new GateStage(GitHub, Panel ?? Reviewer, TimeSpan.FromMilliseconds(1), CiTimeout, GateOnFakeClock ? Time : null,
-                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock), Prepare, RemoteIos),
+                        TestRunner, Overlays, NoCodeGraph ? null : RiskReader ?? FakeCodeGraphRisk.Reader(CodeGraph, GateOnFakeClock), Prepare, RemoteIos, RemoteGui),
                     freeze: Freeze is null ? null : new FactoryFreeze(Contexts, Controls, Freeze, TimeProvider.System, GitHub),
                     maxControlReadFailures: MaxControlReadFailures,
                     swift: Swift,
@@ -316,6 +316,7 @@ public class GatePipelineTests
         public bool Swift { get; init; }
 
         public RemoteIosNewTests? RemoteIos { get; init; }
+        public RemoteIosNewTests? RemoteGui { get; init; }
 
         /// <summary>The gate's prepare stage (sc-26232): each commit's recipe read and its artifacts fetched before the runs; none by default.</summary>
         public Orchestrator.Prepare.PrepareStage? Prepare { get; init; }

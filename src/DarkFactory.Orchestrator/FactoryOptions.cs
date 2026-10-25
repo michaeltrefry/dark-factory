@@ -550,6 +550,8 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     /// <c>Gate:TestTimeoutMinutes</c> (&gt; 0, default 20): one sandboxed run (restore, build, the new tests) of the
     /// <c>new-tests-fail-on-base</c> check; a run still going after this fails the check.
     /// </summary>
+    public Gate.GuiWorkflowSettings? GuiWorkflow => Gate.GuiWorkflowSettings.Parse(config["Gate:Gui:CollectorRepo"], config["Gate:Gui:TrustedRepos"], config["Gate:Gui:ConfigurationSha256"]);
+
     public TimeSpan TestTimeout => Positive("Gate:TestTimeoutMinutes", Gate.SandboxTestRunner.DefaultTimeout.TotalMinutes, TimeSpan.FromMinutes);
 
     /// <summary>
@@ -568,7 +570,7 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
     {
         _ = (RouterBaseUrl, DefaultRepo, Repos, WorkerSlotCount, WorkerSwift, WorkerPrepare, WorkerSlots, WatchScope, WatchedIssueRepos, PollInterval, MaxItemFailures, MaxConcurrentRuns);
         _ = (Freeze, UsagePollInterval, CostSettleDelay, HostPort, WorkerTimeout, MaxControlReadFailures, PauseGrace, StuckDetection);
-        _ = (QuietThreshold, Metrics, ReviewTimeout, ReviewMaxOutputTokens, CiPollInterval, CiTimeout, TestTimeout, CodeGraphBaseUrl, KanbanMcpUrl);
+        _ = (QuietThreshold, Metrics, ReviewTimeout, ReviewMaxOutputTokens, CiPollInterval, CiTimeout, TestTimeout, GuiWorkflow, CodeGraphBaseUrl, KanbanMcpUrl);
         _ = (CodeGraphOverlayTimeout, KanbanWatchScope, KanbanWebUrl, IssueClassificationMode, IssueClassificationModel, IssueClassificationTimeout, IssueClassificationMaxInputChars);
         CheckWorkerAuth();
         // Kanban:WriteToken must not be Kanban:Token (E2, sc-25992); compared where the write token is read, the registry.
