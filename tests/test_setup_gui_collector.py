@@ -1,0 +1,596 @@
+"""Safe installer contracts: filesystem in TemporaryDirectory, ALL host commands faked.
+Run: python3 -I tests/test_setup_gui_collector.py [--mutations]
+No sudo, dscl, launchctl, downloaded executable, runner or network is run.
+"""
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import time
+import types
+import unittest
+
+SOURCE = Path(__file__).resolve().parents[1] / 'scripts/setup-gui-collector.py'
+TEXT = SOURCE.read_text()
+
+
+def load(text):
+    module = types.ModuleType('collector_installer')
+    exec(compile(text, str(SOURCE), 'exec'), module.__dict__)
+    return module
+
+
+setup = load(TEXT)
+
+
+class FakeHost:
+    def __init__(self, root):
+        self.root = root
+        self.accounts = {'lwrunner': {'uid': 502}}
+        self.calls = []
+        self.acls = set()
+        self.used = {0, 501, 502}
+        self.fail = None
+
+    def account(self, name):
+        return self.accounts.get(name)
+
+    def ids(self):
+        return self.used, self.used
+
+    def group(self, name):
+        return self.accounts.get(name, {}).get('gid')
+
+    def create_account(self, name, uid, home):
+        self.accounts[name] = dict(uid=uid, gid=uid, home=home, shell='/usr/bin/false')
+        self.calls.append(('account', name, uid, home))
+
+    def verify_account(self, name, uid, home):
+        setup.require(self.accounts[name] == dict(uid=uid, gid=uid, home=str(home), shell='/usr/bin/false'), 'account mismatch')
+
+    def acl_free(self, path):
+        return str(path) not in self.acls
+
+    def run(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        if self.fail and self.fail in argv[0]:
+            raise setup.Refused('simulated failure')
+        if argv[0].endswith('config.sh'):
+            runner = Path(kwargs['cwd'])
+            info = {'agentName': argv[argv.index('--name') + 1], 'agentId': 71,
+                    'gitHubUrl': 'https://github.com/o/central'}
+            for name, data in (('.runner', json.dumps(info)), ('.credentials', 'private-key'),
+                               ('.credentials_rsaparams', 'private-rsa')):
+                (runner / name).write_text(data)
+                (runner / name).chmod(0o600)
+        return ''
+
+    def start(self, plist):
+        self.calls.append(('start', str(plist)))
+
+    def stop(self, label):
+        self.calls.append(('stop', label))
+        if self.fail == 'stop':
+            raise setup.Refused('simulated stop failure')
+
+
+class Contracts(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.archive = self.root / 'runner.tar.gz'
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            for name in ('config.sh', 'run.sh'):
+                entry = tarfile.TarInfo(name)
+                entry.mode = 0o755
+                entry.size = 4
+                archive.addfile(entry, io.BytesIO(b'fake'))
+        self.helper = self.root / 'helper'
+        self.helper.write_text('trusted helper')
+        self.source_job = self.root / 'source-job'
+        self.source_job.write_text('trusted non-root source client')
+        self.host = FakeHost(self.root)
+        self.plan = dict(version=1, user='_factorygui', uid=503, home='/Users/_factorygui',
+                         runnerName='factory-gui-unique-1234', archive=str(self.archive),
+                         archiveSha256=hashlib.sha256(self.archive.read_bytes()).hexdigest(), helper=str(self.helper),
+                         helperSha256=setup.digest(self.helper.read_bytes()), sourceJob=str(self.source_job),
+                         sourceJobSha256=setup.digest(self.source_job.read_bytes()),
+                         configuration=dict(collectorUid=503, sourceUid=502, sourceUser='lwrunner',
+                                            runnerRoot='/Users/_factorygui/actions-runner',
+                                            runnerName='factory-gui-unique-1234', collectorRepository='o/central',
+                                            stateDirectory='/Users/_factorygui/gui-state',
+                                            retiredRunnerRoots=['/Users/lwrunner/actions-runner'],
+                                            developer='/Applications/Xcode.app/Contents/Developer', xcode='26.5',
+                                            build='17F42', runtime='iOS-26-5', deviceType='iPhone-17', trustedRepositories=['o/trusted']),
+                         old=dict(runnerRoot='/Users/lwrunner/actions-runner', runnerId=19,
+                                  runnerName='lensworks-guest', serviceLabel='actions.runner.old',
+                                  servicePlist='/Library/LaunchAgents/actions.runner.old.plist', files={}))
+        old = self.root / 'Users/lwrunner/actions-runner'
+        old.mkdir(parents=True, mode=0o700)
+        for name in setup.AUTH_FILES:
+            (old / name).write_text(json.dumps({'agentId': 19, 'agentName': 'lensworks-guest', 'gitHubUrl': 'https://github.com/o/old-repo'}) if name == '.runner' else 'old-' + name)
+        service = self.root / 'Library/LaunchAgents/actions.runner.old.plist'
+        service.parent.mkdir(parents=True)
+        (old / '.service').write_text('actions.runner.old')
+        service.write_bytes(setup.plistlib.dumps({'Label': 'actions.runner.old', 'UserName': 'lwrunner',
+                                                'WorkingDirectory': '/Users/lwrunner/actions-runner'}))
+        self.plan['old']['files'] = {name: setup.digest((old / name).read_bytes()) for name in setup.AUTH_FILES}
+        self.plan['old']['files']['servicePlist'] = setup.digest(service.read_bytes())
+        self.authority = dict(expiresAt=time.time() + 600, appPermissionsVerified=True, newNameAbsent=True,
+                              migratedWorkflows=[dict(path=path, sha256='a' * 64, collectorProtocol=True) for path in sorted(setup.MIGRATED_WORKFLOWS)])
+        self.bind()
+        self.installer = setup.Installer(self.plan, self.host, self.root)
+
+    def bind(self):
+        self.authority['planSha256'] = setup.digest(json.dumps(self.plan, sort_keys=True).encode())
+
+    def apply(self):
+        return self.installer.apply(self.authority, lambda: 'SHORT_LIVED_TOKEN_12345')
+
+    def online(self):
+        self.authority['online'] = dict(runnerId=71, runnerName=self.plan['runnerName'], status='online', labels=[setup.bootstrap_label(self.authority['planSha256'])])
+        self.authority['removedOldRunnerId'] = None
+        self.apply()  # online proof protects backups BEFORE exact remote removal
+        self.authority['removedOldRunnerId'] = 19
+
+    def test_dryrun_has_no_mutations(self):
+        before = sorted(str(x) for x in self.root.rglob('*'))
+        self.installer.validate(self.authority)
+        self.assertEqual(before, sorted(str(x) for x in self.root.rglob('*')))
+        self.assertEqual([], self.host.calls)
+
+    def test_uid_must_be_free_and_not_lwrunner(self):
+        for uid in (499, 502, 501):
+            self.plan['uid'] = uid
+            self.plan['configuration']['collectorUid'] = uid
+            self.bind()
+            with self.assertRaises(setup.Refused):
+                self.installer.validate(self.authority)
+
+    def test_existing_group_name_is_not_reassigned(self):
+        self.host.group = lambda name: 777
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+        self.assertEqual([], self.host.calls)
+
+    def test_private_home_never_adopted(self):
+        (self.root / 'Users/_factorygui').mkdir()
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_symlink_home_refused(self):
+        (self.root / 'Users/_factorygui').symlink_to(self.root / 'Users/lwrunner')
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_collector_registration_cannot_be_in_source_repository(self):
+        self.plan['configuration']['trustedRepositories'] = ['O/CENTRAL']
+        self.bind()
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+        self.assertEqual([], self.host.calls)
+
+    def test_reviewed_source_client_is_installed_fixed_root_program(self):
+        result = self.apply()
+        installed = self.installer.path(setup.SOURCE_JOB)
+        self.assertEqual(self.source_job.read_bytes(), installed.read_bytes())
+        self.assertEqual(0o755, installed.stat().st_mode & 0o777)
+        self.assertEqual(self.plan['sourceJobSha256'], result['sourceJobSha256'])
+        self.assertFalse(any(isinstance(x[0], list) and x[0][0] == str(installed) for x in self.host.calls))
+        self.assertNotIn(str(setup.SOURCE_JOB), (self.root / 'etc/sudoers.d/dark-factory-gui-collector').read_text())
+
+    def test_source_client_checksum_is_plan_bound(self):
+        self.source_job.write_text('modified after review')
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+        self.assertEqual([], self.host.calls)
+
+    def test_privileged_helper_checksum_is_plan_bound(self):
+        self.helper.write_text('modified privileged helper')
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+        self.assertEqual([], self.host.calls)
+
+    def test_checksum_mismatch_refused(self):
+        self.plan['archiveSha256'] = '0' * 64
+        self.bind()
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_root_inventory_is_readonly_and_nonsecret(self):
+        before = {str(path): path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        result = setup.inventory('/Users/lwrunner/actions-runner', self.host, self.root)
+        after = {str(path): path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        self.assertEqual(before, after)
+        self.assertEqual('inventory', result['status'])
+        self.assertEqual('o/old-repo', result['repository'])
+        self.assertEqual(self.plan['old'], result['old'])
+        self.assertNotIn('old-.credentials', json.dumps(result))
+        self.assertEqual([], self.host.calls)
+
+    def test_root_inventory_cannot_leave_source_home(self):
+        with self.assertRaises(setup.Refused):
+            setup.inventory('/Users/owner/actions-runner', self.host, self.root)
+
+    def test_root_inventory_never_follows_credential_symlink(self):
+        path = self.root / 'Users/lwrunner/actions-runner/.credentials'
+        path.unlink()
+        path.symlink_to(self.helper)
+        with self.assertRaises(setup.Refused):
+            setup.inventory('/Users/lwrunner/actions-runner', self.host, self.root)
+
+    def test_root_inventory_binds_service_to_source_directory(self):
+        path = self.root / 'Library/LaunchAgents/actions.runner.old.plist'
+        path.write_bytes(setup.plistlib.dumps({'Label': 'actions.runner.old', 'WorkingDirectory': '/Users/owner/runner'}))
+        with self.assertRaises(setup.Refused):
+            setup.inventory('/Users/lwrunner/actions-runner', self.host, self.root)
+
+    def test_root_inventory_refuses_wrong_source_uid(self):
+        self.host.accounts['lwrunner']['uid'] = 501
+        with self.assertRaises(setup.Refused):
+            setup.inventory('/Users/lwrunner/actions-runner', self.host, self.root)
+
+    def test_reserved_account_before_home_creation_resumes(self):
+        self.installer.mkdir(self.installer.path(setup.STATE))
+        self.installer.receipt.update(planSha256=self.authority['planSha256'])
+        self.installer.save()
+        self.host.create_account('_factorygui', 503, '/Users/_factorygui')
+        self.assertFalse((self.root / 'Users/_factorygui').exists())
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', self.apply()['status'])
+        self.assertEqual(0o700, (self.root / 'Users/_factorygui').stat().st_mode & 0o777)
+
+    def test_nullable_owner_authority_resumes_as_pending(self):
+        self.authority.update(kind='gui-collector-authority-v1', online=None, removedOldRunnerId=None)
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', self.apply()['status'])
+
+    def test_secret_bearing_authority_is_never_persisted(self):
+        self.authority['registrationToken'] = 'SECRET_MUST_NOT_PERSIST'
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(self.installer.path(setup.STATE / 'receipt.json').exists())
+
+    def test_owner_handoff_private_file_can_be_promoted(self):
+        source = self.root / 'authority.json'
+        source.write_bytes(b'{"owner":true}')
+        source.chmod(0o600)
+        data = setup.handoff_bytes(source, os.getuid(), self.host, 65536)
+        self.installer.mkdir(self.installer.path(setup.STATE))
+        self.installer.atomic_state('authority.json', data)
+        target = self.installer.path(setup.STATE / 'authority.json')
+        self.assertEqual(b'{"owner":true}', target.read_bytes())
+        self.assertEqual(0o600, target.stat().st_mode & 0o777)
+        self.assertEqual([], [x for x in self.host.calls if x[0] == 'account'])
+
+    def test_handoff_symlink_is_not_followed(self):
+        source = self.root / 'handoff-link'
+        source.symlink_to(self.helper)
+        with self.assertRaises(setup.Refused):
+            setup.handoff_bytes(source, os.getuid(), self.host, 65536)
+
+    def test_handoff_wrong_mode_and_acl_refused(self):
+        source = self.root / 'handoff.json'
+        source.write_text('{}')
+        source.chmod(0o644)
+        with self.assertRaises(setup.Refused):
+            setup.handoff_bytes(source, os.getuid(), self.host, 65536)
+        source.chmod(0o600)
+        self.host.acls.add(str(source))
+        with self.assertRaises(setup.Refused):
+            setup.handoff_bytes(source, os.getuid(), self.host, 65536)
+
+    def test_raw_plan_file_hash_is_authority_binding(self):
+        raw = json.dumps(self.plan, indent=2).encode() + b'\n'
+        self.installer.raw_plan_sha256 = setup.digest(raw)
+        self.authority['planSha256'] = setup.digest(raw)
+        self.assertEqual(setup.digest(raw), self.installer.validate(self.authority))
+        self.authority['planSha256'] = setup.digest(raw.rstrip())
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_exact_four_workflow_paths_not_arbitrary_four(self):
+        self.authority['migratedWorkflows'][0]['path'] = '.github/workflows/unrelated.yml'
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_four_migrations_required(self):
+        self.authority['migratedWorkflows'].pop()
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_app_permissions_required(self):
+        self.authority['appPermissionsVerified'] = False
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_authority_plan_binding(self):
+        self.authority['planSha256'] = '0' * 64
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_native_token_environment_and_no_default_labels(self):
+        result = self.apply()
+        call, = [x for x in self.host.calls if isinstance(x[0], list) and x[0][0].endswith('config.sh')]
+        argv, context = call
+        self.assertIn('--no-default-labels', argv)
+        self.assertEqual('factory-gui-bootstrap-' + self.authority['planSha256'][:16], argv[argv.index('--labels') + 1])
+        self.assertEqual('factory-gui-bootstrap-' + self.authority['planSha256'][:16], result['bootstrapLabel'])
+        self.assertNotIn('factory-gui-collector', argv)
+        self.assertNotIn('--replace', argv)
+        self.assertNotIn('SHORT_LIVED_TOKEN_12345', str(argv))
+        self.assertEqual(503, context['uid'])
+        self.assertEqual(503, context['gid'])
+        self.assertNotIn('SHORT_LIVED_TOKEN_12345', json.dumps(result))
+        # Real adapter tested with a fake subprocess; no command executes.
+        captured = []
+        original = setup.subprocess.run
+        setup.subprocess.run = lambda argv, **kw: (captured.append(kw) or types.SimpleNamespace(returncode=0, stdout=b''))
+        try:
+            setup.Host().run(['fake'], uid=503, gid=503, home='/Users/_factorygui', token='one-time')
+        finally:
+            setup.subprocess.run = original
+        self.assertEqual('one-time', captured[0]['env']['ACTIONS_RUNNER_INPUT_TOKEN'])
+        self.assertEqual('/Users/_factorygui', captured[0]['env']['HOME'])
+        self.assertNotIn('GH_TOKEN', captured[0]['env'])
+        self.assertNotIn('VSTS_AGENT_INPUT_TOKEN', captured[0]['env'])
+
+    def test_final_label_before_old_retirement_cannot_authorize_backup(self):
+        self.apply()
+        self.authority['online'] = dict(runnerId=71, runnerName=self.plan['runnerName'], status='online',
+                                        labels=[setup.CUSTOM_LABEL])
+        result = self.apply()
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', result['status'])
+        self.assertNotIn('old-backup-protected', result['stages'])
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
+        self.assertFalse(any(x[0] == 'stop' for x in self.host.calls))
+
+    def test_final_label_after_durable_retirement_is_valid_on_resume(self):
+        self.apply()
+        self.online()
+        self.assertEqual('complete', self.apply()['status'])
+        self.authority['online']['labels'] = [setup.CUSTOM_LABEL]
+        self.assertEqual('complete', self.apply()['status'])
+        self.assertIn('old-retired', self.installer.receipt['stages'])
+        self.assertEqual(1, len([x for x in self.host.calls if isinstance(x[0], list) and x[0][0].endswith('config.sh')]))
+
+    def test_online_stage_protects_backup_before_remote_removal(self):
+        self.apply()
+        self.authority['online'] = dict(runnerId=71, runnerName=self.plan['runnerName'], status='online', labels=[setup.bootstrap_label(self.authority['planSha256'])])
+        result = self.apply()
+        self.assertEqual('awaiting-owner-exact-old-registration-removal', result['status'])
+        self.assertIn('old-backup-protected', result['stages'])
+        self.assertTrue((self.root / 'var/db/dark-factory/gui-collector/rollback/.credentials').exists())
+        self.assertFalse(any(x[0] == 'stop' for x in self.host.calls))
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
+
+    def test_remote_removal_before_backup_is_refused(self):
+        self.apply()
+        self.authority.update(online=dict(runnerId=71, runnerName=self.plan['runnerName'], status='online', labels=[setup.bootstrap_label(self.authority['planSha256'])]),
+                              removedOldRunnerId=19)
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(x[0] == 'stop' for x in self.host.calls))
+        self.assertFalse((self.root / 'var/db/dark-factory/gui-collector/rollback').exists())
+
+    def test_online_required_before_old_retirement(self):
+        self.online()
+        self.authority['online']['status'] = 'offline'
+        result = self.apply()
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', result['status'])
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
+        self.assertFalse(any(x[0] == 'stop' for x in self.host.calls))
+
+    def test_idempotent_resume_never_registers_again(self):
+        self.apply()
+        self.online()
+        self.assertEqual('complete', self.apply()['status'])
+        self.assertEqual('complete', self.apply()['status'])
+        calls = [x for x in self.host.calls if isinstance(x[0], list) and x[0][0].endswith('config.sh')]
+        self.assertEqual(1, len(calls))
+        self.assertFalse((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
+        backup = self.root / 'var/db/dark-factory/gui-collector/rollback/.credentials'
+        self.assertEqual(0o600, backup.stat().st_mode & 0o777)
+
+    def test_partial_registration_is_not_blindly_repeated(self):
+        self.host.fail = 'config.sh'
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.host.fail = None
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        calls = [x for x in self.host.calls if isinstance(x[0], list) and x[0][0].endswith('config.sh')]
+        self.assertEqual(1, len(calls))
+
+    def test_acl_rejected_on_resume(self):
+        self.apply()
+        self.host.acls.add(str(self.root / 'Users/_factorygui'))
+        with self.assertRaises(setup.Refused):
+            self.apply()
+
+    def test_sudoers_is_exact_fixed_command(self):
+        self.apply()
+        rule = (self.root / 'etc/sudoers.d/dark-factory-gui-collector').read_text()
+        self.assertEqual('_factorygui ALL=(root) NOPASSWD: /usr/local/libexec/dark-factory/factory-gui-exec\n', rule)
+        self.assertTrue(any(isinstance(x[0], list) and x[0][0] == '/usr/sbin/visudo' for x in self.host.calls))
+        self.assertEqual(0o600, (self.root / 'etc/dark-factory/gui-executor.json').stat().st_mode & 0o777)
+        self.assertEqual(setup.digest((self.root / 'etc/dark-factory/gui-executor.json').read_bytes()),
+                         self.installer.receipt['configurationSha256'])
+        self.assertEqual(0o755, (self.root / 'usr/local/libexec/dark-factory/factory-gui-exec').stat().st_mode & 0o777)
+
+    def test_launchdaemon_is_non_gui_service_user(self):
+        self.apply()
+        plist = setup.plistlib.loads((self.root / 'Library/LaunchDaemons/net.dark-factory.gui-collector.plist').read_bytes())
+        self.assertEqual('_factorygui', plist['UserName'])
+        self.assertEqual('_factorygui', plist['GroupName'])
+        self.assertEqual({'HOME': '/Users/_factorygui', 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}, plist['EnvironmentVariables'])
+        self.assertEqual('/Users/_factorygui/actions-runner', plist['WorkingDirectory'])
+
+    def test_exact_old_id_required_for_retirement(self):
+        self.apply()
+        self.online()
+        self.authority['removedOldRunnerId'] = 20
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
+
+    def test_old_hash_mismatch_preserves_service_and_credentials(self):
+        self.apply()
+        self.online()
+        (self.root / 'Users/lwrunner/actions-runner/.credentials').write_text('someone changed it')
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(x[0] == 'stop' for x in self.host.calls))
+
+    def test_retirement_failure_keeps_protected_backup_and_old_files(self):
+        self.apply()
+        self.online()
+        self.host.fail = 'stop'
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
+        self.assertTrue((self.root / 'var/db/dark-factory/gui-collector/rollback/.credentials').exists())
+        self.assertEqual('rollback-local-files-restored-registration-requires-owner', self.installer.receipt['status'])
+
+    def test_partial_retirement_restores_deleted_credential(self):
+        self.apply()
+        self.online()
+        original = Path.unlink
+        target = self.root / 'Users/lwrunner/actions-runner/.credentials'
+        def fail_once(path, *args, **kwargs):
+            if path == target:
+                raise OSError('fake deletion failure')
+            return original(path, *args, **kwargs)
+        Path.unlink = fail_once
+        try:
+            with self.assertRaises(OSError):
+                self.apply()
+        finally:
+            Path.unlink = original
+        restored = self.root / 'Users/lwrunner/actions-runner/.runner'
+        self.assertTrue(restored.exists())
+        self.assertEqual(self.plan['old']['files']['.runner'], setup.digest(restored.read_bytes()))
+
+    def test_credential_reappearing_is_not_complete(self):
+        self.apply()
+        self.online()
+        self.apply()
+        (self.root / 'Users/lwrunner/actions-runner/.runner').write_text('new registration')
+        with self.assertRaises(setup.Refused):
+            self.apply()
+
+    def test_wrong_private_home_mode_refuses_resume(self):
+        self.apply()
+        (self.root / 'Users/_factorygui').chmod(0o755)
+        with self.assertRaises(setup.Refused):
+            self.apply()
+
+    def test_sudoers_symlink_never_followed(self):
+        sudoers = self.root / 'etc/sudoers.d/dark-factory-gui-collector'
+        sudoers.parent.mkdir(parents=True)
+        victim = self.root / 'victim'
+        victim.write_text('untouched')
+        sudoers.symlink_to(victim)
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertEqual('untouched', victim.read_text())
+
+    def test_existing_account_without_reservation_is_not_adopted(self):
+        self.host.create_account('_factorygui', 503, '/Users/_factorygui')
+        (self.root / 'Users/_factorygui').mkdir(mode=0o700)
+        with self.assertRaises(setup.Refused):
+            self.installer.validate(self.authority)
+
+    def test_archive_symlink_refused_without_execution(self):
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            entry = tarfile.TarInfo('config.sh')
+            entry.type = tarfile.SYMTYPE
+            entry.linkname = '/etc/sudoers'
+            archive.addfile(entry)
+        self.plan['archiveSha256'] = setup.digest(self.archive.read_bytes())
+        self.bind()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(isinstance(x[0], list) and x[0][0].endswith('config.sh') for x in self.host.calls))
+
+
+# Named RED mutations, restored GREEN, entirely in-memory and only this installer's code.
+MUTATIONS = [
+    ('uid-floor', "p['uid'] >= 500 and p['uid'] != 502", "p['uid'] >= 1", 'test_uid_must_be_free_and_not_lwrunner'),
+    ('adopt-home', "require(not self.path(p['home']).exists(),", "require(True,", 'test_private_home_never_adopted'),
+    ('private-group', "self.host.group(p['user']) is None", 'True', 'test_existing_group_name_is_not_reassigned'),
+    ('checksum', "file_digest(archive) == p['archiveSha256']", 'True', 'test_checksum_mismatch_refused'),
+    ('migration-four', "len(workflows) == 4 and {w['path'] for w in workflows} == MIGRATED_WORKFLOWS", 'True', 'test_four_migrations_required'),
+    ('app-permission', "authority.get('appPermissionsVerified') is True", 'True', 'test_app_permissions_required'),
+    ('plan-binding', "authority.get('planSha256') == binding", 'True', 'test_authority_plan_binding'),
+    ('generic-labels', "'--no-default-labels', '--labels'", "'--labels'", 'test_native_token_environment_and_no_default_labels'),
+    ('native-token-protocol', "env['ACTIONS_RUNNER_INPUT_TOKEN']", "env['VSTS_AGENT_INPUT_TOKEN']", 'test_native_token_environment_and_no_default_labels'),
+    ('registration-root', "uid=p['uid'], gid=p['uid'], home=home", "uid=None, gid=None, home=home", 'test_native_token_environment_and_no_default_labels'),
+    ('online-order', "online.get('status') == 'online'", 'True', 'test_online_required_before_old_retirement'),
+    ('reregister', "if not (runner / '.runner').exists():", 'if True:', 'test_idempotent_resume_never_registers_again'),
+    ('uncertain-register', "require('registration-attempted' not in self.receipt['stages'],", 'require(True,', 'test_partial_registration_is_not_blindly_repeated'),
+    ('acl', 'and self.host.acl_free(path)', 'and True', 'test_acl_rejected_on_resume'),
+    ('sudo-command', "str(HELPER) + '\\n'", "'/bin/sh' + '\\n'", 'test_sudoers_is_exact_fixed_command'),
+    ('daemon-user', "'UserName': p['user']", "'UserName': 'lwrunner'", 'test_launchdaemon_is_non_gui_service_user'),
+    ('old-id', "removed == old['runnerId']", 'True', 'test_exact_old_id_required_for_retirement'),
+    ('old-inventory', "digest(source.read_bytes()) == old['files'][name]", 'True', 'test_old_hash_mismatch_preserves_service_and_credentials'),
+    ('rollback-status', "'rollback-local-files-restored-registration-requires-owner'", "'complete'", 'test_retirement_failure_keeps_protected_backup_and_old_files'),
+    ('archive-link', '(member.isfile() or member.isdir())', 'True', 'test_archive_symlink_refused_without_execution'),
+    ('rollback-file', 'if not source.exists():', 'if False:', 'test_partial_retirement_restores_deleted_credential'),
+    ('retired-reappears', "not old_file.exists() and not old_file.is_symlink()", 'True', 'test_credential_reappearing_is_not_complete'),
+    ('private-mode', 'stat.S_IMODE(node.st_mode) == mode', 'True', 'test_wrong_private_home_mode_refuses_resume'),
+    ('reservation', "self.path(STATE / 'receipt.json').is_file()", 'True', 'test_existing_account_without_reservation_is_not_adopted'),
+    ('dryrun-write', 'p = self.p\n        require(set(p)', "p = self.p\n        self.host.run(['mutation-write'])\n        require(set(p)", 'test_dryrun_has_no_mutations'),
+    ('handoff-promotion', 'output.write(data)', "output.write(b'{}')", 'test_owner_handoff_private_file_can_be_promoted'),
+    ('handoff-acl', 'and host.acl_free(path)', 'and True', 'test_handoff_wrong_mode_and_acl_refused'),
+    ('raw-plan-binding', 'self.raw_plan_sha256 or digest', 'digest', 'test_raw_plan_file_hash_is_authority_binding'),
+    ('exact-workflows', "{w['path'] for w in workflows} == MIGRATED_WORKFLOWS", 'True', 'test_exact_four_workflow_paths_not_arbitrary_four'),
+    ('authority-secrets', 'require(set(authority) <=', 'require(set() <=', 'test_secret_bearing_authority_is_never_persisted'),
+    ('nullable-online', "authority.get('online') or {}", "authority.get('online', {})", 'test_nullable_owner_authority_resumes_as_pending'),
+    ('partial-home-resume', 'if home.exists() or home.is_symlink():', 'if True:', 'test_reserved_account_before_home_creation_resumes'),
+    ('installed-config-hash', "self.receipt['configurationSha256'] = digest(config)", "self.receipt['configurationSha256'] = '0' * 64", 'test_sudoers_is_exact_fixed_command'),
+    ('backup-stage', "'awaiting-owner-exact-old-registration-removal'", "'complete'", 'test_online_stage_protects_backup_before_remote_removal'),
+    ('backup-before-delete', "require('old-backup-protected' in self.receipt['stages'],", 'require(True,', 'test_remote_removal_before_backup_is_refused'),
+    ('inventory-nonsecret', "'files': {name: digest(data) for name, data in contents.items()}", "'files': {name: data.decode() for name, data in contents.items()}", 'test_root_inventory_is_readonly_and_nonsecret'),
+    ('inventory-home-scope', "logical.is_relative_to('/Users/lwrunner')", 'True', 'test_root_inventory_cannot_leave_source_home'),
+    ('inventory-symlink', 'physical = canonical(mapped(path))', 'physical = mapped(path)', 'test_root_inventory_never_follows_credential_symlink'),
+    ('inventory-service', "info.get('WorkingDirectory') == str(logical)", 'True', 'test_root_inventory_binds_service_to_source_directory'),
+    ('inventory-source-uid', "source['uid'] == 502", 'True', 'test_root_inventory_refuses_wrong_source_uid'),
+    ('source-client-install', "self.put(self.path(SOURCE_JOB), pathlib.Path(self.inputs.get('sourceJob', p['sourceJob'])).read_bytes(), 0o755)", 'pass', 'test_reviewed_source_client_is_installed_fixed_root_program'),
+    ('source-client-hash', "file_digest(source_job) == p['sourceJobSha256']", 'True', 'test_source_client_checksum_is_plan_bound'),
+    ('root-helper-hash', "file_digest(helper) == p['helperSha256']", 'True', 'test_privileged_helper_checksum_is_plan_bound'),
+    ('separate-collector-repo', "c['collectorRepository'].lower() not in {repo.lower() for repo in repositories}", 'True', 'test_collector_registration_cannot_be_in_source_repository'),
+    ('premature-final-label', "if 'old-retired' in self.receipt['stages']:", 'if True:', 'test_final_label_before_old_retirement_cannot_authorize_backup'),
+    ('promoted-label-resume', 'allowed_labels.append([CUSTOM_LABEL])', 'pass', 'test_final_label_after_durable_retirement_is_valid_on_resume'),
+]
+
+
+def mutations():
+    global setup
+    for name, old, new, case in MUTATIONS:
+        if old not in TEXT:
+            raise RuntimeError('stale mutation: ' + name)
+        setup = load(TEXT.replace(old, new))
+        result = unittest.TextTestRunner(stream=io.StringIO()).run(Contracts(case))
+        if result.wasSuccessful():
+            raise RuntimeError('SURVIVED: ' + name)
+        setup = load(TEXT)
+        restored = unittest.TextTestRunner(stream=io.StringIO()).run(Contracts(case))
+        if not restored.wasSuccessful():
+            raise RuntimeError('restored test failed: ' + name)
+        print(name + ': RED (mutation rejected), restored GREEN')
+
+
+if __name__ == '__main__':
+    if '--mutations' in sys.argv:
+        mutations()
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Contracts)
+        result = unittest.TextTestRunner(verbosity=1).run(suite)
+        print('GUI_SETUP_CONTRACT_RESULT ' + json.dumps(dict(executed=result.testsRun, skipped=len(result.skipped),
+                                                           failures=len(result.failures), errors=len(result.errors))))
+        sys.exit(0 if result.wasSuccessful() and not result.skipped else 1)

@@ -1366,6 +1366,88 @@ public class CodeGraphRiskTests
         Assert.Contains("worst blast radius low (src/x.cs)", gate.Detail);
     }
 
+    [Theory]
+    [InlineData("unavailable-refresh")]
+    [InlineData("timeout-refresh")]
+    [InlineData("timeout-first-read")]
+    public async Task A_critical_observation_survives_a_stale_other_file_and_an_unavailable_or_timed_out_refresh(string failure)
+    {
+        // The review already recorded a ready overlay. The gate reads critical A, then B says it has gone stale. Neither a
+        // replacement read that loses CodeGraph nor the CI backstop may turn A into missing data and allow a merge.
+        var h = new Harness
+        {
+            GateOnFakeClock = true, CiTimeout = TimeSpan.FromMinutes(5),
+            Overlays = new ReviewOverlays(new FakeCodeGraphRisk(), FakeCodeGraphRisk.FakeClockOverlayTimeout),
+        };
+        h.GitHub.Diff = head => TestPolicies.Diff("src/a.cs", marker: head) + TestPolicies.Diff("src/b.cs", marker: head);
+        var refreshing = false;
+        h.CodeGraph.Impact = (path, sha) =>
+        {
+            if (refreshing)
+            {
+                throw new HttpRequestException("refresh disconnected");
+            }
+            if (path == "src/a.cs")
+            {
+                return FakeCodeGraphRisk.Found(path, sha, BlastRadius.Critical);
+            }
+            if (failure == "timeout-first-read")
+            {
+                h.Time.Advance(h.CiTimeout);
+            }
+            return FakeCodeGraphRisk.NotIndexed(sha, "stale");
+        };
+        h.CodeGraph.DefaultImpact = _ => throw new HttpRequestException("default index disconnected");
+        h.CodeGraph.Hotspot = path => path == "src/a.cs" && !refreshing
+            ? FakeCodeGraphRisk.Hot(path, 0.1) : throw new HttpRequestException("hotspots disconnected");
+        h.CodeGraph.Overlay = sha =>
+        {
+            refreshing = true;
+            if (failure == "timeout-refresh")
+            {
+                h.Time.Advance(h.CiTimeout);
+                return new OverlayAnswer(false, "indexing", 8, "indexing", sha, null, null);
+            }
+            throw new HttpRequestException("overlay refresh disconnected");
+        };
+
+        var outcome = await h.Run().WaitAsync(TimeSpan.FromSeconds(60));
+        var gate = (await h.Rows()).Single(r => r.Step == RunPipeline.Steps.GateDecision);
+
+        Assert.True(outcome.State == WorkState.Escalated && h.Merges.Count == 0
+            && gate.Detail!.Contains("src/a.cs critical", StringComparison.Ordinal),
+            $"{failure} must preserve critical A and reject the merge: {outcome.State}; {gate.Detail}");
+        var missing = gate.Detail!.Split(CodeGraphRisk.NoDataMark, StringSplitOptions.None);
+        Assert.True(missing.Length == 2 && missing[1].Contains("src/b.cs", StringComparison.Ordinal),
+            $"The unanswered B must be recorded as no data: {gate.Detail}");
+        if (failure != "timeout-first-read")
+        {
+            // Both inputs for A arrived before the refresh; only B is unknown. A first-read timeout leaves A's hotspot unanswered.
+            Assert.DoesNotContain("src/a.cs", missing[1]);
+        }
+    }
+
+    [Theory]
+    [InlineData("critical")]
+    [InlineData("hotspot")]
+    [InlineData("unrecognised")]
+    [InlineData("misread")]
+    public void An_unavailable_refresh_preserves_each_kind_of_blocking_observation(string observation)
+    {
+        const string a = "src/a.cs";
+        const string b = "src/b.cs";
+        var previous = new CodeGraphRisk(Head,
+            [new FileBlastRadius(a, observation == "critical" ? BlastRadius.Critical : BlastRadius.Low, true)],
+            [new FileHotspot(a, observation == "hotspot" ? 0.9 : 0.1, true, IndexCommit)], [],
+            Unrecognised: observation == "unrecognised" ? [new UnrecognisedBlastRadius(a, "future")] : [],
+            Misread: observation == "misread" ? [new CodeGraphMisread(a, "wrong commit")] : []);
+        var refreshed = CodeGraphRisk.None(Head, [a, b], "refresh disconnected").PreserveObservations(previous);
+        var decision = Evaluate(refreshed, TestPolicies.V3("high", "0.5"));
+
+        Assert.True(decision.Outcome == GateOutcome.Blocked && decision.Detail.Contains(a, StringComparison.Ordinal), decision.Detail);
+        Assert.Equal([new NoCodeGraphData(b, "refresh disconnected")], refreshed.NoData);
+    }
+
     [Fact]
     public async Task A_sealed_change_escalates_without_asking_codegraph()
     {

@@ -55,7 +55,7 @@ def configuration(cleanup=False):
     if (runner / '.runner').stat().st_size > 8192:
         raise ValueError('oversized collector registration')
     registration = json.loads((runner / '.runner').read_text())
-    if (registration.get('agentName') != config['runnerName'] or config['runnerName'] != 'lensworks-guest'
+    if (registration.get('agentName') != config['runnerName'] or not re.fullmatch(r'factory-gui-[a-z0-9-]{8,60}', config['runnerName'])
             or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', config['collectorRepository'])
             or str(registration.get('gitHubUrl', '')).rstrip('/').lower() != ('https://github.com/' + config['collectorRepository']).lower()):
         raise ValueError('collector registration does not match the configured central runner')
@@ -193,33 +193,243 @@ def stop_commands(root):
         record.unlink(missing_ok=True)
 
 
-def sweep(uid):
-    # Dedicated trusted-CI cleanup, NOT a claim to clear dormant launchd state.
-    # Apple GUI agents may respawn; only root-owned OS binaries under /System
-    # or the three observed per-user agents may remain. Source build products may not.
+BASELINE_NAME = 'gui-os-agent-baseline.json'
+MAX_AGENTS = 256
+MAX_COMMAND = 4096
+MAX_BASELINE_BYTES = 1024 * 1024
+OBSERVED_AGENTS = frozenset(('/usr/sbin/distnoted agent', '/usr/libexec/lsd', '/usr/sbin/cfprefsd agent'))
+
+
+def source_processes(uid):
+    # comm identifies the executable separately from argv; -ww prevents ps truncating full arguments. Ambiguous/oversized
+    # inventories fail closed. OS paths with whitespace cannot be proven by this format and are deliberately not exempted.
+    result = subprocess.run(['/bin/ps', '-ww', '-U', str(uid), '-o', 'pid=,ppid=,comm=,args='], capture_output=True, timeout=2)
+    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+        return []
+    if result.returncode != 0 or result.stderr.strip() or len(result.stdout) > MAX_BASELINE_BYTES:
+        raise ValueError('GUI process inventory could not be read')
+    rows = result.stdout.decode().splitlines()
+    if len(rows) > MAX_AGENTS:
+        raise ValueError('oversized GUI process inventory')
+    parsed = []
+    for row in rows:
+        fields = row.lstrip().split(None, 3)
+        if (len(fields) != 4 or not fields[0].isdigit() or not fields[1].isdigit() or int(fields[0]) <= 1
+                or int(fields[1]) < 0 or not valid_agent(fields[2], fields[3])):
+            raise ValueError('unreadable GUI process inventory')
+        parsed.append((int(fields[1]), fields[2], fields[3]))
+    return parsed
+
+
+def valid_agent(executable, command):
+    return (isinstance(executable, str) and isinstance(command, str) and 0 < len(command) <= MAX_COMMAND
+            and executable.startswith('/') and not any(c.isspace() for c in executable)
+            and not any(ord(c) < 32 or ord(c) == 127 for c in executable + command)
+            and (command == executable or command.startswith(executable + ' ')))
+
+
+def root_os_binary(executable):
+    path = pathlib.Path(executable)
+    if not (executable.startswith('/System/Library/') or executable in ('/usr/sbin/distnoted', '/usr/libexec/lsd', '/usr/sbin/cfprefsd')):
+        return False
+    try:
+        node = path.lstat()
+        return stat.S_ISREG(node.st_mode) and node.st_uid == 0 and not node.st_mode & 0o022 and path.resolve() == path
+    except OSError:
+        return False
+
+
+def baseline_directory(config, create=False):
+    state = pathlib.Path(config['stateDirectory'])
+    protected(state, config['collectorUid'], True)
+    directory = state / 'os-agent-baselines'
+    if create:
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    if directory.exists() or directory.is_symlink():
+        protected(directory, 0, True)
+    return directory
+
+
+def baseline_name(root):
+    return hashlib.sha256(str(root.resolve()).encode()).hexdigest() + '.json'
+
+
+def sync_baseline_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_baseline_record(record, raw):
+    # Publish a fully flushed root-owned inode exclusively. A crash cannot leave partial JSON at the authority-bearing final name.
+    pending = record.with_name('.' + record.name + '.' + os.urandom(16).hex() + '.pending')
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(raw)
+        stream.flush(); os.fsync(stream.fileno())
+    protected(pending, 0)
+    try:
+        os.link(pending, record, follow_symlinks=False)
+    except FileExistsError:
+        pending.unlink()
+        raise
+    # Any other failure leaves a pending snapshot, never a partial final. Only fully verified pending bytes can be recovered.
+    sync_baseline_directory(record.parent)
+    pending.unlink()
+    protected(record, 0)
+
+
+def read_baseline_record(record, uid, config, root=None):
+    protected(record, 0)
+    fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        node = os.fstat(stream.fileno())
+        if node.st_uid != 0 or stat.S_IMODE(node.st_mode) != 0o600 or not stat.S_ISREG(node.st_mode):
+            raise ValueError('unsafe GUI agent baseline')
+        raw = stream.read(MAX_BASELINE_BYTES + 1)
+    if len(raw) > MAX_BASELINE_BYTES:
+        raise ValueError('oversized GUI agent baseline')
+    value = json.loads(raw)
+    if (not isinstance(value, dict) or set(value) != {'version', 'uid', 'root', 'configurationHash', 'agents'}
+            or type(value['version']) is not int or value['version'] != 1 or type(value['uid']) is not int or value['uid'] != uid
+            or not isinstance(value['root'], str) or len(value['root']) > 1024
+            or not pathlib.Path(value['root']).is_absolute() or str(pathlib.Path(value['root']).resolve()) != value['root']
+            or value['configurationHash'] != config['hash'] or not re.fullmatch('[0-9a-f]{64}', value['configurationHash'])
+            or not isinstance(value['agents'], list) or len(value['agents']) > MAX_AGENTS):
+        raise ValueError('invalid GUI agent baseline schema')
+    recorded_root = pathlib.Path(value['root'])
+    if root is not None and recorded_root != root.resolve():
+        raise ValueError('GUI agent baseline names another workspace')
+    agents = set()
+    for agent in value['agents']:
+        if (not isinstance(agent, dict) or set(agent) != {'executable', 'command'}
+                or not valid_agent(agent['executable'], agent['command']) or not root_os_binary(agent['executable'])):
+            raise ValueError('invalid GUI agent baseline entry')
+        identity = (agent['executable'], agent['command'])
+        if identity in agents:
+            raise ValueError('duplicate GUI agent baseline entry')
+        agents.add(identity)
+    return recorded_root, agents
+
+
+def baseline_inventory(directory):
+    entries = []
+    if not directory.exists():
+        return entries
+    for record in directory.iterdir():
+        if len(entries) >= MAX_AGENTS or not re.fullmatch(r'(?:[0-9a-f]{64}\.json|\.[0-9a-f]{64}\.json\.[0-9a-f]{32}\.pending)', record.name):
+            raise ValueError('oversized or unknown GUI baseline inventory')
+        entries.append(record)
+    return entries
+
+
+def recover_pending_baseline(root, uid, config, directory):
+    record = directory / baseline_name(root)
+    candidates = []
+    for pending in baseline_inventory(directory):
+        if pending.name.startswith('.' + record.name + '.') and pending.name.endswith('.pending'):
+            read_baseline_record(pending, uid, config, root)
+            candidates.append(pending)
+    if not candidates:
+        return False
+    raw = candidates[0].read_bytes()  # every candidate was already read bounded, root-private, regular and immutable
+    if any(pending.read_bytes() != raw for pending in candidates[1:]):
+        raise ValueError('ambiguous pending GUI baselines')
+    try:
+        os.link(candidates[0], record, follow_symlinks=False)
+    except FileExistsError:
+        read_baseline_record(record, uid, config, root)
+        if record.read_bytes() != raw:
+            raise ValueError('GUI baseline publication changed')
+    sync_baseline_directory(directory)
+    for pending in candidates:
+        pending.unlink()
+    return True
+
+
+def sweep_baseline_records(config, directory):
+    # Only the current machine-lease holder calls this (through the fixed baseline operation). A crash after rm but before
+    # clearing active.json MUST retain the old copy. Reclaim it only once a later lease journals another root and the old root is gone.
+    marker = pathlib.Path(config['stateDirectory']) / 'active.json'
+    protected(marker, config['collectorUid'])
+    if marker.stat().st_size > 1024:
+        raise ValueError('invalid GUI lease journal')
+    active = json.loads(marker.read_text()).get('root')
+    if not isinstance(active, str) or str(pathlib.Path(active).resolve()) != active:
+        raise ValueError('invalid GUI lease journal root')
+    for record in baseline_inventory(directory):
+        old_root, _ = read_baseline_record(record, config['sourceUid'], config)
+        expected = baseline_name(old_root)
+        if record.name != expected and not re.fullmatch(r'\.' + re.escape(expected) + r'\.[0-9a-f]{32}\.pending', record.name):
+            raise ValueError('GUI baseline record names another workspace')
+        if str(old_root) != active and not old_root.exists() and not old_root.is_symlink():
+            record.unlink()
+
+
+def baseline(root, uid, config):
+    # Capture once under the machine lease, BEFORE source. Persist the SAME bound bytes in protected state BEFORE the workspace
+    # copy: deleting the workspace cannot erase the proof a later job needs to reconcile a crashed cleanup.
+    directory = baseline_directory(config, create=True)
+    sweep_baseline_records(config, directory)
+    durable = directory / baseline_name(root)
+    local = root / BASELINE_NAME
+    if not durable.exists() and not durable.is_symlink():
+        recover_pending_baseline(root, uid, config, directory)
+    if durable.exists() or durable.is_symlink():
+        read_baseline_record(durable, uid, config, root)
+        if local.exists() or local.is_symlink():
+            raise FileExistsError('GUI baseline already captured')
+        write_baseline_record(local, durable.read_bytes())
+        return
+    if local.exists() or local.is_symlink():
+        raise ValueError('GUI workspace baseline lost its durable proof')
+    agents = sorted({(binary, command) for parent, binary, command in source_processes(uid)
+                     if parent == 1 and root_os_binary(binary)})
+    value = {'version': 1, 'uid': uid, 'root': str(root.resolve()), 'configurationHash': config['hash'],
+             'agents': [{'executable': binary, 'command': command} for binary, command in agents]}
+    raw = json.dumps(value).encode()
+    if len(raw) > MAX_BASELINE_BYTES:
+        raise ValueError('oversized GUI agent baseline')
+    write_baseline_record(directory / baseline_name(root), raw)
+    write_baseline_record(root / BASELINE_NAME, raw)
+
+
+def read_baseline(root, uid, config, required=False):
+    record = root / BASELINE_NAME
+    local_exists = record.exists() or record.is_symlink()
+    if required or not local_exists:
+        # Never capture current post-job state. Recover only the exact, fully verified pre-source pending bytes if publication
+        # was interrupted. An incomplete/ambiguous pending record is unknown and stays quarantined, never silently recaptured.
+        directory = baseline_directory(config)
+        durable = directory / baseline_name(root)
+        if not durable.exists() and not durable.is_symlink():
+            recover_pending_baseline(root, uid, config, directory)
+        if durable.exists() or durable.is_symlink():
+            agents = read_baseline_record(durable, uid, config, root)[1]
+            if local_exists and read_baseline_record(record, uid, config, root)[1] != agents:
+                raise ValueError('GUI workspace and durable baselines disagree')
+            return agents
+        if not required:
+            return set()  # no baseline ever completed: only the three exact observed agents can be exempted
+        raise FileNotFoundError('GUI source execution requires durable baseline proof')
+    return read_baseline_record(record, uid, config, root)[1]
+
+
+def sweep(uid, root, config):
+    # Dedicated trusted-CI process cleanup only: existing exact OS-agent commands can respawn under launchd. This does NOT
+    # clear dormant launchd jobs, the persistent GUI account or other source-influenced state, and is not a malicious-code sandbox.
+    agents = read_baseline(root, uid, config)
     for _ in range(20):
         subprocess.run(['/usr/bin/pkill', '-KILL', '-u', str(uid)], capture_output=True, timeout=2)
-        inventory = subprocess.run(['/bin/ps', '-U', str(uid), '-o', 'pid=,ppid=,comm='], capture_output=True, timeout=2)
-        # BSD ps documents status 1 for no matches. Only an entirely empty
-        # answer (stdout AND stderr) proves this case; other failures remain unknown.
-        if inventory.returncode == 1 and not inventory.stdout.strip() and not inventory.stderr.strip():
-            return
-        if inventory.returncode != 0 or inventory.stderr.strip():
-            raise ValueError('GUI process inventory could not be read')
-        rows = inventory.stdout.decode().splitlines()
-        remaining = []
-        for row in rows:
-            fields = row.strip().split(None, 2)
-            if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit() or int(fields[0]) <= 1:
-                raise ValueError('unreadable GUI process inventory')
-            executable = pathlib.Path(fields[2])
-            system = str(executable).startswith('/System/Library/') or str(executable) in ('/usr/sbin/distnoted', '/usr/libexec/lsd', '/usr/sbin/cfprefsd')
-            try:
-                safe = fields[1] == '1' and system and executable.stat().st_uid == 0 and not executable.stat().st_mode & 0o022
-            except OSError:
-                safe = False
-            if not safe:
-                remaining.append(fields[0])
+        remaining = [(parent, binary, command) for parent, binary, command in source_processes(uid)
+                     if not (parent == 1 and root_os_binary(binary)
+                             and ((binary, command) in agents or command in OBSERVED_AGENTS))]
         if not remaining:
             return
         time.sleep(0.1)
@@ -243,12 +453,15 @@ def main():
 
 
 def execute_operation(config, operation, root):
-    if operation == 'sweep' and len(sys.argv) == 3:
+    if operation == 'baseline' and len(sys.argv) == 3:
         stop_commands(root)
-        sweep(config['sourceUid'])
+        baseline(root, config['sourceUid'], config)
+    elif operation == 'sweep' and len(sys.argv) == 3:
+        stop_commands(root)
+        sweep(config['sourceUid'], root, config)
     elif operation == 'remove' and len(sys.argv) == 3:
         stop_commands(root)
-        sweep(config['sourceUid'])
+        sweep(config['sourceUid'], root, config)
         subprocess.run(['/bin/rm', '-rf', '--', str(root)], check=True, timeout=30)
         if root.exists() or root.is_symlink():
             raise ValueError('GUI workspace removal failed')
@@ -258,7 +471,7 @@ def execute_operation(config, operation, root):
         if not re.fullmatch(pattern, sys.argv[3]):
             raise ValueError('invalid owned GUI device identity')
         stop_commands(root)
-        sweep(config['sourceUid'])
+        sweep(config['sourceUid'], root, config)
         inventory = source_tool(config, root, ['/usr/bin/xcrun', 'simctl', 'list', 'devices', '-j'])
         if inventory.returncode or len(inventory.stdout) > 8 * 1024 * 1024:
             raise ValueError('GUI device inventory could not be read')
@@ -289,6 +502,7 @@ def execute_operation(config, operation, root):
             raise ValueError('GUI share path refused')
         subprocess.run(['/usr/sbin/chown', '-R', str(config['sourceUid']), str(target)], check=True, timeout=30)
     elif operation == 'run' and len(sys.argv) == 4:
+        read_baseline(root, config['sourceUid'], config, required=True)
         request = pathlib.Path(sys.argv[3])
         if request.parent != root or not re.fullmatch(r'command-[a-f0-9]{32}.json', request.name):
             raise ValueError('GUI command file refused')
@@ -312,8 +526,10 @@ def execute_operation(config, operation, root):
         try:
             with os.fdopen(fd, 'w') as output:
                 os.fchmod(output.fileno(), 0o644)
-                json.dump({'sourceUid': config['sourceUid'], 'collectorUid': config['collectorUid'], 'configurationHash': config['hash']}, output)
-            env = dict(env, FACTORY_GUI_TEST_BINDING=str(binding), FACTORY_GUI_CONFIGURATION_HASH=config['hash'])
+                json.dump({'sourceUid': config['sourceUid'], 'collectorUid': config['collectorUid'], 'configurationHash': config['hash'],
+                           'collectorCredentialProbe': str(pathlib.Path(config['runnerRoot']) / '.credentials')}, output)
+            env = dict(env, FACTORY_GUI_TEST_BINDING=str(binding), FACTORY_GUI_CONFIGURATION_HASH=config['hash'],
+                       TEST_RUNNER_FACTORY_GUI_TEST_BINDING=str(binding), TEST_RUNNER_FACTORY_GUI_CONFIGURATION_HASH=config['hash'])
             with register_command(root):
                 signal.alarm(0)  # source deadline belongs to the sealed collector; its group is now journaled
                 result = subprocess.run(['/bin/launchctl', 'asuser', str(config['sourceUid']),

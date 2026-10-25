@@ -503,7 +503,7 @@ class Fixtures(unittest.TestCase):
             if sys.platform=='darwin' and pathlib.Path('/usr/bin/swift').exists():
                 home=root/'isolated-home';home.mkdir()
                 class Principal:
-                    def __init__(self):self.home=home
+                    def __init__(self):self.home=home;self.env={}
                     def share(self,path):pass
                     def run(self,args,cwd,**kwargs):
                         result=r.subprocess.run(args,cwd=cwd,env={'PATH':'/usr/bin:/bin','HOME':str(home),'CFFIXED_USER_HOME':str(home)},stdin=r.subprocess.DEVNULL,capture_output=True)

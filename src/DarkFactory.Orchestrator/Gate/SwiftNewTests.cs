@@ -97,10 +97,11 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
 
     /// <summary>
     /// The one report a test's step asks for and reads: <c>swift-test-&lt;the first 16 hex digits of the id's SHA-256&gt;.xml</c>,
-    /// so <see cref="ParseResults"/> knows from a report's name which test it may speak of.
+    /// with the package fingerprint suffix for a non-root package, so <see cref="ParseResults"/> knows from a report's name
+    /// which package and test it may speak of.
     /// </summary>
     public static string ReportName(string id) =>
-        $"{ReportPrefix}{Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)))[..16]}.xml";
+        $"{ReportPrefix}{Hash(id)}{PackageSuffix(id)}.xml";
 
     /// <summary>The name a test step's standard output and exit code are kept under (<see cref="TestStep.CaptureOutput"/>), beside its report.</summary>
     public static string OutputName(string id) => ReportName(id)[..^".xml".Length] + ".out";
@@ -128,19 +129,36 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
 
     private static string Hash(string id) => Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)))[..16];
 
+    /// <summary>Discovery/result identity includes the package manifest's SHA-256; root-package keys retain their historic
+    /// spelling. The fixed-size fingerprint also keeps report filenames below NAME_MAX even for deeply nested packages.
+    /// Runtime filters and the test runner's own names never contain this prefix; Projects retains the manifest path.</summary>
+    public static string TestKey(string manifest, string runtimeId) => manifest == Manifest ? runtimeId
+        : $"swiftpm:{Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(manifest)))}:{runtimeId}";
+
+    public static string RuntimeId(string key) => key.StartsWith("swiftpm:", StringComparison.Ordinal)
+        ? key[(key.IndexOf(':', "swiftpm:".Length) + 1)..] : key;
+
+    private static string PackageHex(string key) => key.StartsWith("swiftpm:", StringComparison.Ordinal)
+        ? key["swiftpm:".Length..key.IndexOf(':', "swiftpm:".Length)] : "";
+
+    private static string PackageSuffix(string key) => PackageHex(key) is { Length: > 0 } hex ? "-p" + hex : "";
+
+    private static string ResultKey(string runtimeId, Match filename) => filename.Groups["package"].Success
+        ? $"swiftpm:{filename.Groups["package"].Value}:{runtimeId}" : runtimeId;
+
     /// <summary>
     /// The name an XCTest test's step output and exit code are kept under (sc-26129): <c>swift-xctest-&lt;16 hex of the id's
-    /// SHA-256&gt;-&lt;the target's name in hex&gt;.out</c> — the target, because XCTest on Linux names a test by its class
+    /// SHA-256&gt;-&lt;the target's name in hex&gt;[-p&lt;package fingerprint&gt;].out</c> — the target, because XCTest on Linux names a test by its class
     /// and method alone.
     /// </summary>
     public static string XCTestOutputName(string id) =>
-        $"swift-xctest-{Hash(id)}-{Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(id[..id.IndexOf('.')]))}.out";
+        $"swift-xctest-{Hash(id)}-{Convert.ToHexStringLower(System.Text.Encoding.UTF8.GetBytes(RuntimeId(id)[..RuntimeId(id).IndexOf('.')]))}{PackageSuffix(id)}.out";
 
-    private static readonly Regex XCTestOutputFileName = new(@"^swift-xctest-(?<hash>[0-9a-f]{16})-(?<target>(?:[0-9a-f]{2})+)\.out$", RegexOptions.CultureInvariant);
+    private static readonly Regex XCTestOutputFileName = new(@"^swift-xctest-(?<hash>[0-9a-f]{16})-(?<target>(?:[0-9a-f]{2})+)(?:-p(?<package>(?:[0-9a-f]{2})+))?\.out$", RegexOptions.CultureInvariant);
 
-    private static readonly Regex ReportFileName =new(@"^swift-test-[0-9a-f]{16}\.xml$", RegexOptions.CultureInvariant);
+    private static readonly Regex ReportFileName =new(@"^swift-test-[0-9a-f]{16}(?:-p(?<package>(?:[0-9a-f]{2})+))?\.xml$", RegexOptions.CultureInvariant);
 
-    private static readonly Regex EventsFileName = new(@"^swift-test-[0-9a-f]{16}\.events\.jsonl$", RegexOptions.CultureInvariant);
+    private static readonly Regex EventsFileName = new(@"^swift-test-[0-9a-f]{16}(?:-p(?<package>(?:[0-9a-f]{2})+))?\.events\.jsonl$", RegexOptions.CultureInvariant);
 
     public bool Understands(string path) => path.EndsWith(".swift", StringComparison.Ordinal);
 
@@ -271,7 +289,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             {
                 foreach (var test in file.Tests)
                 {
-                    baseTests.TryAdd(Id(target, test), test);
+                    baseTests.TryAdd(TestKey(place.Package!.ManifestPath, Id(target, test)), test);
                 }
                 if (MayChangeXCTests(file))
                 {
@@ -360,7 +378,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             }
             foreach (var test in file.Tests)
             {
-                var id = Id(target, test);
+                var id = TestKey(place.Package!.ManifestPath, Id(target, test));
                 if (!seen.Add(id))
                 {
                     twice.Add(id);
@@ -408,7 +426,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             }
             foreach (var test in added)
             {
-                var id = XCTestId(target, test.Class, test.Method.Name);
+                var id = TestKey(package.ManifestPath, XCTestId(target, test.Class, test.Method.Name));
                 if (!seen.Add(id))
                 {
                     twice.Add(id);
@@ -439,7 +457,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             {
                 foreach (var test in file.Tests.Where(t => t.TestArguments is not null))
                 {
-                    var id = Id(place.Target!, test);
+                    var id = TestKey(place.Package!.ManifestPath, Id(place.Target!, test));
                     var existing = !news.ContainsKey(id) && !argumentsChanged.Contains(id) && (!headPaths.Contains(path) || baseTests.ContainsKey(id));
                     if (existing && SwiftSource.ArgumentsReachChange(test, changed) is { } why)
                     {
@@ -582,20 +600,20 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
         steps.AddRange(byPackage.Select((g, n) => new TestStep(TestPhase.Build, Swift, ["build", "--package-path", g.Key, "--build-system", BuildSystem, "--build-tests"]) { CaptureOutput = $"swift-build-{n}", CaptureBuildStderr = true }));
         foreach (var id in byPackage.SelectMany(g => g.Select(id => (Id: id, Package: g.Key))))
         {
-            if (IsXCTestId(id.Id))
+            if (IsXCTestId(RuntimeId(id.Id)))
             {
                 // An XCTest test (sc-26129): XCTest alone, its own console output kept with the exit code (SwiftPM writes an
                 // xUnit report for XCTest only with --parallel, where a skipped test reads as passed).
                 steps.Add(new TestStep(TestPhase.Test, Swift,
                 [
-                    "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-swift-testing", "--filter", Filter(id.Id),
+                    "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-swift-testing", "--filter", Filter(RuntimeId(id.Id)),
                 ]) { CaptureOutput = XCTestOutputName(id.Id) });
                 continue;
             }
             // Its own report only (a pattern naming exactly it), and its exit code, which the report must agree with.
             steps.Add(new TestStep(TestPhase.Test, Swift,
             [
-                "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-xctest", "--filter", Filter(id.Id),
+                "test", "--package-path", id.Package, "--build-system", BuildSystem, "--skip-build", "--disable-xctest", "--filter", Filter(RuntimeId(id.Id)),
                 "--xunit-output", $"{resultsDirectory}/{ReportName(id.Id)}",
                 "--event-stream-output-path", $"{resultsDirectory}/{EventsName(id.Id)}", "--event-stream-version", EventStreamVersion,
             ]) { ResultFilePattern = ResultPattern(id.Id), CaptureOutput = OutputName(id.Id) });
@@ -627,7 +645,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             {
                 var match = XCTestOutputFileName.Match(output.Name);
                 var target = System.Text.Encoding.UTF8.GetString(Convert.FromHexString(match.Groups["target"].Value));
-                foreach (var result in XCTestCases(output.Content, target, match.Groups["hash"].Value, output.ExitCode!.Value))
+                foreach (var result in XCTestCases(output.Content, target, match.Groups["hash"].Value, output.ExitCode!.Value, match))
                 {
                     (results.TryGetValue(result.Name, out var list) ? list : results[result.Name] = []).Add(result);
                 }
@@ -688,7 +706,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
                             throw new InvalidDataException("a testcase names no classname and name");
                         }
                         var types = classname.Split('.');
-                        var id = Id(types[0], types[1..], function);
+                        var id = ResultKey(Id(types[0], types[1..], function), ReportFileName.Match(name));
                         if (ReportName(id) != name)
                         {
                             throw new InvalidDataException($"it holds {id}, which is not the test its step ran");
@@ -765,7 +783,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
     /// skipped: no pass on the head, no failure on the base. As with cargo's libtest lines, a test that prints a complete
     /// fake report of itself and picks its exit code is read as what it printed (accepted: reviewed code lying about itself).
     /// </summary>
-    internal static List<TestCaseResult> XCTestCases(string output, string target, string hash, int exit)
+    internal static List<TestCaseResult> XCTestCases(string output, string target, string hash, int exit, Match? filename = null)
     {
         var started = new HashSet<string>(StringComparer.Ordinal);
         var ended = new HashSet<string>(StringComparer.Ordinal);
@@ -795,6 +813,7 @@ public sealed class SwiftNewTests(bool xcode = false) : INewTestStrategy
             var id = XCTestObjCName.Match(name) is { Success: true } objc ? $"{objc.Groups["type"].Value}/{objc.Groups["method"].Value}"
                 : XCTestPlainName.Match(name) is { Success: true } plain ? XCTestId(target, plain.Groups["type"].Value, plain.Groups["method"].Value)
                 : throw new InvalidDataException($"its test case '{name}' is not named as XCTest names one");
+            if (filename is not null) id = ResultKey(id, filename);
             if (Hash(id) != hash)
             {
                 throw new InvalidDataException($"it reports {id}, which is not the test its step ran");

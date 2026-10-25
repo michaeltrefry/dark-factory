@@ -1583,78 +1583,238 @@ public class LiveWorkerSandboxTests
 {
     private static readonly RepoRef Repo = new("acme", "widgets");
 
-    /// <summary>
-    /// Every configured worker slot (<c>Worker:Slots</c>, each slot's own user and installed helper as the factory would use them,
-    /// sc-25992), each probed ready. The machine not set up at all (slot 1 not ready) skips; a further configured slot that is not
-    /// ready fails, naming it. Taken without the slots' run locks, as these probes always were: run them with no factory running.
-    /// </summary>
-    private static async Task<IReadOnlyList<WorkerSlot>> RequireSlotsAsync()
+    /// <summary>Resolve the opted-in machine configuration without running any helper.</summary>
+    private static Task<IReadOnlyList<WorkerSlot>> RequireSlotsAsync()
     {
         // Before anything touches a helper: even the readiness probe ends in its uid-wide kill.
         if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1")
         {
             Assert.Skip("Live sandbox test: set FACTORY_SANDBOX_LIVE=1 to run (kills every process of every configured sandbox user).");
         }
-        if (!OperatingSystem.IsMacOS())
-        {
-            Assert.Skip("The worker sandbox is macOS-only.");
-        }
+        if (!OperatingSystem.IsMacOS()) Assert.Skip("The worker sandbox is macOS-only.");
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
         if (options.WorkerSlots is not { } pool)
         {
             Assert.Skip("Worker:RunAs=none: there is no sandbox user to probe.");
             throw new UnreachableException();
         }
-        var slots = pool.All.Select(s => s with { Sandbox = s.Sandbox with { Lock = null } }).ToList();
-        foreach (var slot in slots)
-        {
-            try
-            {
-                await slot.Sandbox.EnsureReadyAsync(options.ClaudePath, CancellationToken.None);
-            }
-            catch (InvalidOperationException ex) when (slot.Number == 1)
-            {
-                Assert.Skip(ex.Message);
-            }
-            catch (InvalidOperationException ex)
-            {
-                Assert.Fail($"Worker {slot} (Worker:Slots is {slots.Count}) is not ready: {ex.Message}");
-            }
-        }
-        return slots;
+        return Task.FromResult(pool.All);
     }
 
-    /// <summary>Runs <paramref name="probe"/> for every configured slot (<see cref="RequireSlotsAsync"/>); a failure names its slot.</summary>
-    private static async Task ForEachSlotAsync(Func<WorkerSlot, Task> probe)
+    // Testable guard used by the real live entry. Acquire ALL configured locks fail-fast before any readiness/probe,
+    // retaining the actual sandbox locks and their async-flow ownership throughout. A busy later slot releases earlier
+    // locks without ever running a helper. Kept helpers retain their own locks through WorkerLock.KeepUntil as usual.
+    internal static async Task RunGuardedAsync(string? optIn, Func<Task<IReadOnlyList<WorkerSlot>>> configured,
+        Func<WorkerSlot, Task> readiness, Func<IReadOnlyList<WorkerSlot>, Task> probe)
     {
-        foreach (var slot in await RequireSlotsAsync())
+        if (optIn != "1") throw new InvalidOperationException("Live sandbox test is not authorized: FACTORY_SANDBOX_LIVE=1 is required.");
+        var slots = await configured();
+        if (slots.Count == 0 || slots.Any(s => s.Lock is null) || slots.Select(s => s.Lock!.Path).Distinct().Count() != slots.Count)
+            throw new InvalidOperationException("Every live sandbox slot needs its own configured lock.");
+        async Task Acquire(int index)
         {
-            try
+            if (index == slots.Count)
             {
-                await probe(slot);
+                foreach (var slot in slots) await readiness(slot);
+                await probe(slots);
+                return;
             }
+            if (!await slots[index].Lock!.TryHoldAsync(() => Acquire(index + 1)))
+                throw new InvalidOperationException($"Live sandbox probe refused: {slots[index]} is busy. Stop factory work and retry; no readiness or probe ran.");
+        }
+        await Acquire(0);
+    }
+
+    private static Task WithLiveSlotsAsync(Func<IReadOnlyList<WorkerSlot>, Task> probe)
+    {
+        if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1") Assert.Skip("Live sandbox opt-in is required.");
+        return RunGuardedAsync(Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE"), RequireSlotsAsync,
+            async slot =>
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+                await slot.Sandbox.EnsureReadyAsync(new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets()).ClaudePath, timeout.Token);
+            }, probe);
+    }
+
+    /// <summary>Every helper run, including readiness, stays inside the fail-fast all-slot hold.</summary>
+    private static Task ForEachSlotAsync(Func<WorkerSlot, Task> probe) => WithLiveSlotsAsync(async slots =>
+    {
+        foreach (var slot in slots)
+        {
+            try { await probe(slot); }
             catch (Exception ex) when (ex is not Xunit.Sdk.SkipException)
             {
                 throw new Xunit.Sdk.XunitException($"Worker {slot}: {ex.Message}", ex);
             }
         }
+    });
+
+    internal static string? HeadlessIdentityProblem(string expectedUser, string output)
+    {
+        var parts = output.Split('\n', 5);
+        if (parts.Length != 5 || !System.Text.RegularExpressions.Regex.IsMatch(parts[0], "^[0-9]+$")
+            || parts[1] != expectedUser || parts[2] != parts[0] || parts[3] != "Background")
+            return "effective identity or own non-GUI manager does not match";
+        var uid = parts[0];
+        var domain = parts[4];
+        if (!System.Text.RegularExpressions.Regex.IsMatch(domain, @"\Auser/" + uid + @" = \{\s*type = user(?:\s|$)"))
+            return "the own domain is not a recognized user domain";
+        var contexts = System.Text.RegularExpressions.Regex.Matches(domain, @"(?m)^\s*security context = \{(?<body>[^{}]*)\}");
+        if (contexts.Count != 1) return "own security context is missing or ambiguous";
+        var owners = System.Text.RegularExpressions.Regex.Matches(contexts[0].Groups["body"].Value, @"(?m)^\s*uid = (?<uid>[0-9]+)\s*$");
+        return owners.Count == 1 && owners[0].Groups["uid"].Value == uid ? null : "own security-context uid does not match";
+    }
+
+    internal static IReadOnlyList<string> OwnerProbePaths(string home, string probe)
+    {
+        home = Path.GetFullPath(home).TrimEnd(Path.DirectorySeparatorChar);
+        var path = Path.GetFullPath(probe);
+        if (!path.StartsWith(home + Path.DirectorySeparatorChar, StringComparison.Ordinal) || !File.Exists(path))
+            throw new InvalidOperationException("The owner must supply an existing private probe file inside their home.");
+        var at = path;
+        while (at != home)
+        {
+            if ((File.GetAttributes(at) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("The private probe path must contain no symlink.");
+            at = Path.GetDirectoryName(at)!;
+        }
+        if ((File.GetUnixFileMode(path) & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute)) != 0)
+            throw new InvalidOperationException("The existing owner probe must be private (no group or other mode bits).");
+        // Establish existence AND readability owner-side, without reading or printing any content.
+        using (File.OpenHandle(path, FileMode.Open, FileAccess.Read)) { }
+        var files = new List<string> { path };
+        foreach (var relative in new[] { ".ssh/id_ed25519", ".ssh/id_rsa", ".config/gh/hosts.yml", "Library/Keychains/login.keychain-db" })
+        {
+            var credential = Path.Combine(home, relative);
+            if (!File.Exists(credential)) continue;
+            using (File.OpenHandle(credential, FileMode.Open, FileAccess.Read)) { }
+            files.Add(credential);
+        }
+        return files.Distinct(StringComparer.Ordinal).ToList();
+    }
+
+    internal sealed class OwnerProbeFixture(string probePath, string? ownedDirectory, IReadOnlyList<string> paths) : IDisposable
+    {
+        public string ProbePath => probePath;
+        public IReadOnlyList<string> Paths => paths;
+        public void Dispose()
+        {
+            if (ownedDirectory is null) return;
+            File.Delete(probePath);
+            // Only our known file and now-empty new directory: never recursive deletion of an owner-home path.
+            Directory.Delete(ownedDirectory);
+        }
+    }
+
+    internal static OwnerProbeFixture CreateOwnerProbe(string? optIn, string home, string? existing)
+    {
+        if (optIn != "1") throw new InvalidOperationException("Creating a live owner probe requires explicit FACTORY_SANDBOX_LIVE=1.");
+        if (!string.IsNullOrEmpty(existing)) return new OwnerProbeFixture(existing, null, OwnerProbePaths(home, existing));
+        var directory = Path.Combine(Path.GetFullPath(home), ".factory-sandbox-proof-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "nonsecret-probe");
+        Directory.CreateDirectory(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        try
+        {
+            using (var file = new FileStream(path, new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None,
+                UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+            }))
+            {
+                file.Write(System.Text.Encoding.UTF8.GetBytes("Nonsecret dark-factory live sandbox identity probe.\n"));
+            }
+            return new OwnerProbeFixture(path, directory, OwnerProbePaths(home, path));
+        }
+        catch
+        {
+            File.Delete(path);
+            Directory.Delete(directory);
+            throw;
+        }
+    }
+
+    [Fact]
+    public async Task Headless_worker_has_own_manager_security_context_and_cannot_open_existing_owner_private_files()
+    {
+        // Explicit authorization precedes even fixture creation; the default is a new nonsecret owner-home private file.
+        // An optional existing private override is validated open-only and is never changed or removed by this test.
+        if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1") Assert.Skip("Live sandbox opt-in is required.");
+        using var privateProbe = CreateOwnerProbe(Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE"), OwnerHome,
+            Environment.GetEnvironmentVariable("FACTORY_SANDBOX_OWNER_PROBE"));
+        var paths = privateProbe.Paths;
+        await ForEachSlotAsync(async slot =>
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var (code, output, error) = await slot.Sandbox.RunAsync("/", "/bin/sh", ["-c", "uid=$(/usr/bin/id -u); printf '%s\n' \"$uid\"; /usr/bin/id -un; /bin/launchctl manageruid; /bin/launchctl managername; /bin/launchctl print \"user/$uid\""], timeout.Token);
+            Assert.True(code == 0, error);
+            Assert.Null(HeadlessIdentityProblem(slot.User, output));
+            TestContext.Current.TestOutputHelper?.WriteLine($"{slot}: own headless manager/security context verified; testing open-only denial for {paths.Count} existing private files (no contents read).");
+            var denied = await slot.Sandbox.RunAsync("/", "/usr/bin/perl",
+                ["-MFcntl=O_RDONLY", "-e", "for my $p (@ARGV) { if (sysopen(my $f, $p, O_RDONLY)) { close($f); print \"UNEXPECTED_OPEN\\n\"; exit 1; } if (!$!{EACCES} && !$!{EPERM}) { print \"NOT_PERMISSION_DENIED\\n\"; exit 2; } } print \"DENIED\\n\";", .. paths], timeout.Token);
+            Assert.Equal(0, denied.ExitCode);
+            Assert.Equal("DENIED", denied.Stdout.Trim());
+        });
+    }
+
+    [Fact]
+    public async Task Headless_detached_worker_cleanup_preserves_another_configured_slots_running_worker() =>
+        await WithLiveSlotsAsync(async slots =>
+        {
+            if (slots.Count < 2) Assert.Skip("Cross-slot live proof needs at least two configured sandbox slots.");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var other = slots[1].Sandbox;
+            var p = other.Start("/", "/bin/sh", ["-c", $"echo {OwnProcess.ShellRecord("$$")}; exec /bin/sleep 600"], new Dictionary<string, string>());
+            try
+            {
+                await other.VerifyStartedAsync(p, timeout.Token);
+                var sentinel = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync(timeout.Token))!);
+                await SetsidGrandchildIsDeadAsync(slots[0].Sandbox, timeout.Token);
+                Assert.True(sentinel.IsAlive, "cleanup of slot 1 ended slot 2's own worker");
+                WorkerSandbox.Stop(p);
+                await p.WaitForExitAsync(timeout.Token);
+                other.VerifyCompleted(p);
+                await OwnProcess.WaitUntilDeadAsync(sentinel);
+            }
+            finally { await other.EndAsync(p); }
+        });
+
+    private static async Task<(int Exit, string Output, string Error)> RunWithVariablesAsync(WorkerSandbox sandbox,
+        string program, IReadOnlyList<string> args, IReadOnlyDictionary<string, string> variables, CancellationToken ct)
+    {
+        var p = sandbox.Start("/", program, args, variables);
+        try
+        {
+            await sandbox.VerifyStartedAsync(p, ct);
+            var stdout = p.StandardOutput.ReadToEndAsync(ct);
+            var stderr = p.StandardError.ReadToEndAsync(ct);
+            await p.WaitForExitAsync(ct);
+            sandbox.VerifyCompleted(p);
+            return (p.ExitCode, await stdout, await stderr);
+        }
+        finally { await sandbox.EndAsync(p); }
     }
 
     private static readonly string OwnerHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
     [Theory]
-    [InlineData("/bin/ls", "")]
-    [InlineData("/bin/ls", ".ssh")]
-    [InlineData("/bin/ls", ".config/gh")]
-    [InlineData("/bin/cat", "Library/Keychains/login.keychain-db")]
-    public async Task Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain(string program, string relative) =>
+    [InlineData("")]
+    [InlineData(".ssh")]
+    [InlineData(".config/gh")]
+    [InlineData("Library/Keychains/login.keychain-db")]
+    public async Task Worker_is_denied_the_owners_home_ssh_keys_gh_config_and_login_keychain(string relative)
+    {
+        if (Environment.GetEnvironmentVariable("FACTORY_SANDBOX_LIVE") != "1") Assert.Skip("Live sandbox opt-in is required.");
+        var path = Path.Combine(OwnerHome, relative);
+        if (!File.Exists(path) && !Directory.Exists(path)) Assert.Skip("The owner path is absent: a failed open would not prove isolation.");
         await ForEachSlotAsync(async slot =>
         {
-            var (exitCode, _, stderr) = await slot.Sandbox.RunAsync("/", program, [Path.Combine(OwnerHome, relative)], CancellationToken.None);
-
-            Assert.NotEqual(0, exitCode);
-            Assert.Contains("Permission denied", stderr);
+            var (exitCode, stdout, _) = await slot.Sandbox.RunAsync("/", "/usr/bin/perl",
+                ["-MFcntl=O_RDONLY", "-e", "if (sysopen(my $f, $ARGV[0], O_RDONLY)) { close($f); exit 1; } if (!$!{EACCES} && !$!{EPERM}) { exit 2; } print \"DENIED\\n\";", path], CancellationToken.None);
+            Assert.Equal(0, exitCode);
+            Assert.Equal("DENIED", stdout.Trim());
         });
+    }
 
     /// <summary>
     /// AT6 (docs/acceptance.md): the installed helper, launched exactly as <see cref="ClaudeWorker"/> launches a sandboxed
@@ -1678,12 +1838,9 @@ public class LiveWorkerSandboxTests
             await ForEachSlotAsync(async slot =>
             {
                 var sandbox = slot.Sandbox;
-                using var p = sandbox.Start("/", "/usr/bin/env", [], ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, WorkerModelClass.Mid));
-                var output = await p.StandardOutput.ReadToEndAsync();
-                await p.WaitForExitAsync();
-                WorkerSandbox.Stop(p);
-
-                Assert.Equal(0, p.ExitCode);
+                var (exit, output, _) = await RunWithVariablesAsync(sandbox, "/usr/bin/env", [],
+                    ClaudeWorker.BuildRouterVariables(options.RouterBaseUrl, probeKey, WorkerModelClass.Mid), CancellationToken.None);
+                Assert.Equal(0, exit);
                 var env = SandboxSupport.ParseEnv(output);
                 Assert.Equal(expected, env.Keys.Order());
                 Assert.Equal(options.RouterBaseUrl.ToString().TrimEnd('/'), env["ANTHROPIC_BASE_URL"].TrimEnd('/'));
@@ -1724,7 +1881,7 @@ public class LiveWorkerSandboxTests
         await ForEachSlotAsync(async slot =>
         {
             var (exitCode, stdout, _) = await slot.Sandbox.RunAsync("/", "/usr/bin/security",
-                ["find-generic-password", "-s", SecretAccounts.Service, "-w", Path.Combine(OwnerHome, "Library/Keychains/login.keychain-db")],
+                ["find-generic-password", "-s", SecretAccounts.Service, Path.Combine(OwnerHome, "Library/Keychains/login.keychain-db")],
                 CancellationToken.None);
 
             Assert.NotEqual(0, exitCode);
@@ -1788,13 +1945,17 @@ public class LiveWorkerSandboxTests
                     Assert.True(await git.CommitAndPushAsync(Repo, ws, "sc-1: change", TestGrants.Untainted, ct)); // owner reads the worker's files
                     break;
                 case "stop":
-                    using (var p = sandbox.Start(ws.Path, "/bin/sh", ["-c", $"sleep 600 & echo {OwnProcess.ShellRecord("$!")}; wait"], new Dictionary<string, string>()))
+                    var p = sandbox.Start(ws.Path, "/bin/sh", ["-c", $"sleep 600 & echo {OwnProcess.ShellRecord("$!")}; wait"], new Dictionary<string, string>());
+                    try
                     {
+                        await sandbox.VerifyStartedAsync(p, ct);
                         var pid = OwnProcess.Parse((await p.StandardOutput.ReadLineAsync(ct))!);
                         WorkerSandbox.Stop(p);
                         await p.WaitForExitAsync(ct);
+                        sandbox.VerifyCompleted(p);
                         await OwnProcess.WaitUntilDeadAsync(pid);
                     }
+                    finally { await sandbox.EndAsync(p); }
                     break;
             }
 
@@ -1816,26 +1977,34 @@ public class LiveWorkerSandboxTests
     public async Task A_setsid_grandchild_of_the_worker_is_dead_once_the_helper_exits() =>
         await ForEachSlotAsync(slot => SetsidGrandchildIsDeadAsync(slot.Sandbox));
 
-    private static async Task SetsidGrandchildIsDeadAsync(WorkerSandbox sandbox)
+    private static async Task SetsidGrandchildIsDeadAsync(WorkerSandbox sandbox, CancellationToken ct = default)
     {
-        var ct = CancellationToken.None;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromMinutes(2));
+        ct = timeout.Token;
 
-        using var p = sandbox.Start("/", "/usr/bin/perl",
+        var p = sandbox.Start("/", "/usr/bin/perl",
             ["-MPOSIX", "-e", "$| = 1; my $pid = fork; if (!$pid) { exit 0 if fork; POSIX::setsid(); print \"$$\\n\"; open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null'); exec('/bin/sleep', '600'); } waitpid($pid, 0);"],
             new Dictionary<string, string>());
-        var grandchild = int.Parse((await p.StandardOutput.ReadLineAsync(ct))!);
-        await p.WaitForExitAsync(ct);
-        WorkerSandbox.Stop(p);
-
-        // The owner can't signal _factory's processes, so ask ps whether it still exists.
-        for (var i = 0; i < 50 && ProcessExists(grandchild); i++)
+        try
         {
-            await Task.Delay(100, ct);
+            await sandbox.VerifyStartedAsync(p, ct);
+            var grandchild = int.Parse((await p.StandardOutput.ReadLineAsync(ct))!);
+            await p.WaitForExitAsync(ct);
+            sandbox.VerifyCompleted(p);
+            WorkerSandbox.Stop(p);
+
+            // The owner can't signal _factory's processes, so ask ps whether it still exists.
+            for (var i = 0; i < 50 && ProcessExists(grandchild); i++)
+            {
+                await Task.Delay(100, ct);
+            }
+            Assert.False(ProcessExists(grandchild), $"setsid grandchild {grandchild} outlived the helper");
+            // Nothing of _factory's left. launchd starts Apple's per-user distnoted agent again seconds after any sweep (sc-26126),
+            // so this holds only because StopAllAsync does not count that agent (WorkerSandbox.RespawnedAgents).
+            Assert.False(await sandbox.StopAllAsync(ct));
         }
-        Assert.False(ProcessExists(grandchild), $"setsid grandchild {grandchild} outlived the helper");
-        // Nothing of _factory's left. launchd starts Apple's per-user distnoted agent again seconds after any sweep (sc-26126),
-        // so this holds only because StopAllAsync does not count that agent (WorkerSandbox.RespawnedAgents).
-        Assert.False(await sandbox.StopAllAsync(ct));
+        finally { await sandbox.EndAsync(p); }
     }
 
     /// <summary>
@@ -1943,7 +2112,8 @@ public class LiveWorkerSandboxTests
     [Fact]
     public async Task The_ios_gate_runs_a_new_unit_test_and_ui_test_on_a_simulator_as_each_sandbox_user()
     {
-        await RequireSlotsAsync();
+        await WithLiveSlotsAsync(async heldSlots =>
+        {
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new Support.InMemorySecrets());
         if (!options.WorkerSwift)
         {
@@ -1954,7 +2124,7 @@ public class LiveWorkerSandboxTests
             Assert.Skip("Worker:RunAs=none: there is no sandbox user to run the gate as.");
             return;
         }
-        foreach (var slot in pool.All)
+        foreach (var slot in heldSlots)
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(60));
             var ct = timeout.Token;
@@ -2023,6 +2193,7 @@ public class LiveWorkerSandboxTests
             TestContext.Current.TestOutputHelper?.WriteLine($"worker {slot} processes 15 s after the test's own last run:\n{ProcessesOf(slot.User)}");
             Assert.False(await slot.Sandbox.StopAllAsync(ct), $"worker {slot}: a process of {slot.User} outlived the test's own last simctl or deletion");
         }
+        });
     }
 
     private static bool ProcessExists(int pid)

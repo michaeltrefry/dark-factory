@@ -1139,7 +1139,7 @@ def hydrate_packages(root, worktree, data=None):
             code, _ = command(['/usr/bin/git', '--git-dir=' + str(mirror), '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0', *args], root, env=env)
             if code:
                 raise ValueError('pinned package object verification failed')
-        mirrors.append({'original': url, 'mirror': mirror.as_uri()})
+        mirrors.append({'original': url, 'mirror': mirror.resolve().as_uri()})
     for directory, _, files in os.walk(cache, topdown=False):
         for name in files:
             (pathlib.Path(directory) / name).chmod(0o444)
@@ -1389,6 +1389,18 @@ for relative in ('.swiftpm/configuration', 'Library/org.swift.swiftpm/configurat
     (directory / 'mirrors.json').write_text(json.dumps(config['mirrors']))
     if config['registries'] is not None:
         (directory / 'registries.json').write_text(json.dumps(config['registries']))
+# Only the collector's exact immutable mirror directories are trusted. Modern
+# upload-pack checks ownership too; source UID must not inherit the owner's git
+# configuration or a wildcard safe.directory exception.
+paths = []
+for entry in config['mirrors']['object']:
+    import urllib.parse
+    parsed = urllib.parse.urlsplit(entry['mirror'])
+    path = pathlib.Path(urllib.parse.unquote(parsed.path))
+    if parsed.scheme != 'file' or parsed.netloc or not path.is_absolute() or path.resolve() != path or not path.is_dir() or path.stat().st_mode & 0o222:
+        raise ValueError('invalid immutable package mirror')
+    paths.append(str(path))
+(home / '.factory-gitconfig').write_text('[safe]\n' + ''.join('\tdirectory = ' + json.dumps(path) + '\n' for path in paths))
 if config['registries'] is not None and len(sys.argv) > 3:
     for path in pathlib.Path(sys.argv[3]).rglob('registries.json'):
         if path.parent.name == 'configuration' and path.parent.parent.name in ('.swiftpm', 'swiftpm'):
@@ -1401,6 +1413,8 @@ def install_package_mirrors(principal, mirrors, registry=None):
     code, _ = principal.run(['/usr/bin/python3', '-I', '-c', CONFIG_SCRIPT, str(principal.home), json.dumps(config), str(getattr(principal, 'worktree', principal.home.parent / 'base'))], principal.home.parent)
     if code:
         raise PrepareFailure('package-hydration-failed')
+    principal.env.update({'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': '/dev/null',
+                          'GIT_CONFIG_GLOBAL': str(principal.home / '.factory-gitconfig')})
 
 
 BINARY_DISCOVERY_SCRIPT = r"""

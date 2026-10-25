@@ -34,6 +34,47 @@ public sealed record RepoRef(string Owner, string Name)
     public override string ToString() => FullName;
 }
 
+/// <summary>The separately reviewed GUI control repository is infrastructure, never a model-authored work target.
+/// Each instance reserves both the default trusted source-job controller and its configured collector, so moving settings
+/// cannot reopen worker authority over an old controller still registered during migration. No mutable
+/// process-global configuration is used. An All-repositories App installation does not grant
+/// factory workers authority over the controller. Owner-admin deployment uses its separate explicit owner credential.</summary>
+public static class FactoryRepositoryPolicy
+{
+    public const string ReservedController = Gate.RemoteGuiSourceWorkflow.Repository;
+    private static readonly RepoRef DefaultController = RepoRef.Parse(ReservedController);
+
+    public static RepoRef ControllerRepository(RepoRef? configured = null) => configured ?? DefaultController;
+
+    public static bool IsReservedController(RepoRef repo, RepoRef? reservedController = null) =>
+        repo.Is(DefaultController) || repo.Is(ControllerRepository(reservedController));
+
+    private static RepoRef ReservedIdentity(RepoRef repo, RepoRef? configured) => repo.Is(DefaultController)
+        ? DefaultController : ControllerRepository(configured);
+
+    public static string? WorkRefusal(RepoRef repo, RepoRef? reservedController = null) => IsReservedController(repo, reservedController)
+        ? $"Repository {ReservedIdentity(repo, reservedController)} is reserved for the trusted GUI controller: model-authored factory work is forbidden there. No work is claimed, implemented, pushed, dispatched or merged there."
+        : null;
+
+    public static void EnsureWorkAllowed(RepoRef repo, RepoRef? reservedController = null)
+    {
+        if (WorkRefusal(repo, reservedController) is { } reason) throw new InvalidOperationException(reason);
+    }
+
+    /// <summary>Token-issuer floor, checked before signing a JWT or making a GitHub request. The only controller write
+    /// grant is the narrow trusted-workflow Actions scope, with optional Contents-read; it cannot edit contents, PRs, issues or repository settings.
+    /// Explicit read scopes remain available. Empty/unknown scopes are refused rather than inheriting App defaults.</summary>
+    public static void EnsureInstallationPermissions(RepoRef repo, IReadOnlyDictionary<string, string> permissions, RepoRef? reservedController = null)
+    {
+        if (!IsReservedController(repo, reservedController)) return;
+        var readOnly = permissions.Count > 0 && permissions.All(p => p.Value is "read" or "none");
+        var trustedDispatch = permissions.Count is 1 or 2 && permissions.TryGetValue("actions", out var actions) && actions is "read" or "write"
+            && permissions.All(p => p.Key == "actions" || p.Key == "contents" && p.Value == "read");
+        if (!readOnly && !trustedDispatch)
+            throw new InvalidOperationException($"Repository {ReservedIdentity(repo, reservedController)} is reserved for the trusted GUI controller: factory installation tokens may not grant worker write authority there. Only explicit read scopes or trusted Actions-read/write with optional Contents-read are allowed.");
+    }
+}
+
 /// <summary>
 /// A story targets the configured default repo unless its description has a
 /// <c>Repo: owner/name</c> line.

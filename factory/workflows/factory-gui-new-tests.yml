@@ -99,7 +99,7 @@ jobs:
       fail-fast: false
       matrix:
         side: ${{ fromJSON(needs.sources.outputs.sides) }}
-    runs-on: [self-hosted, macOS, ARM64, factory-gui-collector]
+    runs-on: [factory-gui-collector]
     # Hosted hard ceiling only; Python enforces the transported remaining deadline.
     timeout-minutes: 360
     permissions: {}

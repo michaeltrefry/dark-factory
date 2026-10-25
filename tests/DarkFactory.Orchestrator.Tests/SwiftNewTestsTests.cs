@@ -344,6 +344,86 @@ public class SwiftIdentifyTests
         Assert.Empty(set.Unisolable);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task An_existing_test_in_package_A_cannot_hide_a_new_same_runtime_id_in_package_B(bool xctest)
+    {
+        var body = xctest ? "import XCTest\nclass C: XCTestCase { func testFoo() {} }\n" : "import Testing\n@Test func foo() {}\n";
+        var runtime = xctest ? "WordsTests.C/testFoo" : "WordsTests.foo()";
+        // Editing A's manifest must not rename its existing test; B's byte-identical base manifest is a different package.
+        var runner = Runner(("A/Tests/WordsTests/t.swift", body + "// edited\n"), ("B/Tests/WordsTests/t.swift", body),
+            ("A/Package.swift", Manifest + "\n// manifest edited without renaming the package\n"));
+        runner.BaseFiles["A/Package.swift"] = Manifest;
+        runner.BaseFiles["B/Package.swift"] = Manifest;
+        runner.BaseFiles["A/Tests/WordsTests/t.swift"] = body;
+        runner.BaseFiles["B/Tests/WordsTests/t.swift"] = xctest ? "import XCTest\n" : "import Testing\n";
+
+        var set = (SwiftNewTestSet)await Identify(runner);
+        var key = SwiftNewTests.TestKey("B/Package.swift", runtime);
+        Assert.Equal([key], set.Tests);
+        Assert.Empty(set.Unisolable);
+        Assert.Equal("B/Package.swift", set.Projects[key]);
+        Assert.Equal("B/Tests/WordsTests/t.swift", set.Locations[key].Path);
+        var steps = await new SwiftNewTests().StepsAsync(null!, Head, set.Tests, set.Projects, ".results", CancellationToken.None);
+        var test = Assert.Single(steps, s => s.Phase == TestPhase.Test);
+        Assert.Equal(SwiftNewTests.Filter(runtime), test.Args[test.Args.ToList().IndexOf("--filter") + 1]);
+        Assert.Equal("./B", test.Args[test.Args.ToList().IndexOf("--package-path") + 1]);
+        Assert.Equal(NewTestsOutcome.Pass, (await Check(runner)).Outcome);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Identical_runtime_ids_in_independent_packages_have_independent_reports_and_gate_results(bool xctest)
+    {
+        var body = xctest ? "import XCTest\nclass C: XCTestCase { func testFoo() {} }\n" : "import Testing\n@Test func foo() {}\n";
+        var runtime = xctest ? "WordsTests.C/testFoo" : "WordsTests.foo()";
+        var runner = Runner(("A/Tests/WordsTests/t.swift", body), ("B/Tests/WordsTests/t.swift", body));
+        foreach (var package in new[] { "A", "B" })
+        {
+            runner.BaseFiles[package + "/Package.swift"] = Manifest;
+            runner.BaseFiles[package + "/Tests/WordsTests/t.swift"] = xctest ? "import XCTest\n" : "import Testing\n";
+        }
+        var a = SwiftNewTests.TestKey("A/Package.swift", runtime);
+        var b = SwiftNewTests.TestKey("B/Package.swift", runtime);
+        var set = await Identify(runner);
+        Assert.Equal(new[] { a, b }.Order(StringComparer.Ordinal), set.Tests);
+        Assert.Empty(set.Unisolable);
+        runner.Answer = spec =>
+        {
+            var files = new List<ResultFile>();
+            foreach (var step in spec.Steps.Where(s => s.Phase == TestPhase.Test))
+            {
+                var package = step.Args[step.Args.ToList().IndexOf("--package-path") + 1];
+                var key = package == "./A" ? a : b;
+                // Only A is vacuous. Its pass on the base must not be merged with B's genuine failure there.
+                var failed = spec.OverlayFrom is not null && package == "./B";
+                if (xctest)
+                {
+                    files.Add(new ResultFile(step.CaptureOutput!, $"Test Case '-[WordsTests.C testFoo]' started.\nTest Case '-[WordsTests.C testFoo]' {(failed ? "failed" : "passed")} (0.001 seconds).\nExecuted 1 test, with {(failed ? 1 : 0)} failures (0 unexpected) in 0.001 (0.001) seconds\n") { ExitCode = failed ? 1 : 0 });
+                }
+                else
+                {
+                    files.Add(new ResultFile(SwiftNewTests.ReportName(key), $"<testsuite tests=\"1\" failures=\"{(failed ? 1 : 0)}\" errors=\"0\" skipped=\"0\"><testcase classname=\"WordsTests\" name=\"foo()\">{(failed ? "<failure/>" : "")}</testcase></testsuite>"));
+                    files.Add(new ResultFile(step.CaptureOutput!, "") { ExitCode = failed ? 1 : 0 });
+                    files.Add(new ResultFile(SwiftNewTests.EventsName(key), SwiftRunOutputTests.RunEnded));
+                }
+                Assert.Equal(SwiftNewTests.Filter(runtime), step.Args[step.Args.ToList().IndexOf("--filter") + 1]);
+            }
+            Assert.Equal(2, files.Where(f => f.ExitCode is not null).Select(f => f.Name).Distinct().Count());
+            var parsed = new SwiftNewTests().ParseResults(files);
+            Assert.Empty(parsed.Unreadable);
+            Assert.Equal(new[] { a, b }.Order(StringComparer.Ordinal), parsed.Cases.Keys.Order(StringComparer.Ordinal));
+            return new TestRunReport(TestRunStatus.Ran, parsed.Cases, "ran");
+        };
+        var result = await Check(runner);
+        Assert.Equal(NewTestsOutcome.Rejected, result.Outcome);
+        Assert.Equal(TestCaseResult.Passed, Assert.Single(result.Tests, t => t.Test == a).Base);
+        Assert.Equal(TestCaseResult.Failed, Assert.Single(result.Tests, t => t.Test == b).Base);
+        Assert.All(result.Tests, t => Assert.Equal(TestCaseResult.Passed, t.Head));
+    }
+
     [Fact]
     public async Task A_test_of_a_package_in_a_subdirectory_belongs_to_that_package_and_runs_there()
     {
@@ -354,8 +434,9 @@ public class SwiftIdentifyTests
         var set = await Identify(runner);
         var steps = await new SwiftNewTests().StepsAsync(null!, Head, set.Tests, set.Projects, ".results", CancellationToken.None);
 
-        Assert.Equal(["WordsTests.nested()"], set.Tests);
-        Assert.Equal("sub/Package.swift", set.Projects["WordsTests.nested()"]);
+        var key = SwiftNewTests.TestKey("sub/Package.swift", "WordsTests.nested()");
+        Assert.Equal([key], set.Tests);
+        Assert.Equal("sub/Package.swift", set.Projects[key]);
         Assert.Empty(set.Unisolable);
         Assert.Equal([new ChangedFile('A', null, "sub/Tests/WordsTests/x.swift")], set.TestFiles);
         Assert.All(steps.Where(s => s.Program == SwiftNewTests.Swift && s.Phase != TestPhase.Toolchain),

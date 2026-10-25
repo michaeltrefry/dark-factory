@@ -146,7 +146,7 @@ public sealed class WorkSourceRegistry(FactoryOptions options, Func<ItemNaming, 
 
     /// <summary>The GitHub issue work source over the watched repos (<c>GitHub:Watch:Repos</c>), as the workers' App.</summary>
     public static GitHubIssueWorkSource Issues(FactoryOptions options, HttpClient githubHttp, IDbContextFactory<LedgerDbContext>? contexts = null) =>
-        new(new GitHubIssuesClient(githubHttp, new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System)),
+        new(new GitHubIssuesClient(githubHttp, new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector)),
             contexts ?? Ledger(options), options.WatchedIssueRepos);
 
     /// <summary>

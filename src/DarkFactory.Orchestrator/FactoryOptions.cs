@@ -134,7 +134,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
         {
             try
             {
-                return RepoRef.Parse(config["Factory:DefaultRepo"] ?? "michaeltrefry/dark-factory-sandbox");
+                var repo = RepoRef.Parse(config["Factory:DefaultRepo"] ?? "michaeltrefry/dark-factory-sandbox");
+                if (FactoryRepositoryPolicy.WorkRefusal(repo, GuiWorkflow?.Collector) is { } reason) throw new InvalidOperationException($"Factory:DefaultRepo: {reason}");
+                return repo;
             }
             catch (ArgumentException ex)
             {
@@ -313,7 +315,9 @@ public sealed class FactoryOptions(IConfiguration config, ISecretStore secrets, 
             {
                 try
                 {
-                    return RepoRef.Parse(v);
+                    var repo = RepoRef.Parse(v);
+                    if (FactoryRepositoryPolicy.WorkRefusal(repo, GuiWorkflow?.Collector) is { } reason) throw new InvalidOperationException($"{key}: {reason}");
+                    return repo;
                 }
                 catch (ArgumentException ex)
                 {

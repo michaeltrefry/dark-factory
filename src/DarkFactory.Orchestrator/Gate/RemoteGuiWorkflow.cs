@@ -31,6 +31,13 @@ public static class RemoteGuiWorkflow
     }
     public static string Helper { get; } = Resource("factory-gui-exec");
     public static string Runner { get; } = RenderRunner();
+    public static string SourceJob { get; } = RenderSourceJob();
+    private static string RenderSourceJob()
+    {
+        var entry = Runner.LastIndexOf("if __name__ == '__main__':", StringComparison.Ordinal);
+        return "#!/usr/bin/python3 -I\n" + Runner[..entry] + "\n" + Resource("factory-gui-source-job.py").Replace("GUI_HELPER_HASH",
+            Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Helper))));
+    }
     private static string RenderRunner()
     {
         var runner = RemoteIosWorkflow.Runner;

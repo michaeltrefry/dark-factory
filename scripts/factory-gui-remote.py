@@ -7,6 +7,7 @@ import uuid
 GUI_HELPER = pathlib.Path('/usr/local/libexec/dark-factory/factory-gui-exec')
 GUI_LEASE = None
 GUI_CONFIG = None
+GUI_TEMP_ROOT = pathlib.Path('/private/tmp')
 
 
 def gui_operation(operation, root=None, extra=None, cleanup=False):
@@ -21,13 +22,61 @@ def gui_operation(operation, root=None, extra=None, cleanup=False):
     return output
 
 
+PROBE_UNCERTAINTY_BODY = json.dumps({'group': 0, 'start': 'factory-owned-acceptance-no-process'})
+
+
+def reconcile_probe_fixture(config):
+    # A diagnostic interrupted during its deliberate refusal must not require a
+    # manual re-arm. Only its exact collector-owned, non-process fixture can be
+    # removed; real root-owned command records/quarantines are NEVER changed.
+    directory = pathlib.Path(config['stateDirectory'])
+    state = directory / 'probe-uncertainty.json'
+    if not state.exists():
+        return
+    lock = open(directory / 'probe.lock', 'a+b')
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # a live probe owns its own intentional refusal
+        metadata = state.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != config['collectorUid'] or metadata.st_mode & 0o077 or metadata.st_size > 1024:
+            raise ValueError('unknown acceptance uncertainty state')
+        value = json.loads(state.read_text())
+        if set(value) != {'version', 'root', 'configurationSha256'} or value['version'] != 1 or value['configurationSha256'] != config['hash']:
+            raise ValueError('unbound acceptance uncertainty state')
+        root = pathlib.Path(value['root'])
+        if root.parent != GUI_TEMP_ROOT or not re.fullmatch('factory-ios-[A-Za-z0-9_-]+', root.name) or root.resolve() != root:
+            raise ValueError('acceptance uncertainty workspace refused')
+        probe = root / 'gui-command-0.json'
+        if probe.exists() or probe.is_symlink():
+            journal = json.loads((directory / 'active.json').read_text())
+            if journal != {'root': str(root), 'devices': [], 'deviceIntents': []}:
+                raise ValueError('acceptance uncertainty is not the active own workspace')
+            node = root.lstat()
+            metadata = probe.lstat()
+            if (not stat.S_ISDIR(node.st_mode) or node.st_uid != config['collectorUid'] or node.st_mode & 0o022
+                    or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != config['collectorUid']
+                    or metadata.st_mode & 0o777 != 0o600 or metadata.st_size > 1024 or probe.read_text() != PROBE_UNCERTAINTY_BODY):
+                raise ValueError('acceptance fixture changed; reuse stays held')
+            probe.unlink()
+        state.unlink()
+        # The normal protected reconciliation below still has to prove actual
+        # process quiescence and remove the complete old workspace.
+    finally:
+        lock.close()
+
+
 class GuiLease:
     def __init__(self, config):
+        self.config = dict(config)
         self.directory = pathlib.Path(config['stateDirectory'])
         self.stream = None
         self.marker = self.directory / 'active.json'
         self.root = None
         self.cleaned = False
+        self.started_utc = None
+        self.reconciled = False
 
     def __enter__(self):
         self.stream = open(self.directory / 'machine.lock', 'a+b')
@@ -39,6 +88,7 @@ class GuiLease:
                     break
                 except BlockingIOError:
                     time.sleep(min(0.1, remaining()))
+            reconcile_probe_fixture({'collectorUid': os.geteuid(), **self.config})
             if self.marker.exists():
                 # An OS-released lock with a marker is a crashed job, never
                 # permission to overlap it. Reconcile through the same bounded
@@ -67,7 +117,9 @@ class GuiLease:
                         gui_operation('device-delete', old, device, cleanup=True)
                     gui_operation('remove', old, cleanup=True)
                 self.marker.unlink()
+                self.reconciled = True
             self.record(None)
+            self.started_utc = time.time()
             return self
         except BaseException:
             self.stream.close()
@@ -83,6 +135,13 @@ class GuiLease:
             os.fsync(output.fileno())
         os.replace(temporary, self.marker)
         self.root = root
+
+    def evidence(self):
+        if not self.cleaned or self.root is None or self.root.exists() or self.started_utc is None:
+            raise ValueError('GUI cleanup has not been proven')
+        return {'workspaceSha256': hashlib.sha256(str(self.root).encode()).hexdigest(),
+                'startedUtcSeconds': self.started_utc, 'completedUtcSeconds': time.time(),
+                'cleaned': True, 'reconciled': self.reconciled}
 
     def __exit__(self, *failure):
         try:
@@ -125,6 +184,7 @@ class GuiPrincipal:
         (self.home / 'tmp').mkdir(mode=0o700)
         root.chmod(0o755)
         GUI_LEASE.record(root)
+        gui_operation('baseline', self.root)
         self.share(self.home)
         self.env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(self.home),
                     'TMPDIR': str(self.home / 'tmp'), 'DEVELOPER_DIR': GUI_CONFIG['developer'], 'xcrun_nocache': '1'}
@@ -199,11 +259,11 @@ def parse_execution(text, request):
 
 def write_execution_result(payload):
     payload['guiConfigurationHash'] = GUI_CONFIG['hash']
+    payload['guiLease'] = GUI_LEASE.evidence()
     _gui_original_write(payload)
 
 
-def main():
-    global GUI_CONFIG, GUI_LEASE, ENVIRONMENT, EXECUTION_DEADLINE
+def verify_gui_helper():
     # Verify the installed root-owned helper before ever invoking it. Parent
     # directories must be root-owned and closed to group/other writers too.
     for path in [GUI_HELPER, *GUI_HELPER.parents]:
@@ -222,6 +282,11 @@ def main():
                 raise ValueError('installed GUI helper has a writable or unknown ACL')
     if hashlib.sha256(GUI_HELPER.read_bytes()).hexdigest() != 'GUI_HELPER_HASH':
         raise ValueError('stale installed GUI helper')
+
+
+def main():
+    global GUI_CONFIG, GUI_LEASE, ENVIRONMENT, EXECUTION_DEADLINE
+    verify_gui_helper()
     EXECUTION_DEADLINE = execution_budget(os.environ['EXECUTION_BUDGET_SECONDS'], os.environ['EXECUTION_DEADLINE_UNIX_SECONDS'])
     code, collector_manager = command(['/bin/launchctl', 'managername'], '/')
     if code or collector_manager.strip() not in ('Background', 'System'):

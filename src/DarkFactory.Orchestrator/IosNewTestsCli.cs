@@ -45,7 +45,7 @@ public static class IosNewTestsCli
         var options = new FactoryOptions(FactoryOptions.LoadConfiguration(), new MacKeychain());
         options.ValidateSettings();
         using var http = OutboundHttp.GitHubApi();
-        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector);
         return await new RemoteIosNewTests(new IosWorkflowGitHub(http, app), Path.Combine(options.WorkRoot, "ios-dispatches"))
             { Timeout = options.TestTimeout }.RunAsync(repo, request, ct);
     }

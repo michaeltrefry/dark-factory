@@ -91,7 +91,7 @@ public sealed partial class RunPipeline(
     Func<CancellationToken, Task>? enterSandbox = null,
     bool swift = false,
     Prepare.WorkerPrepare? workerPrepare = null,
-    Recovery.HotFileRecovery? recovery = null, bool backgroundRecovery = false)
+    Recovery.HotFileRecovery? recovery = null, bool backgroundRecovery = false, RepoRef? reservedController = null)
 {
     /// <summary>
     /// <c>Worker:Prepare</c> (sc-26232), or null when it is off: before each implementing session of a worktree with a prepare recipe
@@ -398,6 +398,7 @@ public sealed partial class RunPipeline(
     /// only ones a plan item may name, whether it names one or several (sc-25874, sc-25877, <see cref="PlanRepositories"/>).
     /// </summary>
     private readonly IReadOnlyList<RepoRef> _configuredRepos = configuredRepos ?? [defaultRepo];
+    private readonly RepoRef _reservedController = FactoryRepositoryPolicy.ControllerRepository(reservedController);
 
     /// <summary>
     /// Reads of an item's controls in a row that may fail while a worker or the gate's test runs go on (<c>Controls:MaxReadFailures</c>);
@@ -977,6 +978,8 @@ public sealed partial class RunPipeline(
             // A stop is finished even while the factory is frozen: it starts no new work.
             return await StopIdleAsync(known, storyId, ct);
         }
+        if (known is not null && await ReservedRecordedWorkAsync(known, ct) is { } reservedKnown)
+            return await OutcomeAsync(known, reservedKnown, ct);
         // The freeze evaluator runs before every dispatch (sc-25387): a frozen factory defers the run, changing nothing.
         if (freeze is not null && await CheckFreezeAsync(ct) is { Frozen: true } frozen)
         {
@@ -1037,9 +1040,13 @@ public sealed partial class RunPipeline(
         }
         // The repository the item's story names: every item's own, and a plan item's primary one (sc-25873).
         var primary = RepoResolver.Resolve(story.Description, defaultRepo);
+        IReadOnlyList<RepoRef> requestedRepositories = source.PlansItems && Plans.PlanLabel.IsOn(story)
+            ? RepoResolver.ResolveAll(story.Description, defaultRepo) : [primary];
+        foreach (var requested in requestedRepositories)
+            if (FactoryRepositoryPolicy.WorkRefusal(requested, _reservedController) is { } reserved)
+                return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, reserved);
         // Before the run lock (E12): a plan item may work in every repository it names; any other item in its own.
-        await AdvanceRecoveryAsync(source.PlansItems && Plans.PlanLabel.IsOn(story)
-            ? RepoResolver.ResolveAll(story.Description, defaultRepo) : [primary], ct);
+        await AdvanceRecoveryAsync(requestedRepositories, ct);
         if (await source.AuthorizeDispatchAsync(storyId, primary, ct) is { Claimed: false } refusal)
             return new RunOutcome(known?.Id ?? 0, known?.State ?? WorkState.Intake, null, null, refusal.Refusal);
         var correctionDelivered = Naming == ItemNaming.Recovery && known is not null
@@ -1066,7 +1073,11 @@ public sealed partial class RunPipeline(
         // in any other state, works in the repository its story names. Decided from the rows read under the run lock, never from
         // what was loaded before it: another process may have finished one repository's pull request and opened the next one's
         // meanwhile, and this run would take that one through the gate as the earlier repository's.
+        if (await ReservedRecordedWorkAsync(item, ct) is { } reservedRecorded)
+            return await OutcomeAsync(item, reservedRecorded, ct);
         var repo = Plans.Changeset.PassRepo(await ledger.HistoryAsync(item, ct)) ?? primary;
+        if (FactoryRepositoryPolicy.WorkRefusal(repo, _reservedController) is { } reservedPass)
+            return await OutcomeAsync(item, reservedPass, ct);
         // Re-read under the lock: another run may have moved the item since it was loaded.
         await ledger.RefreshAsync(item, story.Name, repo.FullName, spec.Epic?.Id, ct);
         if (known is not null && !correctionDelivered && item.State != WorkState.Planned && !Lifecycle.IsTerminal(item.State))
@@ -1322,6 +1333,17 @@ public sealed partial class RunPipeline(
         return await OutcomeAsync(item, null, ct);
     }
 
+    private async Task<string?> ReservedRecordedWorkAsync(WorkItem item, CancellationToken ct)
+    {
+        if (FactoryRepositoryPolicy.WorkRefusal(RepoRef.Parse(item.Repo), _reservedController) is { } own) return own;
+        var history = await ledger.HistoryAsync(item, ct);
+        if (Plans.Changeset.PassRepo(history) is { } pass && FactoryRepositoryPolicy.WorkRefusal(pass, _reservedController) is { } active) return active;
+        foreach (var changeset in history.Where(e => e.Step == Steps.Changeset)
+            .Select(e => Plans.Changeset.FromDetail(e.Detail)).OfType<Plans.Changeset>())
+            if (FactoryRepositoryPolicy.WorkRefusal(RepoRef.Parse(changeset.Repo), _reservedController) is { } recorded) return recorded;
+        return null;
+    }
+
     /// <summary>
     /// The item is in a state no handler drives (e.g. parked at Review, Done): read and change nothing on
     /// the board, but tell the story once per state entry why the factory is not working on it.
@@ -1335,6 +1357,7 @@ public sealed partial class RunPipeline(
             return new RunOutcome(item.Id, item.State, null, null, $"{item.ExternalId} is already running.");
         }
         await ledger.RefreshAsync(item, item.Title, item.Repo, item.EpicId, ct);
+        if (await ReservedRecordedWorkAsync(item, ct) is { } reserved) return await OutcomeAsync(item, reserved, ct);
         await EndEarlierSlotUseAsync(item, await ledger.HistoryAsync(item, ct));
         var history = await ledger.HistoryAsync(item, ct);
         if (gate is not null && CloseoutPending(item.State, history))
