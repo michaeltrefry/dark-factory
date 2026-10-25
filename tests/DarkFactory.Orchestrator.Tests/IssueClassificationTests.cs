@@ -321,7 +321,9 @@ public class IssueClassificationTests
         if (failure == "transport") { router.Respond = _ => throw new HttpRequestException("private-report"); }
         if (failure == "http") { router.Respond = _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.TooManyRequests) { Content = new StringContent("private-report all_exhausted") }); }
         using var http = new HttpClient(router) { BaseAddress = new("http://router.test/") };
-        var options = Options(("Issues:Classification:Mode", mode), ("Issues:Classification:Model", "catalog-d3"), ("Issues:Classification:TimeoutSeconds", "0.05"));
+        // Only the timeout row races a deadline. Other rows exercise distinct failures and need scheduling headroom
+        // during the full parallel suite, rather than accidentally observing a 50 ms timeout before their fake handler runs.
+        var options = Options(("Issues:Classification:Mode", mode), ("Issues:Classification:Model", "catalog-d3"), ("Issues:Classification:TimeoutSeconds", failure == "timeout" ? "0.05" : "5"));
         var h = new IssueIntakeTests.Harness(Answer()) { Classifier = IssueClassifier.Create(options, http, () => "router-secret") };
         var observedFailures = 0;
         h.Status.Changed += () => observedFailures = Math.Max(observedFailures, h.Status.ItemErrors.Values.Sum(e => e.Count));

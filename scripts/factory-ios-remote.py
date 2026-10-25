@@ -1617,7 +1617,10 @@ def validate_test_environment(values):
     return values
 
 
-def resolve_test_environment(values, worktree):
+TRUSTED_EXECUTABLE_ROOTS = ('/bin', '/usr/bin', '/usr/local/bin', '/usr/local/libexec', '/usr/local/Cellar', '/usr/local/share/dotnet', '/opt/homebrew/bin', '/opt/homebrew/Cellar', '/opt/homebrew/libexec', '/opt/homebrew/Library/Homebrew', '/System/Cryptexes/App/usr/bin', '/System/Volumes/Preboot/Cryptexes/OS/usr/bin')
+
+
+def resolve_test_environment(values, worktree, canonical_executable=None, trusted_executable_roots=TRUSTED_EXECUTABLE_ROOTS):
     validate_test_environment(values)
     result = {}
     root = worktree.resolve()
@@ -1631,8 +1634,16 @@ def resolve_test_environment(values, worktree):
                     raise ValueError('test_env.' + key + ': symbolic link')
             if not pathlib.Path(expanded).resolve().is_relative_to(root):
                 raise ValueError('test_env.' + key + ': outside workspace')
-        elif expanded.startswith('/') and (not pathlib.Path(expanded).is_file() or not os.access(expanded, os.X_OK)):
-            raise ValueError('test_env.' + key + ': executable unavailable')
+        elif expanded.startswith('/'):
+            try:
+                canonical = pathlib.Path(canonical_executable(expanded) if canonical_executable else pathlib.Path(expanded).resolve(strict=True))
+                if not any(str(canonical).startswith(trusted.rstrip('/') + '/') for trusted in trusted_executable_roots):
+                    raise ValueError('test_env.' + key + ': executable resolves outside trusted system/tool installation roots')
+                if not canonical.is_file() or not os.access(canonical, os.X_OK):
+                    raise ValueError('test_env.' + key + ': executable unavailable')
+                expanded = str(canonical)  # forward the verified destination, never a mutable owner-path indirection
+            except (OSError, RuntimeError) as error:
+                raise ValueError('test_env.' + key + ': executable cannot be resolved and verified') from error
         result['TEST_RUNNER_' + key] = expanded
     return result
 

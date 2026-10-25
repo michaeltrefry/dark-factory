@@ -155,6 +155,82 @@ public class TestEnvironmentTests
         finally { Directory.Delete(root, true); }
     }
 
+    internal static (string Prefix, string Destination, string[] Trusted) ExecutableFixture(string directory, string scenario)
+    {
+        var prefix = SandboxTestRunner.RealPath(Directory.CreateDirectory(Path.Combine(directory, "filesystem")).FullName);
+        var bin = Path.Combine(prefix, "usr/local/bin");
+        var destination = scenario switch
+        {
+            "homebrew" => Path.Combine(prefix, "opt/homebrew/Cellar/helper/1.0/bin/repo-helper"),
+            "dotnet" => Path.Combine(prefix, "usr/local/share/dotnet/repo-helper"),
+            "cryptex" => Path.Combine(prefix, "System/Volumes/Preboot/Cryptexes/OS/usr/bin/repo-helper"),
+            _ => Path.Combine(prefix, "owner/private/repo-helper"),
+        };
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        SandboxSupport.ExecutableAt(destination, "#!/bin/sh\nexit 0\n");
+        Directory.CreateDirectory(Path.GetDirectoryName(bin)!);
+        if (scenario == "parent-owner") Directory.CreateSymbolicLink(bin, Path.GetDirectoryName(destination)!);
+        else
+        {
+            Directory.CreateDirectory(bin);
+            File.CreateSymbolicLink(Path.Combine(bin, "repo-helper"), destination);
+        }
+        return (prefix, destination, [prefix + "/usr/local/bin", prefix + "/opt/homebrew/Cellar", prefix + "/usr/local/share/dotnet", prefix + "/System/Volumes/Preboot/Cryptexes/OS/usr/bin"]);
+    }
+
+    [Theory]
+    [InlineData("leaf-owner", false)]
+    [InlineData("parent-owner", false)]
+    [InlineData("homebrew", true)]
+    [InlineData("dotnet", true)]
+    [InlineData("cryptex", true)]
+    public void Fixed_executables_forward_only_verified_canonical_system_or_tool_destinations(string scenario, bool allowed)
+    {
+        var directory = Directory.CreateTempSubdirectory("df-env-executable-").FullName;
+        try
+        {
+            var fixture = ExecutableFixture(directory, scenario);
+            var values = new Dictionary<string, string> { ["REPO_HELPER"] = "/usr/local/bin/repo-helper" };
+            IReadOnlyDictionary<string, string> Resolve() => TestEnvironment.Resolve(values, directory,
+                path => SandboxTestRunner.RealPath(fixture.Prefix + path), fixture.Trusted);
+            if (allowed)
+            {
+                var resolved = Resolve()["REPO_HELPER"];
+                Assert.Equal(fixture.Destination, resolved);
+                using var process = Process.Start(new ProcessStartInfo(resolved))!;
+                process.WaitForExit();
+                Assert.Equal(0, process.ExitCode);
+            }
+            else Assert.Contains("REPO_HELPER", Assert.Throws<PrepareRecipeException>(() => Resolve()).Message);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public async Task Fixed_executable_destination_policy_matches_sealed_python_on_isolated_filesystems()
+    {
+        var directory = Directory.CreateTempSubdirectory("df-env-canonical-parity-").FullName;
+        try
+        {
+            var cases = new[] { "leaf-owner", "parent-owner", "homebrew", "dotnet", "cryptex" }
+                .Select(scenario => (Scenario: scenario, Fixture: ExecutableFixture(Directory.CreateDirectory(Path.Combine(directory, scenario)).FullName, scenario))).ToArray();
+            var script = Path.Combine(directory, "runner.py");
+            await File.WriteAllTextAsync(script, RemoteIosWorkflow.Runner);
+            const string python = "import json,runpy,sys,pathlib; r=runpy.run_path(sys.argv[1]); result=[]\nfor case in json.load(sys.stdin):\n try:\n  value=r['resolve_test_environment']({'REPO_HELPER':'/usr/local/bin/repo-helper'},pathlib.Path(case['prefix']),lambda p:str(pathlib.Path(case['prefix']+p).resolve(strict=True)),case['trusted'])\n  result.append(value['TEST_RUNNER_REPO_HELPER'])\n except ValueError as error: result.append(str(error))\nprint(json.dumps(result))";
+            using var process = Process.Start(new ProcessStartInfo("python3", ["-I", "-c", python, script]) { WorkingDirectory = directory, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true })!;
+            await process.StandardInput.WriteAsync(System.Text.Json.JsonSerializer.Serialize(cases.Select(c => new { prefix = c.Fixture.Prefix, trusted = c.Fixture.Trusted })));
+            process.StandardInput.Close();
+            var stdout = process.StandardOutput.ReadToEndAsync(); var stderr = process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 0, await stderr);
+            var answers = System.Text.Json.JsonSerializer.Deserialize<string[]>(await stdout)!;
+            for (var i = 0; i < cases.Length; i++)
+                if (cases[i].Scenario.EndsWith("owner", StringComparison.Ordinal)) Assert.Contains("REPO_HELPER", answers[i]);
+                else Assert.Equal(cases[i].Fixture.Destination, answers[i]);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
     [Fact]
     public async Task Csharp_and_sealed_python_validate_the_same_bounded_contract()
     {

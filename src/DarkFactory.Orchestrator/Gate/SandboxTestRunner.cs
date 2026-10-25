@@ -261,7 +261,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         if (!xcode && step.Program is not ("dotnet" or "cargo" or "swift")) return step;
         var environment = Prepare.TestEnvironment.Resolve(values, worktree);
         if (xcode)
-            return step with { Args = step.Args.Concat(environment.SelectMany(p => new[] { "--test-env", p.Key + "=" + p.Value })).ToArray() };
+            return step with { Args = step.Args.Concat(values.SelectMany(p => new[] { "--test-env", p.Key + "=" + p.Value })).ToArray() };
         return step with { Program = Prepare.PrepareSteps.EnvPath, Args = environment.Select(p => p.Key + "=" + p.Value).Concat(new[] { step.Program }).Concat(step.Args).ToArray() };
     }
 

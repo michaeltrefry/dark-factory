@@ -112,6 +112,14 @@ relative_path() { # relative_path <value> <suffix>
     resolves_inside "$value"
 }
 
+# Only these canonical system/tool installation destinations may receive fixed executable inputs.
+# The empty prefix and roots are source constants, not environment/configuration. Tests change them in a private COPY.
+executable_prefix=
+trusted_executable_roots=(/bin /usr/bin /usr/local/bin /usr/local/libexec /usr/local/Cellar /usr/local/share/dotnet /opt/homebrew/bin /opt/homebrew/Cellar /opt/homebrew/libexec /opt/homebrew/Library/Homebrew /System/Cryptexes/App/usr/bin /System/Volumes/Preboot/Cryptexes/OS/usr/bin)
+canonical_executable() {
+    /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/perl -T -MCwd=abs_path -e 'my $p = abs_path($ARGV[0]); defined($p) or exit 1; print $p' -- "$1"
+}
+
 [ $# -ge 1 ] || usage
 
 # The gate's runs (sc-26131): SwiftPM checkouts inside this working directory's DerivedData, not the user's shared ones.
@@ -209,6 +217,7 @@ while [ $# -gt 0 ]; do
             literal_re='^[A-Za-z0-9 _.,:+@%=-]*$'
             executable_re='^(/usr/bin|/bin|/usr/local/bin|/opt/homebrew/bin)/[A-Za-z0-9_+.-]+$'
             workspace_re='^[A-Za-z0-9_. /-]+$'
+            case "$value" in '${worktree}/'*) value="$work_dir/${value#'${worktree}/'}" ;; esac
             case "$value" in
                 "$work_dir"/*)
                     rel=${value#"$work_dir"/}
@@ -220,7 +229,16 @@ while [ $# -gt 0 ]; do
                         probe=$(dirname "$probe")
                     done
                     resolves_inside "$rel" || refuse "test_env.$key outside workspace" ;;
-                /*) [[ $value =~ $executable_re ]] && [ -f "$value" ] && [ -x "$value" ] || refuse "test_env.$key executable" ;;
+                /*)
+                    [[ $value =~ $executable_re ]] || refuse "test_env.$key executable"
+                    canonical=$(canonical_executable "$executable_prefix$value") || refuse "test_env.$key executable resolution"
+                    executable_trusted=0
+                    for trusted in "${trusted_executable_roots[@]}"; do
+                        case "$canonical" in "$trusted"/*) executable_trusted=1 ;; esac
+                    done
+                    [ "$executable_trusted" -eq 1 ] || refuse "test_env.$key executable outside trusted system/tool installation roots"
+                    [ -f "$canonical" ] && [ -x "$canonical" ] || refuse "test_env.$key executable"
+                    value=$canonical ;;
                 *) [[ $value =~ $literal_re ]] || refuse "test_env.$key value" ;;
             esac
             test_env+=("TEST_RUNNER_$key=$value"); test_count=$((test_count + 1)); shift ;;

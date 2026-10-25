@@ -41,7 +41,16 @@ public static class TestEnvironment
             && !value.EndsWith("/.", StringComparison.Ordinal) && !value.EndsWith("/..", StringComparison.Ordinal);
     }
 
-    public static IReadOnlyDictionary<string, string> Resolve(IReadOnlyDictionary<string, string> values, string worktree)
+    // Canonical destinations, not merely allowlisted symlink spellings. Homebrew's Intel/ARM Cellar and the .NET
+    // installation are legitimate tool roots; Apple's signed Cryptex aliases are explicit, never all of /System or /usr/local.
+    private static readonly string[] TrustedExecutableRoots = ["/bin", "/usr/bin", "/usr/local/bin", "/usr/local/libexec", "/usr/local/Cellar", "/usr/local/share/dotnet", "/opt/homebrew/bin", "/opt/homebrew/Cellar", "/opt/homebrew/libexec", "/opt/homebrew/Library/Homebrew", "/System/Cryptexes/App/usr/bin", "/System/Volumes/Preboot/Cryptexes/OS/usr/bin"];
+
+    public static IReadOnlyDictionary<string, string> Resolve(IReadOnlyDictionary<string, string> values, string worktree) =>
+        Resolve(values, worktree, SandboxTestRunner.RealPath, TrustedExecutableRoots);
+
+    // Filesystem injection for isolated tests; no configuration or descriptor can change the production roots/resolver.
+    internal static IReadOnlyDictionary<string, string> Resolve(IReadOnlyDictionary<string, string> values, string worktree,
+        Func<string, string> canonicalExecutable, IReadOnlyList<string> trustedExecutableRoots)
     {
         Validate(values);
         var result = new SortedDictionary<string, string>(StringComparer.Ordinal);
@@ -61,8 +70,19 @@ public static class TestEnvironment
                 if (!SandboxTestRunner.RealPath(resolved).StartsWith(root + "/", StringComparison.Ordinal))
                     throw Fail(key, "workspace path resolves outside the selected worktree");
             }
-            else if (resolved.StartsWith('/') && (!File.Exists(resolved) || (File.GetUnixFileMode(resolved) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) == 0))
-                throw Fail(key, "fixed executable does not exist or is not executable");
+            else if (resolved.StartsWith('/'))
+            {
+                try
+                {
+                    resolved = canonicalExecutable(resolved);
+                    if (!trustedExecutableRoots.Any(trusted => resolved.StartsWith(trusted.TrimEnd('/') + "/", StringComparison.Ordinal)))
+                        throw Fail(key, "fixed executable resolves outside trusted system/tool installation roots");
+                    if (!File.Exists(resolved) || (File.GetUnixFileMode(resolved) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) == 0)
+                        throw Fail(key, "fixed executable does not exist or is not executable");
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                { throw Fail(key, "fixed executable cannot be resolved and verified"); }
+            }
             result.Add(key, resolved);
         }
         return result;
