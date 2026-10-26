@@ -1801,11 +1801,24 @@ to the existing hosted executor; nonhosted macOS stays local. Conditional/unknow
 and disagreements cannot fall back to hosted/local execution. A scheme mixing GUI and non-GUI
 new tests is executed wholly on GUI CI. Other stacks and GPU placement are unchanged.
 
+Source-job Git queries use sanitized metadata built before handoff, never the owner's checkout,
+credentials, hooks, remotes or configuration. A verified depth-1 pack is followed by an explicit
+bounded connecting-history pack (at most 4,096 commits); installed object membership determines
+Git's real shallow boundaries, and an older boundary is replaced after deepening. Only reachable
+advertised tags are retained, with annotated tag objects verified and installed separately.
+Native local fixtures prove the initial parent is absent, both complete and still-shallow history,
+and annotated/lightweight `describe --tags` results. The protected share changes the checkout's
+ownership to the source UID before Git runs there; no wildcard `safe.directory` is installed.
+Tags beyond the bounded history are not claimed available.
+
 ### One-time deployment (not performed by unit tests or this change)
 
 The existing `lensworks-guest` registration and its generic labels are **not** proof of its OS
-identity. Relocate its credentialed runner service to an **existing trusted non-GUI collector
-principal**, never `lwrunner`. Its HOME, runner installation/work directory, command files,
+identity. Replace it with **one uniquely named new registration**, never `--replace`, on a
+**dedicated non-GUI collector service principal**, never `lwrunner` or the owner's uid. The
+installer reserves a free uid/gid at or above 500 (502 is forbidden), a private group, disabled
+password, `/usr/bin/false` shell and an ACL-free 0700 HOME; it creates no GUI user or login.
+Its HOME, runner installation/work directory, command files,
 registration keys and artifact publication authority must be readable by that collector alone
 (mode 0700, no allowing ACL entries; existing deny ACLs stay). Its `.runner`, `.credentials` and
 `.credentials_rsaparams` are collector-owned 0600. The helper verifies actual `.runner` metadata
@@ -1822,13 +1835,13 @@ Install `/etc/dark-factory/gui-executor.json` root-owned 0600 with exactly these
 
 ```json
 {
-  "collectorUid": 501,
+  "collectorUid": 503,
   "sourceUid": 502,
   "sourceUser": "lwrunner",
-  "runnerRoot": "/Users/collector/actions-runner",
-  "runnerName": "lensworks-guest",
+  "runnerRoot": "/Users/_factorygui/actions-runner",
+  "runnerName": "factory-gui-unique-deployment-id",
   "collectorRepository": "owner/collector",
-  "stateDirectory": "/Users/collector/gui-state",
+  "stateDirectory": "/Users/_factorygui/gui-state",
   "retiredRunnerRoots": ["/Users/lwrunner/actions-runner"],
   "developer": "/Applications/Xcode.app/Contents/Developer",
   "xcode": "26.5",
@@ -1848,11 +1861,162 @@ its bootstrap. It checks `Aqua` and the actual execution UID before repository c
 Only root-owned helper/config paths select identity or Xcode; repository code cannot select a
 privileged principal. This session does not install this rule or run the helper.
 
-Use **one collector registration** on this machine, labelled `factory-gui-collector` as well as
-`self-hosted`, `macOS`, `ARM64`. All existing GUI workflows/jobs on that machine must migrate to
-this same collector protocol before enabling dispatch; leaving generic unrestricted jobs as
-`lwrunner` would defeat serialization and credential separation. The workflow label itself is
-not the identity boundary: the helper checks the real UIDs and paths.
+Use **one collector registration** on this machine, initially with **only** the unadvertised
+`factory-gui-bootstrap-<first 16 hex of raw plan SHA-256>` label (`--no-default-labels`): no
+`self-hosted`, `macOS`, `ARM64` or final dispatch label. After durable local retirement and
+configuration-setting persistence, owner orchestration promotes that exact registration to
+**only** `factory-gui-collector`; it never adds both labels. Thus neither generic old jobs nor
+queued final-label GUI jobs can land on the collector while old credentials remain. The sealed workflow's
+`runs-on` must select only that custom label. The collector repository must be separate from
+every trusted source repository (the installer rejects case-insensitive overlap): custom labels
+do not stop a source PR from replacing its own workflow and bypassing a wrapper. All four existing LensWorks GUI workflows/jobs
+must have verified immutable migrations to this same collector protocol before the new daemon
+is started; leaving generic unrestricted jobs as `lwrunner` would defeat serialization and
+credential separation. The workflow label itself is not the identity boundary: the helper
+checks the real UIDs and paths.
+
+#### Resumable local installer (fake-tested; not executed on this host)
+
+`scripts/setup-gui-collector.sh --preflight|--dry-run|--apply --plan <plan.json>
+--authority <verified-authority.json>` is the local installation boundary. Preflight and dry-run
+only read: no account, service, filesystem, runner or network changes. Apply requires a separately
+authorized root invocation; it **never invokes sudo**. Owner orchestration may hand off plan,
+authority, trusted helper/source client and checksum-pinned local runner archive from an owner-private 0700
+deployment directory (canonical paths, no symlinks or ACLs; plan/authority 0600, every file owned
+by the invoking `SUDO_UID` or root, none group/other writable). Root-owned existing inputs are
+also accepted. Root opens each handoff through a no-follow directory descriptor and no-follow
+file open, snapshots helper/archive as inert bytes to fresh root-private staging, validates the
+plan binding, then atomically promotes plan/authority into protected state under its lock.
+Keep input paths stable when resuming the same plan. The authority receipt is supplied by the
+owner-side verified orchestration, not a hand-authored substitute for checking GitHub. This
+installer itself neither migrates workflows nor makes GitHub requests.
+
+When the owner cannot read the old account's 0600 authentication files, a separately authorized
+root-only **read-only** inventory is available:
+`scripts/setup-gui-collector.sh --inventory --old-root /Users/lwrunner/actions-runner`.
+It never persists files, starts/stops a service or invokes sudo. It returns only the version,
+`status: "inventory"`, old registration `repository`, and the exact `old` metadata/hash map
+below. All four known authentication files and the single matching LaunchAgent plist are read
+as bounded regular files through no-follow descriptors; symlinks, an out-of-source-HOME root,
+ambiguous services and another UID/path binding are refused. Credential bodies never appear
+in output. Owner orchestration must match the returned repository as well as old ID/name before
+an authenticated remote removal; runner IDs are repository-scoped. This mode is not permission
+to run root during an implementation session.
+
+The version-1 plan names `user`, reserved `uid`, `/Users/<user>` `home`, unique `runnerName`,
+local `archive` and `archiveSha256`, trusted local `helper`/`helperSha256` and
+`sourceJob`/`sourceJobSha256` (hashes of exact reviewed resource bytes), the exact `configuration`
+above, and `old`: exact `runnerRoot`, distinct `runnerId`/`runnerName`, `serviceLabel`, `servicePlist`,
+and `files` SHA-256s for `.runner`, `.credentials`, `.credentials_rsaparams`, `.service` and
+`servicePlist`. The root-promoted, short-lived authority binds `planSha256` (SHA-256 of the
+**exact raw plan-file bytes**, including whitespace), `expiresAt` (epoch, at most an hour ahead),
+`appPermissionsVerified`, `newNameAbsent` and exactly four `migratedWorkflows` entries
+(`path`, SHA-256 `sha256`, `collectorProtocol: true`), pinned to `.github/workflows/` plus
+`inference-adapter.yml`, `live-raw-acceptance.yml`, `rust-catalog-tests.yml` and
+`s47-procedural-ui-tour.yml` (four arbitrary paths do not qualify). These are attestations of actual
+owner-side verification, not permissions inferred from a token's presence.
+
+Apply extracts only checked regular files/directories from the checksum-verified archive into
+a fresh empty staging directory. No downloaded code executes as root. Registration runs as the
+collector, with only its own HOME/fixed PATH and a short-lived registration token read from
+stdin, never a PAT, `--token`, argv, receipt or inherited owner environment. The native input
+is **`ACTIONS_RUNNER_INPUT_TOKEN`**, verified read-only in actions/runner
+`f4a774978d9562d6539be5055c17c0eb970d08df`, `src/Runner.Listener/CommandSettings.cs` lines
+110–139 and `GetToken`; `VSTS_AGENT_INPUT_TOKEN` is not the GitHub runner's protocol.
+A fixed root-owned LaunchDaemon starts `run.sh` as the collector in the system domain; the
+existing `lwrunner` Aqua session and owner's HOME ACLs are untouched. Installed helper is
+0755, config 0600, sudoers 0440 (validated by visudo); the reviewed, checksum-bound non-root
+source client is installed root-owned 0755 at the fixed
+`/usr/local/libexec/dark-factory/factory-gui-source-job`. It is never executed by root and gains
+no sudo rule. The scoped rule grants only the fixed helper, including its existing
+public-configuration operation, never direct config access. Both executable hashes are returned
+in the nonsecret receipt; an installed payload differing from the plan is not overwritten.
+
+The nonsecret atomic receipt is `/var/db/dark-factory/gui-collector/receipt.json` (root 0600,
+parent 0700); an exclusive lock serializes applies. A first apply stops at
+`awaiting-owner-online-verification-old-untouched`. Resume with fresh verified authority
+`online: {runnerId, runnerName, status: "online", labels: ["<bootstrapLabel>"]}` after
+GitHub reports that exact new registration online with its plan-bound bootstrap-only label
+(the receipt returns `bootstrapLabel`). The final dispatch label is refused for this proof
+until a durable `old-retired` stage exists; a later resume may then verify final-only instead. This second apply verifies inventory hashes
+and backs up the exact old service/auth files under root-only `rollback/`, recording
+`old-backup-protected` and returning `awaiting-owner-exact-old-registration-removal` without
+stopping or deleting anything old. **Only after that protected backup** may the owner-side
+orchestrator remove the exact old registration ID; its subsequent `removedOldRunnerId` authorizes
+the third apply's local retirement. An attestation that removal preceded the backup is refused.
+The receipt also returns the exact installed `configurationSha256`. No broad
+runner/service deletion, same-name replacement or GUI-domain bootout occurs. Failure restores
+missing local files from those backups; deleting a GitHub registration is **not** undone by
+restoring credential bytes, so a rollback receipt explicitly requires owner reconciliation.
+It does not claim an automatic remote rollback. An uncertain registration attempt is never
+blindly repeated: reconcile the unique new name/ID before retrying. Installed bytes are never
+silently overwritten.
+
+Registration recovery is bounded and plan-bound, with a gated child process. The receipt
+durably records a fresh random `attemptNonce`, attempt number and `createdAt` with state
+`reserved` **before a process may exist**. The runner's `config.sh` is then started behind a
+pipe gate: it cannot exec until the installer writes a release byte. After spawning, root
+records the child PID and its `ps` start identity and persists state `unreleased`; only then
+does it persist `released` and open the gate. A crash while reserved or unreleased leaves the
+child unable to exec (the pipe reaches EOF when its parent dies). At most two attempts are made
+within one hour.
+
+A retry requires a provably unreleased intent — state `reserved` with no PID, or state
+`unreleased` whose recorded PID/start identity is confirmed dead and not reused — plus fresh
+owner-gateway authority `registrationAbsence`
+`{attemptNonce, runnerName, checkedAt, status: "absent", appPermissionsVerified: true}`. The
+nonce must equal that persisted attempt, the name must be the exact new runner, and the check
+must be no older than five minutes and no earlier than the attempt. The installer also requires
+no local `.runner`/credential files. State `released`, an unknown state, a live unreleased child,
+stale or mismatched proof, present/active status, exhausted budget, an expired window, local
+credentials contradicting absence, and a local registration contradicting remote absence are all
+refused. Once a registration may have POSTed, only owner reconciliation can proceed.
+
+Child liveness is never guessed. Root reads the exact child PID and start identity as
+`ps uid= lstart=`; `process_identity` returns the identity only when the process is live with the
+expected UID and a nonempty start time, returns `None` only for `ps`'s confirmed no-such-process
+answer (exit 1 with empty output), and refuses any other `ps` outcome — permission, an unknown
+exit code, malformed or empty output, or a mismatched UID — as ambiguous. A reused PID is proven
+dead because its live identity differs from the recorded start. The child cannot exec until the
+gate opens and the durable `released` marker; an unverifiable start identity closes the gate and
+waits a bounded time without signalling, and nothing is ever released or registered for it.
+
+When a retryable unstarted intent lacks valid fresh proof, **`--apply` itself exits 0** with
+the structured `registration-reconciliation-required` challenge (the same builder the optional
+read-only `--registration-status --plan … --authority …` mode uses). Generic failures still
+exit 2, so the engine never blindly retries a root RPC after an ordinary error or password
+denial. The challenge mutates nothing and carries `planSha256`, exact `runnerName`/`uid`, the
+protected helper/source-client/configuration hashes, attempt count and first start, and
+`registrationIntent {attemptNonce, createdAt, state, pid, startIdentity,
+localUnstartedVerified}`. `runnerId` is absent because none exists. The gateway may emit absence
+proof only from that real challenge, after verifying the bound identity and a fresh authenticated
+listing made after `createdAt`; the installer accepts it once. A released/unknown state yields a
+generic refusal instead of a challenge, so the gateway refuses without a root retry.
+
+Crash recovery is explicit, not inferred from "no other run exists". The account step writes a
+protected journal intent before creating the private group and before each of the six DS
+attributes, and records each completion. A resume finishes exactly the reserved UID/GID/group and
+user fields that are missing; an existing attribute differing from the reservation, an unrelated
+group with that name or GID, another account's UID, or an existing HOME without this plan's
+reservation is refused, never adopted or clobbered. A crash after any individual side effect
+resumes without duplicating it or registering twice.
+
+Local retirement persists the exact service label, `gui/502` domain, user ID and runner root
+before any bootout. Success is proven only when launchctl reports that exact service absent from
+every domain it could occupy (`gui/502`, `user/502`, `system`); a crash after bootout therefore
+resumes without a second bootout, while an unreadable domain, wrong-domain presence, or any
+other launchctl error stays blocked with old files and the protected backup intact.
+
+Safe local evidence (all commands faked, only temporary files; no .NET build needed):
+
+```sh
+python3 -I tests/test_setup_gui_collector.py
+python3 -I tests/test_setup_gui_collector.py --mutations
+```
+
+The mutation runner changes only an in-memory copy of the installer, requires each named
+mutation to turn its contract RED, then restores the original and requires GREEN. This is not
+live account/service/credential-isolation or remote migration evidence.
 
 Render the immutable workflow with:
 
@@ -1928,3 +2092,106 @@ collector/configuration binding must agree. An environment assertion alone canno
 run in. Owner full-suite runs report these GUI cases skipped for placement, not passed; non-GUI
 SwiftPM and nonhosted macOS native fixtures remain local and unchanged. The fixed helper emits
 that binding automatically for each source command; no per-job approval or manual opt-in is added.
+
+## S6 terminal acceptance (sc-26792, epic sc-26198)
+
+A deterministic/fake test passing is not live acceptance. Keep the immutable source head, build/test XML,
+actual workflow run URLs and returned bound evidence with the terminal story. Do not mark the terminal
+story Done while installation authority or any mandatory live proof is unavailable.
+
+The one-time owner automation is `gui-collector prepare`, then `gui-collector apply` / `resume` against
+its private deployment directory. It generates and verifies the plan, official runner archive checksum,
+source/control workflow migrations and actual runner inventory; do not hand-author an authority receipt.
+The default controller is a dedicated private `dark-factory-gui-control` repository, not the public
+factory repository or a source repository. The controller is reserved from model-authored work and
+write-token issuance. Normal `dark-factory` development remains allowed. The source App key is published
+only by explicit owner deployment into a protected default-branch GitHub Environment, never a plain
+repository secret, source process, runner service or owner-PAT fallback. This is a disclosed one-time
+credential publication, not an action performed by unit tests.
+
+The initial source migration targets the default branch; the non-default-PR request bridge is
+excluded there, so an absent default publisher cannot leave the migration waiting on its own
+pending bridge status. Actual failed or pending pre-merge checks still block the exact compiled
+owner migration. After root installation, configuration pinning and final-label promotion, the
+owner CLI automatically reconciles that migration PR's authenticated **merge commit**, never its
+PR head or the latest unrelated default commit. It journals the four exact push workflow run IDs
+and attempts before cancel/rerun requests, waits for fresh-environment reruns, and requires each
+executed source job, its actual-head status and the head's controller/check CI to pass. Missing
+runs, skipped source jobs and no reported CI are not readiness. An uncertain POST is observed on
+resume, not blindly repeated. The journal keeps a thirteen-hour bound (four serialized source
+jobs of at most 180 minutes plus dispatch/upload time); resume does not reset it. No root/worker
+lock is held during this wait, and deployment is not marked complete without the recorded proof.
+No manual GitHub rerun click or general CI bypass is part of bootstrap.
+
+Genuine installation prerequisites include root authorization for the reviewed fixed bootstrap and
+workers' v6 helpers, Gate App Actions read/write plus the installation's approval, and access to the
+private controller repository. An owner without those authorities cannot complete live acceptance;
+the automation must report its exact failing boundary rather than repeatedly retry sudo or substitute
+the owner's runtime credentials. Existing Pause/Stop and claim/ledger behavior are unchanged.
+
+### Safe verification
+
+Run `dotnet build` and `dotnet test -- --report-xunit-xml` with a fresh isolated PostgreSQL 17 cluster and
+`ConnectionStrings__Ledger` pointing only to that cluster. Never change the production ledger or its
+roles to make tests pass. `GuiCollectorSetupTests` requires structured executed-case counters and zero
+skips/failures/errors from the installer, source client and dispatcher Python contracts; the mutation
+contracts execute in-memory and restore the original production module after every case.
+
+Non-GUI SwiftPM/Cargo/xUnit/nonhosted macOS fixtures remain local. Native GUI cases require the actual
+protected `lwrunner` binding; an owner run's skip is not a pass, and must not be bypassed with an
+asserted environment variable.
+
+### Authorized live commands (not run by the safe suite)
+
+Stop competing factory worker sessions first. The headless probes fail fast unless they hold every
+configured slot lock before any readiness/helper command. After explicit live opt-in, the test creates
+and removes its own nonsecret 0600 probe in an owner-private 0700 directory; an existing private file
+can optionally be supplied through `FACTORY_SANDBOX_OWNER_PROBE`. No owner-home ACL is changed.
+Run the opted-in metadata/open-only/cleanup tests:
+
+```sh
+FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 \
+  dotnet test --project tests/DarkFactory.Orchestrator.Tests -- \
+  --filter-method '*Headless_worker_has_own_manager_security_context_and_cannot_open_existing_owner_private_files' \
+  --report-xunit-xml
+FACTORY_SANDBOX_LIVE=1 Worker__Slots=2 \
+  dotnet test --project tests/DarkFactory.Orchestrator.Tests -- \
+  --filter-method '*Headless_detached_worker_cleanup_preserves_another_configured_slots_running_worker' \
+  --report-xunit-xml
+```
+
+After the protected collector and exact sealed workflows are actually deployed, the fixture publisher
+creates the five campaign base/head pairs and their manifests from real published immutable commits.
+No owner has to assemble SHA/JSON input by hand:
+
+```sh
+FACTORY_E2E=1 FACTORY_E2E_S6_PROVISION=1 \
+  dotnet test --project tests/DarkFactory.AcceptanceTests -- \
+  --filter-method '*HeadlessRemoteAcceptanceTests.S6_AT*' --report-xunit-xml
+FACTORY_E2E=1 dotnet test --project tests/DarkFactory.AcceptanceTests -- \
+  --filter-class '*GuiCollectorRecoveryAcceptanceTests' --report-xunit-xml
+```
+
+The default source is `<configured-controller-owner>/dark-factory-s6-fixtures`, automatically created
+with its sealed hosted workflow by owner deployment; `FACTORY_E2E_S6_FIXTURE_REPO` is an optional
+explicit override to an equally isolated, allowlisted scaffold. `FACTORY_E2E_S6_CAMPAIGN=<32-lowercase-hex>`
+resumes the same fixture refs. The publisher verifies sealed
+workflow/source authority before writing, records actual base/head SHAs, reuses unchanged files, and
+refuses cleanup of tampered receipts or moved refs. The mandatory matrix covers hosted non-GUI iOS,
+GUI iOS UI, macOS app-host, actual native child-process environment with/without declarations, and a
+real failing app host. Optional VCS-authentication negatives are not an extra epic resource requirement.
+
+The native environment test opens an existing, helper-verified collector credential path without
+reading bytes and requires `EACCES`/`EPERM`; `ENOENT` is not denial evidence. Two concurrent real GUI
+checks verify distinct fresh workspaces and nonoverlapping trusted lease intervals. The fixed recovery
+probe separately proves a valid unclean journal is reconciled, a controlled uncertain-cleanup fixture
+blocks replacement source execution, and normal protected reconciliation restores fresh reuse. It
+restores only its own exact collector-owned non-process fixture, never a real root-owned command
+record or worker quarantine. Its durable intent and OS lock make an interrupted probe recoverable by
+the next invocation. This is explicitly **crash-equivalent journal evidence, not a claimed SIGKILL**.
+
+An OS-agent baseline is captured before source execution and verified as root-owned bounded evidence;
+cleanup permits only exact baselined root-owned OS executable/full-command respawns under launchd (or
+the exact three observed per-user agents). No blanket `/System/Library`, name-only or parent-only
+exemption is a cleanup proof. The approved trusted-CI residual—persistent same-user GUI/home/launchd
+state—remains; this is not a malicious-code cleanroom.

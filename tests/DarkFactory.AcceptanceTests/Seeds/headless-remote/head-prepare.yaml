@@ -1,0 +1,7 @@
+version: 1
+steps:
+  - name: make-fixture-helper-executable
+    argv: [/bin/chmod, '0755', '${worktree}/.factory-e2e/probe-env']
+test_env:
+  REPO_MODE: head
+  REPO_HELPER: '${worktree}/.factory-e2e/probe-env'

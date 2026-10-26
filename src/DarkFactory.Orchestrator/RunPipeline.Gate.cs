@@ -654,32 +654,37 @@ public sealed partial class RunPipeline
     /// labelled not the PR head (<see cref="CodeGraphRiskReader"/>); a recorded overlay CodeGraph no longer uses
     /// (<see cref="CodeGraphRisk.OverlayUnusable"/>, e.g. stale) is requested again once. The hotspots are read from the default branch.
     /// A call that fails transiently is retried by the reader (<see cref="CodeGraphRiskReader.Attempts"/>) inside this backstop.
-    /// The whole read is bounded by <c>Gate:CiTimeoutMinutes</c> (a backstop for a CodeGraph that hangs): cut off there, every file has
-    /// no CodeGraph data. Whatever is missing is recorded per file and never holds the gate.
+    /// The whole read is bounded by <c>Gate:CiTimeoutMinutes</c> (a backstop for a CodeGraph that hangs): cut off there, only unanswered
+    /// inputs have no CodeGraph data. Usable and blocking observations survive refreshes and deadlines within this evaluation.
     /// </summary>
     private async Task<CodeGraphRisk> CodeGraphRiskAsync(Run run, PullFacts pull, string diff, CodeGraphRiskReader reader, CancellationToken ct)
     {
         var files = MergeGate.TouchedFiles(diff);
         using var timeout = new CancellationTokenSource(Gate.CiTimeout, GateTime);
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
-        CodeGraphRisk risk;
+        var risk = new CodeGraphRisk(pull.HeadSha, [], [], []);
+        var timeoutReason = $"CodeGraph did not answer within {Gate.CiTimeout} (Gate:CiTimeoutMinutes)";
+        void Interrupted(CodeGraphRisk partial) => risk = CodeGraphRisk.None(pull.HeadSha, files, timeoutReason)
+            .PreserveObservations(partial).Judged(files).PreserveObservations(risk);
         try
         {
             var hotspots = new HotspotCache();
             var overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct, wait: bounded.Token);
             await ThrowIfControlledAsync(run.Item, ct);
-            risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, files, bounded.Token, hotspots);
+            risk = (await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, files, bounded.Token, hotspots, Interrupted))
+                .Judged(files).PreserveObservations(risk);
             if (risk.OverlayUnusable)
             {
                 // CodeGraph no longer uses the overlay it had of the head (e.g. it went stale once the default branch moved): asked again once.
                 overlay = await HeadOverlayAsync(run, pull, reader.Overlays, "gate", ct, requestAgain: true, wait: bounded.Token);
                 await ThrowIfControlledAsync(run.Item, ct);
-                risk = await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, files, bounded.Token, hotspots);
+                risk = (await reader.ReadAsync(run.Repo, pull.HeadSha, overlay, files, bounded.Token, hotspots, Interrupted))
+                    .Judged(files).PreserveObservations(risk);
             }
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            risk = CodeGraphRisk.None(pull.HeadSha, files, $"CodeGraph did not answer within {Gate.CiTimeout} (Gate:CiTimeoutMinutes)");
+            risk = CodeGraphRisk.None(pull.HeadSha, files, timeoutReason).PreserveObservations(risk);
         }
         log.WriteLine($"[gate] {risk.Describe()}");
         return risk;

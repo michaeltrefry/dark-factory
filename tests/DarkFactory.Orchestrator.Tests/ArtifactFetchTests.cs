@@ -4,6 +4,8 @@ using System.IO.Compression;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using DarkFactory.Orchestrator.Prepare;
 using DarkFactory.Orchestrator.Worker;
 
@@ -124,6 +126,19 @@ public sealed class ArtifactFetchTests : IDisposable
         return memory.ToArray();
     }
 
+    internal static byte[] Tar(params TarEntry[] entries)
+    {
+        using var memory = new MemoryStream();
+        using (var tar = new TarWriter(memory, leaveOpen: true))
+        {
+            foreach (var entry in entries)
+            {
+                tar.WriteEntry(entry);
+            }
+        }
+        return memory.ToArray();
+    }
+
     internal static byte[] TarGz(params TarEntry[] entries)
     {
         using var memory = new MemoryStream();
@@ -212,6 +227,105 @@ public sealed class ArtifactFetchTests : IDisposable
         Assert.Equal(path, await other.TryGetAsync(artifact, CancellationToken.None));
         Assert.Equal(1, other.Verifications);
         Assert.Single(_server.Requests);
+    }
+
+    private static byte[] SizedArtifact(ArtifactUnpack unpack) => unpack switch
+    {
+        ArtifactUnpack.None => "abcdef"u8.ToArray(),
+        ArtifactUnpack.Zip => Zip(("a", "abc", 0x81A4), ("b", "def", 0x81A4)),
+        ArtifactUnpack.Tar => Tar(File("a", "abc"), File("b", "def")),
+        ArtifactUnpack.TarGz => TarGz(File("a", "abc"), File("b", "def")),
+        _ => throw new ArgumentOutOfRangeException(nameof(unpack)),
+    };
+
+    public static TheoryData<ArtifactUnpack, bool, int> CurrentLimits => new()
+    {
+        { ArtifactUnpack.None, false, 0 }, { ArtifactUnpack.None, false, 1 }, { ArtifactUnpack.None, false, 2 },
+        { ArtifactUnpack.Zip, false, 0 }, { ArtifactUnpack.Zip, false, 1 }, { ArtifactUnpack.Zip, false, 2 },
+        { ArtifactUnpack.Tar, false, 0 }, { ArtifactUnpack.Tar, false, 1 }, { ArtifactUnpack.Tar, false, 2 },
+        { ArtifactUnpack.TarGz, false, 0 }, { ArtifactUnpack.TarGz, false, 1 }, { ArtifactUnpack.TarGz, false, 2 },
+        { ArtifactUnpack.Zip, true, 0 }, { ArtifactUnpack.Zip, true, 1 }, { ArtifactUnpack.Zip, true, 2 },
+        { ArtifactUnpack.Tar, true, 0 }, { ArtifactUnpack.Tar, true, 1 }, { ArtifactUnpack.Tar, true, 2 },
+        { ArtifactUnpack.TarGz, true, 0 }, { ArtifactUnpack.TarGz, true, 1 }, { ArtifactUnpack.TarGz, true, 2 },
+    };
+
+    [Theory]
+    [MemberData(nameof(CurrentLimits))]
+    public async Task Current_recipe_limits_apply_equally_to_fresh_warm_and_memoized_artifacts(ArtifactUnpack unpack, bool unpackedLimit, int cacheState)
+    {
+        // 0: no entry; 1: a previous process's entry; 2: this cache's fully verified memoized hit.
+        var body = SizedArtifact(unpack);
+        const string url = "https://files.example/tool";
+        _server.Serve(url, body);
+        var artifact = Artifact(url, body, unpack, maxBytes: body.Length, maxUnpacked: 6);
+        var cache = new ArtifactCache(ArtifactCache.RootOf(_root));
+        var fetcher = new ArtifactFetcher(new HttpClient(_server), _resolver, cache);
+        string? cachedPath = null;
+        if (cacheState != 0)
+        {
+            cachedPath = await fetcher.EnsureAsync(artifact, null, CancellationToken.None); // exact limits pass
+            var manifest = JsonSerializer.Deserialize<CacheManifest>(System.IO.File.ReadAllText(Path.Combine(cache.EntryOf(artifact), ArtifactCache.ManifestName)))!;
+            Assert.Equal((long)body.Length, manifest.DownloadedBytes);
+            if (cacheState == 1)
+            {
+                cache = new ArtifactCache(cache.Root);
+                fetcher = new ArtifactFetcher(new HttpClient(_server), _resolver, cache);
+            }
+        }
+        var stricter = unpackedLimit ? artifact with { MaxUnpackedBytes = 5 } : artifact with { MaxBytes = body.Length - 1 };
+
+        var refused = await Assert.ThrowsAsync<ArtifactFetchException>(() => fetcher.EnsureAsync(stricter, null, CancellationToken.None));
+
+        Assert.Contains(unpackedLimit ? "max_unpacked_bytes" : "max_bytes", refused.Message);
+        Assert.Single(_server.Requests); // warm hits reject without another download
+        if (cacheState != 0)
+        {
+            Assert.True(Directory.Exists(cache.EntryOf(artifact))); // the entry is valid, just outside this recipe's limits
+            Assert.Equal(cachedPath, await fetcher.EnsureAsync(artifact, null, CancellationToken.None));
+            Assert.Single(_server.Requests);
+            Assert.Equal(1, cache.Verifications); // including the memoized rejection: no rehash required
+        }
+        else
+        {
+            Assert.Empty(Directory.EnumerateFileSystemEntries(cache.Root));
+            Assert.NotEmpty(await fetcher.EnsureAsync(artifact, null, CancellationToken.None)); // boundary passes fresh too
+            Assert.Equal(2, _server.Requests.Count);
+        }
+    }
+
+    [Theory]
+    [InlineData(ArtifactUnpack.None, "missing")]
+    [InlineData(ArtifactUnpack.Zip, "missing")]
+    [InlineData(ArtifactUnpack.Tar, "null")]
+    [InlineData(ArtifactUnpack.TarGz, "negative")]
+    public async Task A_legacy_or_invalid_download_size_is_refetched_never_trusted(ArtifactUnpack unpack, string damage)
+    {
+        var body = SizedArtifact(unpack);
+        const string url = "https://files.example/tool";
+        _server.Serve(url, body);
+        var artifact = Artifact(url, body, unpack);
+        var cache = new ArtifactCache(ArtifactCache.RootOf(_root));
+        var fetcher = new ArtifactFetcher(new HttpClient(_server), _resolver, cache);
+        var path = await fetcher.EnsureAsync(artifact, null, CancellationToken.None);
+        var manifestPath = Path.Combine(cache.EntryOf(artifact), ArtifactCache.ManifestName);
+        var manifest = JsonNode.Parse(System.IO.File.ReadAllText(manifestPath))!.AsObject();
+        if (damage == "missing")
+        {
+            manifest.Remove("downloaded_bytes");
+        }
+        else
+        {
+            manifest["downloaded_bytes"] = damage == "null" ? null : JsonValue.Create(-1L);
+        }
+        System.IO.File.WriteAllText(manifestPath, manifest.ToJsonString());
+        System.IO.File.SetLastWriteTimeUtc(manifestPath, DateTime.UtcNow.AddMinutes(-3));
+
+        Assert.Null(await cache.TryGetAsync(artifact, CancellationToken.None));
+        Assert.False(Directory.Exists(cache.EntryOf(artifact)));
+        Assert.Equal(path, await fetcher.EnsureAsync(artifact, null, CancellationToken.None));
+        Assert.Equal(2, _server.Requests.Count);
+        var repaired = JsonSerializer.Deserialize<CacheManifest>(System.IO.File.ReadAllText(manifestPath))!;
+        Assert.Equal((long)body.Length, repaired.DownloadedBytes);
     }
 
     [Fact]
@@ -380,6 +494,74 @@ public sealed class ArtifactFetchTests : IDisposable
             Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead,
                 System.IO.File.GetUnixFileMode(Path.Combine(sdk, "sdk/include/dng.h")));
         }
+    }
+
+    [Theory]
+    [InlineData(ArtifactUnpack.Tar, ".")]
+    [InlineData(ArtifactUnpack.Tar, "./")]
+    [InlineData(ArtifactUnpack.TarGz, ".")]
+    [InlineData(ArtifactUnpack.TarGz, "./")]
+    public async Task A_tar_directory_root_marker_is_skipped_and_its_children_are_unpacked(ArtifactUnpack unpack, string rootName)
+    {
+        TarEntry[] entries = [new PaxTarEntry(TarEntryType.Directory, rootName), File("./lib/a.txt", "a")];
+        var body = unpack == ArtifactUnpack.Tar ? Tar(entries) : TarGz(entries);
+        const string url = "https://files.example/root-tar";
+        _server.Serve(url, body);
+        var artifact = Artifact(url, body, unpack);
+
+        var path = await Fetcher().EnsureAsync(artifact, null, CancellationToken.None);
+
+        Assert.Equal("a", System.IO.File.ReadAllText(Path.Combine(path, "lib/a.txt")));
+        var manifest = JsonSerializer.Deserialize<CacheManifest>(System.IO.File.ReadAllText(Path.Combine(Path.GetDirectoryName(path)!, ArtifactCache.ManifestName)))!;
+        Assert.Equal(["lib", "lib/a.txt"], manifest.Entries.Select(e => e.Path)); // root never becomes an entry
+        Assert.Equal(path, await Fetcher().EnsureAsync(artifact, null, CancellationToken.None));
+        Assert.Single(_server.Requests);
+    }
+
+    public static TheoryData<ArtifactUnpack, TarEntryType, string> UnsafeTarRoots
+    {
+        get
+        {
+            var data = new TheoryData<ArtifactUnpack, TarEntryType, string>();
+            foreach (var unpack in new[] { ArtifactUnpack.Tar, ArtifactUnpack.TarGz })
+            {
+                foreach (var type in new[] { TarEntryType.RegularFile, TarEntryType.SymbolicLink, TarEntryType.HardLink })
+                {
+                    data.Add(unpack, type, ".");
+                    data.Add(unpack, type, "./");
+                }
+                foreach (var name in new[] { "../", "./../", "./../escape", "/" })
+                {
+                    data.Add(unpack, TarEntryType.Directory, name);
+                }
+            }
+            return data;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(UnsafeTarRoots))]
+    public async Task Only_a_directory_root_marker_is_skipped_never_a_root_file_link_or_traversal(ArtifactUnpack unpack, TarEntryType type, string name)
+    {
+        var entry = new PaxTarEntry(type, name);
+        if (type == TarEntryType.RegularFile)
+        {
+            entry.DataStream = new MemoryStream("x"u8.ToArray());
+        }
+        if (type is TarEntryType.SymbolicLink or TarEntryType.HardLink)
+        {
+            entry.LinkName = "../escape";
+        }
+        var body = unpack == ArtifactUnpack.Tar ? Tar(entry) : TarGz(entry);
+        const string url = "https://files.example/unsafe-root-tar";
+        _server.Serve(url, body);
+
+        var refused = await Assert.ThrowsAsync<ArtifactFetchException>(() =>
+            Fetcher().EnsureAsync(Artifact(url, body, unpack), null, CancellationToken.None));
+
+        Assert.Contains("not a plain relative path", refused.Message);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ArtifactCache.RootOf(_root)));
+        Assert.False(System.IO.File.Exists(Path.Combine(_root, "escape")));
     }
 
     public static TheoryData<string, byte[], ArtifactUnpack, string> BadArchives => new()

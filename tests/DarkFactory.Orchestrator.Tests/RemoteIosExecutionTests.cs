@@ -91,6 +91,8 @@ class NativePrincipal:
         self.filesystem=filesystem
         self.root,self.worktree,self.home=root,worktree,root/'native-home'
         self.home.mkdir();(self.home/'tmp').mkdir();self.profile=root/'native.sb'
+        developer='/Applications/Xcode.app/Contents/Developer'
+        self.env={'DEVELOPER_DIR':developer,'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(self.home),'CFFIXED_USER_HOME':str(self.home),'TMPDIR':str(self.home/'tmp'),'SWIFTPM_MODULECACHE_OVERRIDE':str(self.home/'module-cache'),'xcrun_nocache':'1'}
         self.registry_endpoints([])
     def registry_endpoints(self,endpoints):
         self.profile.write_text(r.sandbox_profile(self.root,[self.home,self.worktree],endpoints)+('' if self.filesystem else '\n(allow file-read* file-write*)\n'))
@@ -98,9 +100,23 @@ class NativePrincipal:
         developer='/Applications/Xcode.app/Contents/Developer'
         tools={'/usr/bin/python3':developer+'/usr/bin/python3','/usr/bin/swift':developer+'/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift'}
         args=[tools.get(args[0],args[0]),*args[1:]]
-        result=r.subprocess.run(['/usr/bin/sandbox-exec','-f',str(self.profile),*args],cwd=cwd,env={'DEVELOPER_DIR':developer,'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(self.home),'CFFIXED_USER_HOME':str(self.home),'TMPDIR':str(self.home/'tmp'),'SWIFTPM_MODULECACHE_OVERRIDE':str(self.home/'module-cache'),'xcrun_nocache':'1'},stdin=r.subprocess.DEVNULL,capture_output=True)
+        result=r.subprocess.run(['/usr/bin/sandbox-exec','-f',str(self.profile),*args],cwd=cwd,env=self.env,stdin=r.subprocess.DEVNULL,capture_output=True)
         return result.returncode,result.stdout.decode()+result.stderr.decode()
 class Fixtures(unittest.TestCase):
+    def test_native_principal_carries_installed_git_configuration_to_source_commands(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);worktree=root/'base';worktree.mkdir()
+            principal=NativePrincipal(root,worktree)
+            principal.env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_SYSTEM':'/dev/null','GIT_CONFIG_GLOBAL':str(principal.home/'.factory-gitconfig')})
+            with patch.object(r.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=b'',stderr=b'')) as native:
+                principal.run(['/usr/bin/git','--version'],worktree)
+            environment=native.call_args.kwargs['env']
+            self.assertEqual('1',environment.get('GIT_CONFIG_NOSYSTEM'))
+            self.assertEqual('/dev/null',environment.get('GIT_CONFIG_SYSTEM'))
+            self.assertEqual(str(principal.home/'.factory-gitconfig'),environment.get('GIT_CONFIG_GLOBAL'))
+            self.assertEqual(str(principal.home),environment.get('HOME'))
+
     def parse(self, value):
         return r.parse_execution(json.dumps(value), REQUEST)
     def test_test_environment_validation_and_job_local_resolution(self):
@@ -417,7 +433,9 @@ class Fixtures(unittest.TestCase):
             for execution,expected in [('', ['base','head']),(json.dumps({'side':'base'}),['base']),(json.dumps({'side':'head'}),['head'])]:
                 output=pathlib.Path(d)/'output';output.write_text('')
                 r.subprocess.run([sys.executable,'-I','-c',script],env={'EXECUTION':execution,'GITHUB_OUTPUT':str(output)},check=True,stdin=r.subprocess.DEVNULL,capture_output=True)
-                self.assertEqual(expected,json.loads(output.read_text().split('=',1)[1]))
+                outputs=dict(line.split('=',1) for line in output.read_text().splitlines())
+                self.assertEqual(expected,json.loads(outputs['sides']))
+                self.assertEqual(expected,json.loads(outputs['archive_sides']))
         self.assertTrue('side: ${{ fromJSON(needs.sources.outputs.sides) }}' in WORKFLOW and 'factory-ios-result-${{ inputs.nonce }}-${{ matrix.side }}' in WORKFLOW and 'EXECUTION_BUDGET_SECONDS: ${{ inputs.execution_budget_seconds }}' in WORKFLOW and 'EXECUTION_DEADLINE_UNIX_SECONDS: ${{ inputs.execution_deadline_unix_seconds }}' in WORKFLOW)
     def test_offline_resolution_is_source_only_after_mirror_install_before_build(self):
         payload,calls,_=self.run_main(hydrated=True)
@@ -503,7 +521,7 @@ class Fixtures(unittest.TestCase):
             if sys.platform=='darwin' and pathlib.Path('/usr/bin/swift').exists():
                 home=root/'isolated-home';home.mkdir()
                 class Principal:
-                    def __init__(self):self.home=home
+                    def __init__(self):self.home=home;self.env={}
                     def share(self,path):pass
                     def run(self,args,cwd,**kwargs):
                         result=r.subprocess.run(args,cwd=cwd,env={'PATH':'/usr/bin:/bin','HOME':str(home),'CFFIXED_USER_HOME':str(home)},stdin=r.subprocess.DEVNULL,capture_output=True)

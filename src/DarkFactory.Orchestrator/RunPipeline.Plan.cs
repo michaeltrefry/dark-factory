@@ -834,6 +834,8 @@ public sealed partial class RunPipeline
     private IReadOnlyList<RepoRef> PlanRepositories(Run run, PlanProgress progress = PlanProgress.Fresh)
     {
         var repos = RepoResolver.ResolveAll(run.Story.Description, run.Repo);
+        foreach (var repo in repos)
+            if (FactoryRepositoryPolicy.WorkRefusal(repo, _reservedController) is { } reserved) throw new WorkerFailedException(reserved);
         var unconfigured = repos.Where(r => !_configuredRepos.Any(c => c.Is(r)))
             .Select(r => r.FullName).ToList();
         if (unconfigured.Count > 0)

@@ -131,6 +131,56 @@ public class SandboxReadinessTests
         Assert.False(workerLock.IsHeld);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Readiness_reconciles_quarantine_under_its_slot_lock_before_any_normal_probe(bool uncertain)
+    {
+        var calls = Path.Combine(_dir, "reconciliation-calls");
+        var failure = Path.Combine(_dir, "cleanup-uncertain");
+        var repo = RepoText(CurrentAllowlist).Replace(SandboxSupport.ProtocolPrelude, $$"""
+            protocol=$1
+            nonce=$2
+            shift 2
+            printf 'factory-bootstrap %s\n' "$nonce"
+            echo "$protocol" >> '{{calls}}'
+            if [ "$protocol" = __factory_cleanup ]; then
+                while IFS= read -r line; do [ -z "$line" ] && break; done
+                [ ! -e '{{failure}}' ] || exit 78
+                rm -- "$0.quarantine"
+                exit 0
+            fi
+            [ ! -e "$0.quarantine" ] || exit 78
+            """ + "\n");
+        var helper = SandboxSupport.Executable(_dir, "reconcile-helper", Installed(repo));
+        var workerLock = WorkerLock.For(Directory.CreateDirectory(Path.Combine(_dir, "reconcile-root")).FullName);
+        var locks = Path.Combine(_dir, "reconcile-locks");
+        var sandbox = new WorkerSandbox(Environment.UserName, helper, SandboxSupport.LockProbingSudo(_dir, workerLock, locks), repo) { Lock = workerLock };
+        File.WriteAllText(helper + ".quarantine", "pending-root-proof");
+        var other = Path.Combine(_dir, "other-slot.quarantine");
+        File.WriteAllText(other, "other-slot-held");
+        if (uncertain) File.WriteAllText(failure, "unreadable inventory");
+
+        if (uncertain)
+        {
+            await Assert.ThrowsAsync<FactoryUnavailableException>(() => sandbox.EnsureReadyAsync(Claude(), CancellationToken.None));
+            Assert.Equal("pending-root-proof", File.ReadAllText(helper + ".quarantine"));
+            Assert.Equal(["__factory_cleanup"], File.ReadAllLines(calls));
+            Assert.Equal(["held"], File.ReadAllLines(locks));
+            Assert.False(File.Exists(Ran));
+        }
+        else
+        {
+            await sandbox.EnsureReadyAsync(Claude(), CancellationToken.None);
+            Assert.False(File.Exists(helper + ".quarantine"));
+            Assert.Equal(["__factory_cleanup", "__factory_run", "__factory_run"], File.ReadAllLines(calls));
+            Assert.Equal(["held", "held", "held"], File.ReadAllLines(locks));
+            Assert.True(File.Exists(Ran));
+        }
+        Assert.Equal("other-slot-held", File.ReadAllText(other));
+        Assert.False(workerLock.IsHeld);
+    }
+
     /// <summary>
     /// An installed helper that is not the repo's helper after setup's two edits fails start-up before it ever runs (an older
     /// one may lack the uid sweep's guards), naming the reinstall command.

@@ -217,6 +217,7 @@ public static class FactoryCli
         return new RootCommand("Dark Factory orchestrator")
         {
             IosNewTestsCli.Build(),
+            GuiCollectorCli.Build(),
             runCommand,
             recoverCommand,
             new Command("recovery", "Repository hot-file recovery: read-only status, and the human re-arm of an escalated incident")

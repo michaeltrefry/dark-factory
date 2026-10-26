@@ -27,6 +27,11 @@ internal static class SwiftSeeds
     /// <summary>Where the runbook puts <see cref="PackageSeed"/> in the sandbox.</summary>
     public const string PackageDir = "e2e-swift";
 
+    /// <summary>The manifest path that qualifies every SwiftPM result the live seeds expect.</summary>
+    public const string PackageManifest = PackageDir + "/Package.swift";
+
+    private static string PackageTestKey(string runtimeId) => SwiftNewTests.TestKey(PackageManifest, runtimeId);
+
     /// <summary>Where the runbook puts <see cref="IosSeed"/> in the iOS repository (<c>FACTORY_E2E_P5_IOS_DIR</c> overrides it).</summary>
     public const string IosDir = "e2e-ios";
 
@@ -51,7 +56,8 @@ internal static class SwiftSeeds
     /// <summary>
     /// P5-AT2/P5-AT5's change (<paramref name="id"/>: this run's own, so the files are new on every base): a source file of the
     /// package with a new function, and an XCTest test of it. On the base the function does not exist, so the test does not compile
-    /// there (<see cref="NewTestsCheck.NotBuilt"/>); on the head it passes. Its id as the SwiftPM strategy names it.
+    /// there (<see cref="NewTestsCheck.NotBuilt"/>); on the head it passes. TestId is the package-qualified ledger/result key,
+    /// not a native filter: every P5-AT2/P5-AT5 result lookup must retain the package identity.
     /// </summary>
     public static (string Source, string SourceText, string Test, string TestText, string TestId) MergingChange(string id) =>
         ($"{PackageDir}/Sources/DfE2eSwift/P{id}.swift",
@@ -70,9 +76,10 @@ internal static class SwiftSeeds
             }
 
             """,
-            $"{PackageTarget}.P{id}Tests/testDoubles");
+            PackageTestKey($"{PackageTarget}.P{id}Tests/testDoubles"));
 
-    /// <summary>P5-AT6's test: a Swift Testing test asserting nothing the change does, so it passes on the base; never merged.</summary>
+    /// <summary>P5-AT6's test: a Swift Testing test asserting nothing the change does, so it passes on the base; never merged.
+    /// TestId is the package-qualified result key used by its rejection lookup and reason assertion.</summary>
     public static (string Test, string TestText, string TestId) AlreadyPassing =>
         ($"{PackageDir}/Tests/{PackageTarget}/E2eAlreadyPassing.swift",
             """
@@ -84,7 +91,7 @@ internal static class SwiftSeeds
             }
 
             """,
-            $"{PackageTarget}.e2eAlreadyPassesOnTheBase()");
+            PackageTestKey($"{PackageTarget}.e2eAlreadyPassesOnTheBase()"));
 
     // A plain Regex, not [GeneratedRegex]: the gateway lint compiles this project's sources without its source generators.
     private static readonly Regex CountPattern = new(@"static let count = (\d+)", RegexOptions.CultureInvariant);
@@ -318,7 +325,12 @@ internal static class SwiftLive
     /// </summary>
     public static (string? Platform, string ProductType)? TargetOf(IReadOnlyDictionary<string, string> pbxprojs, string testId)
     {
-        var name = testId[..testId.IndexOf('/')];
+        // SwiftPM result keys are not Xcode ids, even when their runtime id contains a slash. Never strip their package
+        // identity and count them as an Xcode/iOS execution proof. Unqualified ids without a target separator are not Xcode either.
+        if (SwiftNewTests.RuntimeId(testId) != testId) return null;
+        var separator = testId.IndexOf('/');
+        if (separator <= 0) return null;
+        var name = testId[..separator];
         foreach (var (path, text) in pbxprojs.OrderBy(p => p.Key, StringComparer.Ordinal))
         {
             var project = XcodeProject.Parse(path[..^"/project.pbxproj".Length], text);

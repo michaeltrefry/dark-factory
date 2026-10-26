@@ -1212,6 +1212,55 @@ public class GateCloneTests : IDisposable
     }
 
     [Fact]
+    public async Task A_direct_run_whose_program_cannot_start_leaves_no_protection_marker_and_the_worktree_is_reusable()
+    {
+        var (unused, sha) = await ShRunner();
+        var git = Workspace();
+        // The program cannot be started at all (no such executable): the run's own protection marker must not survive it.
+        var runner = new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(1))
+        {
+            DirectStartForTest = _ => throw new System.ComponentModel.Win32Exception(127, "no such program"),
+        };
+        var step = new TestStep(TestPhase.Build, "/nonexistent/df-missing-tool", ["--version"]) { CaptureOutput = "build" };
+        var report = await runner.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [], [step], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+
+        Assert.Equal(TestRunStatus.BuildFailed, report.Status);
+        Assert.Contains("127", report.Log);
+        // No marker is left: the next run of the same worktree is not refused as protected.
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name), "*.factory-test-process", SearchOption.AllDirectories));
+        // The worktree is reusable: the next run reaches it (a protected worktree is refused by PrepareCommitAsync).
+        var again = new SandboxTestRunner(git, slots: null, TimeSpan.FromMinutes(1));
+        var second = await again.RunAsync(Repo, new TestRunSpec("gate-sc-1-base", sha, null, [], [],
+            [new TestStep(TestPhase.Build, "/bin/sh", ["-c", "exit 0"])], new SwiftNewTests(), NewTestsCheck.NewResultsDirectory()), CancellationToken.None);
+        Assert.NotEqual(TestRunStatus.BuildFailed, second.Status);
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(_root, "work", "worktrees", Repo.Owner, Repo.Name), "*.factory-test-process", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task An_uncertain_direct_process_keeps_its_protection_marker_and_another_runs_marker_is_never_removed()
+    {
+        var worktree = Path.Combine(_root, "marker-ownership");
+        Directory.CreateDirectory(worktree);
+        var mine = SandboxTestRunner.WriteOwnedMarker(worktree, "Test command: mine; termination not yet confirmed.");
+        try
+        {
+            // A marker this run did not write is never removed by it (another run's protection, or a root quarantine beside it).
+            SandboxTestRunner.ReleaseOwnedMarker(worktree, "some-other-runs-token");
+            Assert.True(File.Exists(DirectTestProcess.Marker(worktree)));
+            // This run's own marker is removed by its owner alone.
+            SandboxTestRunner.ReleaseOwnedMarker(worktree, mine);
+            Assert.False(File.Exists(DirectTestProcess.Marker(worktree)));
+            // Removing it twice is fine.
+            SandboxTestRunner.ReleaseOwnedMarker(worktree, mine);
+            Assert.False(File.Exists(DirectTestProcess.Marker(worktree)));
+        }
+        finally
+        {
+            File.Delete(DirectTestProcess.Marker(worktree));
+        }
+    }
+
+    [Fact]
     public async Task Verbose_xcode_build_keeps_seven_stderr_helper_errors_without_inventing_a_linker_error()
     {
         var (runner, sha) = await ShRunner();

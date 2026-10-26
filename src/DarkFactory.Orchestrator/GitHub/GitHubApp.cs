@@ -16,7 +16,7 @@ public sealed record InstallationToken(string Token, DateTimeOffset ExpiresAt);
 /// repository with contents + pull_requests write. Every call mints a fresh token;
 /// nothing is cached across runs.
 /// </summary>
-public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPem, TimeProvider time)
+public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPem, TimeProvider time, RepoRef? reservedController = null)
 {
     public static readonly Uri DefaultBaseAddress = Gateway.OutboundHttp.GitHubApiBase;
 
@@ -74,6 +74,9 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
     public async Task<InstallationToken> CreateInstallationTokenAsync(RepoRef repo, CancellationToken ct,
         IReadOnlyDictionary<string, string>? permissions = null)
     {
+        // Snapshot before validation: a caller cannot widen a mutable permission dictionary while the lookup is awaited.
+        var requestedPermissions = new Dictionary<string, string>(permissions ?? TokenPermissions, StringComparer.Ordinal);
+        FactoryRepositoryPolicy.EnsureInstallationPermissions(repo, requestedPermissions, reservedController);
         var jwt = CreateJwt();
 
         using var lookup = Request(HttpMethod.Get, $"repos/{repo.Owner}/{repo.Name}/installation", "Bearer", jwt);
@@ -86,7 +89,7 @@ public sealed class GitHubApp(HttpClient http, string appId, string privateKeyPe
         var installation = await lookupResponse.Content.ReadFromJsonAsync<InstallationDto>(ct);
 
         using var create = Request(HttpMethod.Post, $"app/installations/{installation!.Id}/access_tokens", "Bearer", jwt);
-        create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = permissions ?? TokenPermissions });
+        create.Content = JsonContent.Create(new { repositories = new[] { repo.Name }, permissions = requestedPermissions });
         using var createResponse = await http.SendAsync(create, ct);
         if (createResponse.StatusCode == HttpStatusCode.NotFound)
         {

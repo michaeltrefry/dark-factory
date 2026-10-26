@@ -196,7 +196,7 @@ public class GuiRemoteGateTests
         var root = (YamlMappingNode)yaml.Documents.Single().RootNode;
         var jobs = (YamlMappingNode)root.Children[new YamlScalarNode("jobs")];
         var check = (YamlMappingNode)jobs.Children[new YamlScalarNode("check")];
-        Assert.Contains("factory-gui-collector", check.Children[new YamlScalarNode("runs-on")].ToString());
+        Assert.Equal(["factory-gui-collector"], ((YamlSequenceNode)check.Children[new YamlScalarNode("runs-on")]).Children.Select(label => label.ToString()));
         Assert.DoesNotContain("actions/checkout", RemoteGuiWorkflow.Text);
         Assert.DoesNotContain("secrets.", RemoteGuiWorkflow.Text);
         Assert.DoesNotContain("GH_TOKEN", RemoteGuiWorkflow.Text);
@@ -224,7 +224,7 @@ public class GuiRemoteGateTests
             await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
             var output = await stdout + await stderr;
             Assert.True(process.ExitCode == 0, output);
-            Assert.Contains("Ran 23 tests", output);
+            Assert.Contains("Ran 43 tests", output);
         }
         finally { owned?.KillIfStillRunning(); Directory.Delete(directory, true); }
     }

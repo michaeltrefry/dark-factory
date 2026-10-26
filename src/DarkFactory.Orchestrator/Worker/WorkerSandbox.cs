@@ -289,15 +289,34 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     internal void VerifyCompleted(Process process)
     {
         if (!Bootstraps.TryGetValue(process, out var bootstrap) || !bootstrap.Ready) throw Unavailable("unconfirmed bootstrap");
-        try
-        {
-            _ = File.GetAttributes(HelperPath + ".quarantine");
-            throw Unavailable("cleanup is unconfirmed; the slot remains quarantined");
-        }
-        catch (FileNotFoundException) { }
-        catch (DirectoryNotFoundException) { }
+        if (IsQuarantined()) throw Unavailable("cleanup is unconfirmed; the slot remains quarantined");
+    }
+
+    private bool IsQuarantined()
+    {
+        try { _ = File.GetAttributes(HelperPath + ".quarantine"); return true; }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
         catch (IOException ex) { throw Unavailable("quarantine status cannot be read", ex); }
         catch (UnauthorizedAccessException ex) { throw Unavailable("quarantine status cannot be read", ex); }
+    }
+
+    // Only the fixed root cleanup protocol may reconcile a marker, never an empty owner-side ps listing.
+    // RunLockedAsync verifies both the nonce handshake and the root-owned marker's removal; EndAsync retains the lock
+    // if the helper outlives this deadline. No caller-selected program or router variable reaches cleanup-only dispatch.
+    private async Task CleanupLockedAsync(CancellationToken ct)
+    {
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bounded.CancelAfter(TimeSpan.FromSeconds(30));
+        try
+        {
+            var (exit, _, stderr) = await RunLockedAsync("/", "/usr/bin/true", [], new Dictionary<string, string>(), bounded.Token, cleanupOnly: true);
+            if (exit != 0) throw Unavailable($"cleanup-only helper exited {exit} ({stderr.Trim()}); slot remains quarantined");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw Unavailable("cleanup-only reconciliation did not finish within 30 seconds; slot remains quarantined");
+        }
     }
 
     private FactoryUnavailableException Unavailable(string reason, Exception? inner = null) =>
@@ -305,7 +324,8 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
 
     /// <summary>
     /// Kills every process of the worker user (left by a crashed run) by running a no-op through the
-    /// helper, whose exit kills them all. Returns false, running nothing, when the user has none.
+    /// helper, whose exit kills them all. A quarantined slot always reconciles through cleanup-only dispatch, even when
+    /// the user has no processes. Returns false, running nothing, only when neither leftovers nor quarantine exist.
     /// </summary>
     public Task<bool> StopAllAsync(CancellationToken ct) => LockedAsync(() => StopAllLockedAsync(ct), ct);
 
@@ -354,6 +374,11 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     /// <summary><see cref="StopAllAsync"/> under the lock: with it held no other run's worker is alive, so every process found is a leftover.</summary>
     private async Task<bool> StopAllLockedAsync(CancellationToken ct)
     {
+        if (IsQuarantined())
+        {
+            await CleanupLockedAsync(ct);
+            return true;
+        }
         var psi = new ProcessStartInfo("/bin/ps", ["-U", User, "-o", "pid=,ppid=,command="])
         {
             RedirectStandardOutput = true,
@@ -370,11 +395,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
                 return false;
             }
         }
-        var (exitCode, _, stderr) = await LockedAsync(() => RunLockedAsync("/", "/usr/bin/true", [], new Dictionary<string, string>(), ct, cleanupOnly: true), ct);
-        if (exitCode != 0)
-        {
-            throw new InvalidOperationException($"Could not stop the worker user's processes through {HelperPath} ({stderr.Trim()}).");
-        }
+        await CleanupLockedAsync(ct);
         return true;
     }
 
@@ -487,6 +508,7 @@ public sealed record WorkerSandbox(string User, string HelperPath, string SudoPa
     private async Task EnsureReadyLockedAsync(string claudePath, CancellationToken ct)
     {
         await EnsureHelperCurrentAsync(ct);
+        if (IsQuarantined()) await CleanupLockedAsync(ct);
         // Shaped like a real launch: the headers of a classed session span two lines (E8).
         var probeVariables = ClaudeWorker.BuildRouterVariables(new Uri("http://127.0.0.1/"), "probe", WorkerModelClass.Mid);
         (int ExitCode, string Stdout, string Stderr) probe;

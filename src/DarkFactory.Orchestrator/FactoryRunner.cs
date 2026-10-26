@@ -265,7 +265,7 @@ public static class FactoryRunner
     public static FactoryFreeze CreateFreeze(FactoryOptions options)
     {
         var http = OutboundHttp.GitHubApi();
-        var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        var gateApp = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector);
         return new FactoryFreeze(Contexts(options), Controls(options), options.Freeze, TimeProvider.System, new GitHubGate(http, gateApp),
             options.ConfiguredRepos, FreezeCheckFailures.Process, CreateRecovery(options), scheduleRecovery: true);
     }
@@ -275,7 +275,7 @@ public static class FactoryRunner
         var http = OutboundHttp.GitHubApi();
         var router = ReviewerHttp(options);
         var sources = new WorkSourceRegistry(options);
-        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System);
+        var app = new GitHubApp(http, options.GitHubGateAppId, options.GitHubGateAppPrivateKeyPem, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector);
         var evidence = new Recovery.HotFileEvidence(Contexts(options), new GitHubGate(http, app), naming => sources.Of(naming));
         IReviewFiles files = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
             async (repo, c) => (await app.CreateInstallationTokenAsync(repo, c, GitHubGate.ReadPermissions)).Token, protectCloneLocks: true);
@@ -343,9 +343,9 @@ public static class FactoryRunner
 
         using var githubHttp = OutboundHttp.GitHubApi();
         using var routerHttp = OutboundHttp.RouterApi(options.RouterBaseUrl);
-        var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System);
+        var app = new GitHubApp(githubHttp, appId, appKey, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector);
         // The merge-capable credential: a separate App only the gate uses (workers' pushes and PRs use the one above).
-        var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System);
+        var gateApp = new GitHubApp(githubHttp, gateAppId, gateAppKey, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector);
         using var reviewerHttp = ReviewerHttp(options);
 
         var workspaces = new GitWorkspace(options.WorkRoot, GitWorkspace.GitHubRemote,
@@ -430,7 +430,8 @@ public static class FactoryRunner
             // Worker:Prepare (sc-26232): implementers' factory-prepare, its prefetch and its request spool.
             workerPrepare: options.WorkerPrepare
                 ? new Prepare.WorkerPrepare(artifacts, Prepare.WorkerPrepare.SpoolRootOf(options.WorkRoot), log)
-                : null);
+                : null,
+            reservedController: options.GuiWorkflow?.Collector);
 
         return recoveryHead is null ? await pipeline.RunAsync(storyId, ct)
             : await pipeline.RecoverAsync(storyId, recoveryHead, recoveryOwner!, ct, recoveryBase, retryIncompleteReview);
@@ -625,7 +626,7 @@ public sealed class FactoryItemStops(FactoryOptions options, WorkSourceRegistry 
     private async Task<ControlResult> StopAsync(IWorkSource owner, int id, CancellationToken ct, RepoRef? repository = null)
     {
         using var githubHttp = OutboundHttp.GitHubApi();
-        var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System);
+        var app = new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector);
         await using var db = new LedgerDbContext(LedgerDbContext.PostgresOptions(options.LedgerConnectionString));
         var stopper = new ItemStopper(owner, new WorkLedger(db, TimeProvider.System), new PostgresRunLocks(options.LedgerConnectionString),
             new GitHubPullRequests(githubHttp, app), FactoryRunner.Controls(options), log);
@@ -707,7 +708,7 @@ public sealed class SandboxTriageRunner(FactoryOptions options, TextWriter log) 
             throw new InvalidOperationException("The evaluation snapshot must be a local absolute repository directory.");
         }
         var app = EvaluationSnapshot is null
-            ? new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System) : null;
+            ? new GitHubApp(githubHttp, options.GitHubAppId, options.GitHubAppPrivateKeyPem, TimeProvider.System, reservedController: options.GuiWorkflow?.Collector) : null;
         // The seat is the held slot's (sc-25990): its own root of triage worktrees, its own directory of session files.
         var seat = SlotSeat.Of(options.WorkRoot, TriageWorktrees, slots, slot);
         GitWorkspace SeatsIn(string worktrees) => new(options.WorkRoot, r => EvaluationSnapshot ?? GitWorkspace.GitHubRemote(r),

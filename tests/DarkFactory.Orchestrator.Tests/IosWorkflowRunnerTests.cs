@@ -33,6 +33,114 @@ public sealed class IosWorkflowRunnerTests
                 Assert.Matches("^actions/(download|upload)-artifact@[0-9a-f]{40}$", action.ToString());
     }
 
+    /// <summary>The Python program a sealed workflow's <c>run</c> block executes, without the heredoc wrapper.</summary>
+    internal static string PythonProgram(string run)
+    {
+        var lines = run.Replace("\r\n", "\n").Split('\n');
+        var start = Array.FindIndex(lines, line => line.Contains("python3 -I - <<", StringComparison.Ordinal));
+        if (start < 0) throw new InvalidDataException("run block has no Python heredoc.");
+        var end = lines.Length - 1;
+        while (end > start && (lines[end].Trim() is "" or "PY" or "PYCODE")) end--;
+        return string.Join('\n', lines[(start + 1)..(end + 1)]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Source_acquisition_uses_only_requested_sides_and_refuses_invalid_required_commits(bool gui)
+    {
+        var yaml = new YamlStream();
+        yaml.Load(new StringReader(gui ? RemoteGuiWorkflow.Text : RemoteIosWorkflow.Text));
+        var workflow = (YamlMappingNode)yaml.Documents.Single().RootNode;
+        var jobs = (YamlMappingNode)workflow.Children[new YamlScalarNode("jobs")];
+        var sources = (YamlMappingNode)jobs.Children[new YamlScalarNode("sources")];
+        var steps = (YamlSequenceNode)sources.Children[new YamlScalarNode("steps")];
+        var acquisition = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
+            && name.ToString().StartsWith("Acquire", StringComparison.Ordinal));
+        var env = (YamlMappingNode)acquisition.Children[new YamlScalarNode("env")];
+        Assert.Equal("${{ steps.plan.outputs.archive_sides }}", env.Children[new YamlScalarNode("SIDES")].ToString());
+        var script = PythonProgram(acquisition.Children[new YamlScalarNode("run")].ToString());
+        var directory = Directory.CreateTempSubdirectory("df-source-sides-").FullName;
+        try
+        {
+            const string harness = """
+                import contextlib, io, json, os, pathlib, sys, tempfile, unittest
+                from unittest.mock import patch
+                script = json.loads(sys.stdin.read())
+                class Response(io.BytesIO):
+                    pass
+                def acquire(code, sides, base='bad-unused-base', head='a'*40):
+                    urls=[]
+                    class Opener:
+                        def open(self, request, timeout):
+                            urls.append(request.full_url if hasattr(request,'full_url') else request)
+                            return Response(b'archive')
+                    env={'SIDES':json.dumps(sides),'BASE':base,'HEAD':head,'API':'https://api.example',
+                         'REPO':'owner/source','GH_TOKEN':'fixture','SOURCE_REPOSITORY':'owner/source','TRUSTED_REPOSITORIES':'owner/source'}
+                    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,env,clear=True), patch('urllib.request.build_opener',return_value=Opener()):
+                        before=os.getcwd()
+                        try:
+                            os.chdir(directory)
+                            exec(compile(code,'<sealed-source-acquisition>','exec'),{})
+                            files=sorted(p.name for p in pathlib.Path('sources').iterdir())
+                        finally: os.chdir(before)
+                    return files,urls
+                class Cases(unittest.TestCase):
+                    def valid(self,*args,**kwargs):
+                        try: return acquire(script,*args,**kwargs)
+                        except Exception as error: self.fail('valid selected-side acquisition failed: '+str(error))
+                    def test_head_only_ignores_invalid_base(self):
+                        files,urls=self.valid(['head'])
+                        self.assertEqual(files,['head.zip']);self.assertEqual(len(urls),1)
+                        self.assertTrue(urls[0].endswith('/'+'a'*40))
+                    def test_base_only_ignores_invalid_head(self):
+                        files,urls=self.valid(['base'],base='b'*40,head='bad-unused-head')
+                        self.assertEqual(files,['base.zip']);self.assertEqual(len(urls),1)
+                    def test_legacy_two_sides_remain(self):
+                        files,urls=self.valid(['base','head'],base='b'*40)
+                        self.assertEqual(files,['base.zip','head.zip']);self.assertEqual(len(urls),2)
+                    def test_required_commit_is_validated(self):
+                        with self.assertRaises(ValueError): acquire(script,['head'],head='invalid')
+                    def test_invalid_side_selections_are_refused(self):
+                        for sides in ([],['other'],['head','head'],['base','head','base'],'head'):
+                            with self.subTest(sides=sides), self.assertRaises(ValueError): acquire(script,sides,base='b'*40)
+                def run():
+                    return unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Cases))
+                result=run()
+                if not result.wasSuccessful():
+                    print(result.failures,result.errors);sys.exit(1)
+                original=script
+                for name,old,new in [
+                    ('unrequested-side-acquisition', 'for side in sides:' if 'for side in sides:' in script else 'for name in sides:',
+                     "for side in ('base','head'):" if 'for side in sides:' in script else "for name in ('base','head'):"),
+                    ('required-commit-validation', "if not re.fullmatch('[0-9a-f]{40}', sha):", 'if False:'),
+                    ('empty-selection-accepted', 'or not sides or', 'or False or')]:
+                    if old not in original: raise AssertionError('mutation anchor missing: '+name)
+                    script=original.replace(old,new,1);red=run()
+                    if not red.failures or red.errors: raise AssertionError('not an assertion-only RED: '+name+str(red.errors))
+                    print('MUTANT RED '+name)
+                    script=original
+                    if not run().wasSuccessful(): raise AssertionError('restoration failed: '+name)
+                print('5 source acquisition contracts passed; 3 mutants RED/restored GREEN')
+                """;
+            var start = new ProcessStartInfo("python3", ["-I", "-c", harness])
+            {
+                RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                WorkingDirectory = directory
+            };
+            using var process = Process.Start(start)!;
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            await process.StandardInput.WriteAsync(System.Text.Json.JsonSerializer.Serialize(script));
+            process.StandardInput.Close();
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+            var output = await stdout + await stderr;
+            Assert.True(process.ExitCode == 0, output);
+            Assert.Contains("5 source acquisition contracts passed; 3 mutants RED/restored GREEN", output);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
     [Theory]
     [InlineData("overflow")]
     [InlineData("timeout")]
@@ -79,6 +187,133 @@ public sealed class IosWorkflowRunnerTests
             foreach (var process in owned) process.KillIfStillRunning();
             Directory.Delete(directory, true);
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Source_plan_selects_requested_sides_and_only_the_opposite_an_overlay_needs(bool gui)
+    {
+        var yaml = new YamlStream();
+        yaml.Load(new StringReader(gui ? RemoteGuiWorkflow.Text : RemoteIosWorkflow.Text));
+        var workflow = (YamlMappingNode)yaml.Documents.Single().RootNode;
+        var jobs = (YamlMappingNode)workflow.Children[new YamlScalarNode("jobs")];
+        var steps = (YamlSequenceNode)((YamlMappingNode)jobs.Children[new YamlScalarNode("sources")]).Children[new YamlScalarNode("steps")];
+        var plan = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
+            && name.ToString() == "Select requested execution side");
+        var script = PythonProgram(plan.Children[new YamlScalarNode("run")].ToString());
+        var sources = (YamlMappingNode)jobs.Children[new YamlScalarNode("sources")];
+        var outputs = (YamlMappingNode)sources.Children[new YamlScalarNode("outputs")];
+        var check = (YamlMappingNode)jobs.Children[new YamlScalarNode("check")];
+        var strategy = (YamlMappingNode)check.Children[new YamlScalarNode("strategy")];
+        var matrix = (YamlMappingNode)strategy.Children[new YamlScalarNode("matrix")];
+        var acquisition = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
+            && name.ToString().StartsWith("Acquire", StringComparison.Ordinal));
+        var acquisitionEnv = (YamlMappingNode)acquisition.Children[new YamlScalarNode("env")];
+        var payload = new
+        {
+            script,
+            outputs = outputs.Children.ToDictionary(pair => pair.Key.ToString(), pair => pair.Value.ToString()),
+            matrix = matrix.Children[new YamlScalarNode("side")].ToString(),
+            archive = acquisitionEnv.Children[new YamlScalarNode("SIDES")].ToString()
+        };
+        var directory = Directory.CreateTempSubdirectory("df-source-plan-").FullName;
+        try
+        {
+            const string harness = """
+                import io, json, os, re, sys, tempfile, unittest
+                payload = json.loads(sys.stdin.read())
+                script = payload['script']
+                matrix = payload['matrix']
+                def selection(execution):
+                    with tempfile.TemporaryDirectory() as directory:
+                        output = os.path.join(directory, 'output')
+                        open(output, 'w').close()
+                        env = {'EXECUTION': execution, 'GITHUB_OUTPUT': output}
+                        previous = os.environ
+                        os.environ = env
+                        try:
+                            exec(compile(script, '<sealed-source-plan>', 'exec'), {})
+                        finally:
+                            os.environ = previous
+                        value = open(output).read()
+                    step_outputs = dict(line.split('=', 1) for line in value.splitlines())
+                    def step_value(expression):
+                        match = re.fullmatch(r'\$\{\{ steps\.plan\.outputs\.([a-z_]+) \}\}', expression)
+                        assert match, 'unknown step output expression: ' + expression
+                        return json.loads(step_outputs[match[1]])
+                    job_outputs = {name: step_value(expression) for name, expression in payload['outputs'].items()}
+                    match = re.fullmatch(r'\$\{\{ fromJSON\(needs\.sources\.outputs\.([a-z_]+)\) \}\}', matrix)
+                    assert match, 'unknown matrix expression: ' + matrix
+                    return job_outputs[match[1]], step_value(payload['archive'])
+                def sides(execution):
+                    return selection(execution)[1]
+                class Cases(unittest.TestCase):
+                    def test_legacy_request_without_execution_keeps_both_sides(self):
+                        self.assertEqual(selection(''), (['base', 'head'], ['base', 'head']))
+                    def test_rendered_matrix_runs_only_requested_side_even_when_overlay_needs_opposite_archive(self):
+                        for side in ('base', 'head'):
+                            opposite = 'head' if side == 'base' else 'base'
+                            for overlay, paths in (('b'*40, ['Sources/Shared']), ('a'*40, ['Sources/Shared']), ('b'*40, [])):
+                                execution = json.dumps(dict(side=side, commit='a'*40, overlayFrom=overlay, overlayPaths=paths))
+                                expected_archives = [side, opposite] if paths and overlay != 'a'*40 else [side]
+                                self.assertEqual(selection(execution), ([side], expected_archives))
+                    def test_head_only_needs_no_base_archive(self):
+                        self.assertEqual(sides('{"side":"head","commit":"' + 'a'*40 + '"}'), ['head'])
+                    def test_cross_revision_overlay_adds_only_the_opposite_side(self):
+                        base = 'b'*40; head = 'a'*40
+                        self.assertEqual(sides('{"side":"head","commit":"' + head + '","overlayFrom":"' + base + '","overlayPaths":["Sources/Shared"]}'), ['head', 'base'])
+                        self.assertEqual(sides('{"side":"base","commit":"' + base + '","overlayFrom":"' + head + '","overlayPaths":["Sources/Shared"]}'), ['base', 'head'])
+                    def test_same_revision_overlay_needs_no_opposite_archive(self):
+                        head = 'a'*40
+                        self.assertEqual(sides('{"side":"head","commit":"' + head + '","overlayFrom":"' + head + '","overlayPaths":["Sources/Shared"]}'), ['head'])
+                    def test_non_overlay_ignores_overlay_from(self):
+                        head = 'a'*40; base = 'b'*40
+                        self.assertEqual(sides('{"side":"head","commit":"' + head + '","overlayFrom":"' + base + '","overlayPaths":[]}'), ['head'])
+                    def test_invalid_side_or_malformed_execution_is_refused(self):
+                        for execution in ('{"side":"other"}', 'not-json', '{"commit":"' + 'a'*40 + '"}', '[]'):
+                            with self.subTest(execution=execution), self.assertRaises(Exception): sides(execution)
+                def run():
+                    return unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Cases))
+                result=run()
+                if not result.wasSuccessful():
+                    print(result.failures,result.errors);sys.exit(1)
+                original=script
+                for name,old,new in [
+                    ('overlay-opposite-always', "if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):", "if parsed.get('overlayPaths'):"),
+                    ('overlay-opposite-never', "if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):", "if False:"),
+                    ('legacy-sides-reduced', "if execution:", "if False:")]:
+                    if old not in original: raise AssertionError('mutation anchor missing: '+name)
+                    script=original.replace(old,new,1);red=run()
+                    if not red.failures or red.errors: raise AssertionError('not an assertion-only RED: '+name+str(red.errors))
+                    print('MUTANT RED '+name)
+                    script=original
+                    if not run().wasSuccessful(): raise AssertionError('restoration failed: '+name)
+                original_matrix = matrix
+                matrix = '${{ fromJSON(needs.sources.outputs.archive_sides) }}'
+                red = run()
+                if not red.failures or red.errors: raise AssertionError('not an assertion-only RED: archive-dependencies-reused-as-execution-matrix')
+                print('MUTANT RED archive-dependencies-reused-as-execution-matrix')
+                matrix = original_matrix
+                if not run().wasSuccessful(): raise AssertionError('matrix restoration failed')
+                print('7 source plan contracts passed; 4 mutants RED/restored GREEN')
+                """;
+            var start = new ProcessStartInfo("python3", ["-I", "-c", harness])
+            {
+                RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                WorkingDirectory = directory
+            };
+            using var process = Process.Start(start)!;
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            await process.StandardInput.WriteAsync(System.Text.Json.JsonSerializer.Serialize(payload));
+            process.StandardInput.Close();
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+            var output = await stdout + await stderr;
+            Assert.True(process.ExitCode == 0, output);
+            Assert.Contains("7 source plan contracts passed; 4 mutants RED/restored GREEN", output);
+        }
+        finally { Directory.Delete(directory, true); }
     }
 
     [Fact]

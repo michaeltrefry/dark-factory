@@ -319,6 +319,36 @@ public sealed record CodeGraphRisk(string HeadSha, IReadOnlyList<FileBlastRadius
         new(headSha, [], [], files.Select(f => new NoCodeGraphData(f, reason)).ToList());
 
     /// <summary>
+    /// Refreshing an overlay cannot retract observations already made in this evaluation. Keep the worst usable radius/score per
+    /// file, and every blocking misread; only unanswered inputs can become unavailable. Both reads must describe the same PR head.
+    /// </summary>
+    public CodeGraphRisk PreserveObservations(CodeGraphRisk previous)
+    {
+        if (HeadSha != previous.HeadSha)
+        {
+            throw new ArgumentException("CodeGraph observations belong to different PR heads", nameof(previous));
+        }
+        var blast = BlastRadius.Concat(previous.BlastRadius).GroupBy(b => b.Path, StringComparer.Ordinal)
+            .Select(g => g.OrderByDescending(b => b.Radius).ThenByDescending(b => b.Found).First()).ToList();
+        var hot = Hotspots.Concat(previous.Hotspots).GroupBy(h => h.Path, StringComparer.Ordinal)
+            .Select(g => g.OrderByDescending(h => h.Score).ThenByDescending(h => h.Found).First()).ToList();
+        var misread = Misreads.Concat(previous.Misreads).Distinct().ToList();
+        var unrecognised = UnrecognisedRadii.Concat(previous.UnrecognisedRadii).Distinct().ToList();
+        // A language flag in one read must not erase a blocking observation in the other. A read's own flag still explains that
+        // read's unusable answer when Judged is applied (including an interrupted read's partial observations).
+        var unindexed = UnindexedFiles.Where(u => !previous.Misreads.Any(m => m.Path == u.Path)
+                && !previous.UnrecognisedRadii.Any(r => r.Path == u.Path))
+            .Concat(previous.UnindexedFiles.Where(u => !Misreads.Any(m => m.Path == u.Path)
+                && !UnrecognisedRadii.Any(r => r.Path == u.Path))).Distinct().ToList();
+        var noData = NoData.Concat(previous.NoData).Distinct().Where(n =>
+            !((blast.Any(b => b.Path == n.Path) || unrecognised.Any(r => r.Path == n.Path)
+                || misread.Any(m => m.Path == n.Path && !m.Hotspot))
+                && (hot.Any(h => h.Path == n.Path) || misread.Any(m => m.Path == n.Path && m.Hotspot)))).ToList();
+        return this with { BlastRadius = blast, Hotspots = hot, NoData = noData, Unindexed = unindexed,
+            Unrecognised = unrecognised, Misread = misread };
+    }
+
+    /// <summary>
     /// What the gate judges, for exactly <paramref name="files"/>: the blast radii and hotspots CodeGraph answered, and every other file
     /// with no CodeGraph data and why (<see cref="NoData"/>); a file the inputs leave out is a misread (<see cref="LeftOut"/>). A file whose language CodeGraph does not
     /// index keeps whatever data CodeGraph did answer for it (<c>found: true</c>: a critical blast radius from one tool still blocks), and
@@ -522,7 +552,7 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
     /// instead of asking again.
     /// </param>
     public async Task<CodeGraphRisk> ReadAsync(RepoRef repo, string headSha, CodeGraphOverlay overlay, IReadOnlyList<string> paths, CancellationToken ct,
-        HotspotCache? hotspots = null)
+        HotspotCache? hotspots = null, Action<CodeGraphRisk>? interrupted = null)
     {
         var noData = new List<NoCodeGraphData>();
         var blast = new List<FileBlastRadius>();
@@ -531,164 +561,178 @@ public sealed class CodeGraphRiskReader(ICodeGraphRisk codeGraph, TimeSpan overl
         var unrecognised = new List<UnrecognisedBlastRadius>();
         var misread = new List<CodeGraphMisread>();
         var overlayUnusable = false;
-        var (project, unreachable) = await Call(() => codeGraph.FindProjectAsync(repo, ct), "search_projects", ct);
-        if (unreachable is not null)
-        {
-            return CodeGraphRisk.None(headSha, paths, $"CodeGraph could not be reached or asked: {unreachable}");
-        }
-        if (project is null)
-        {
-            return CodeGraphRisk.None(headSha, paths, $"{repo.FullName}: {ReviewTools.NotIndexed}");
-        }
-        var head = headSha.ToLowerInvariant();
         var impacts = new Dictionary<string, ImpactFileAnswer>();
-        // Why the head is not read (null: it is): no ready overlay of it, or CodeGraph answered it has no usable one. Then each file's
-        // blast radius is read from the default-branch index instead (sc-26254), labelled not the PR head.
-        string? notAtHead = overlay.IsReady && string.Equals(overlay.HeadSha, headSha, StringComparison.OrdinalIgnoreCase)
-            ? null
-            : $"no ready CodeGraph overlay of {headSha} ({overlay.Describe})";
-        string? ended = null;
-        foreach (var path in paths)
+        var hotspotAnswers = new Dictionary<string, FileHotspot>();
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            if (ended is not null)
+            var (project, unreachable) = await Call(() => codeGraph.FindProjectAsync(repo, ct), "search_projects", ct);
+            if (unreachable is not null)
             {
-                noData.Add(new NoCodeGraphData(path, ended));
-                continue;
+                return CodeGraphRisk.None(headSha, paths, $"CodeGraph could not be reached or asked: {unreachable}");
             }
-            ImpactFileAnswer? answer = null;
-            // The head's answer for this file when it could not be used and is not C4's typed notIndexed: a misread, unless the
-            // default-branch read below gives usable data (sc-26134).
-            string? headMisread = null;
-            if (notAtHead is null)
+            if (project is null)
             {
-                var (atHead, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct),
-                    CodeGraphMcpClient.AnalyzeImpactFileTool, ct);
-                if (atHead is null)
+                return CodeGraphRisk.None(headSha, paths, $"{repo.FullName}: {ReviewTools.NotIndexed}");
+            }
+            var head = headSha.ToLowerInvariant();
+            // Why the head is not read (null: it is): no ready overlay of it, or CodeGraph answered it has no usable one. Then each file's
+            // blast radius is read from the default-branch index instead (sc-26254), labelled not the PR head.
+            string? notAtHead = overlay.IsReady && string.Equals(overlay.HeadSha, headSha, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : $"no ready CodeGraph overlay of {headSha} ({overlay.Describe})";
+            string? ended = null;
+            foreach (var path in paths)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (ended is not null)
+                {
+                    noData.Add(new NoCodeGraphData(path, ended));
+                    continue;
+                }
+                ImpactFileAnswer? answer = null;
+                // The head's answer for this file when it could not be used and is not C4's typed notIndexed: a misread, unless the
+                // default-branch read below gives usable data (sc-26134).
+                string? headMisread = null;
+                if (notAtHead is null)
+                {
+                    var (atHead, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, headSha, ImpactDepth, ct),
+                        CodeGraphMcpClient.AnalyzeImpactFileTool, ct);
+                    if (atHead is null)
+                    {
+                        noData.Add(new NoCodeGraphData(path, failed!));
+                        ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
+                        continue;
+                    }
+                    var why = Impact(atHead, head) ?? (SamePath(atHead.Path, path) ? null
+                        : OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, atHead.Path, path));
+                    if (atHead.NotIndexed is not null)
+                    {
+                        // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): it answers no file of it, so this and
+                        // every later file is read from the default branch, and the pipeline asks for the overlay again.
+                        overlayUnusable = true;
+                        notAtHead = why;
+                    }
+                    else if (why is not null)
+                    {
+                        // This file's head answer cannot be used: its default-branch blast radius is read instead, for this file only.
+                        headMisread = why;
+                    }
+                    else
+                    {
+                        answer = atHead;
+                    }
+                }
+                if (answer is null)
+                {
+                    var before = headMisread ?? notAtHead;
+                    var (onDefault, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, null, ImpactDepth, ct),
+                        CodeGraphMcpClient.AnalyzeImpactFileTool, ct);
+                    if (onDefault is null)
+                    {
+                        // CodeGraph cannot be asked any more: no data — unless the head already misanswered this file, which stays a misread.
+                        var reason = $"blast radius: {before}; on the default branch: {failed}";
+                        if (headMisread is null)
+                        {
+                            noData.Add(new NoCodeGraphData(path, reason));
+                        }
+                        else
+                        {
+                            misread.Add(new CodeGraphMisread(path, reason));
+                        }
+                        ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
+                        continue;
+                    }
+                    var unusable = DefaultBranchImpact(onDefault) ?? (SamePath(onDefault.Path, path) ? null
+                        : OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, onDefault.Path, path));
+                    if (unusable is not null)
+                    {
+                        // Only C4's typed notIndexed on the default branch, after no head answer was misread, is no data; any other unusable
+                        // answer of a reachable CodeGraph is a misread, and it blocks (sc-26134).
+                        var reason = $"blast radius: {before}; on the default branch: {unusable}";
+                        if (headMisread is null && onDefault.NotIndexed is not null)
+                        {
+                            noData.Add(new NoCodeGraphData(path, reason));
+                        }
+                        else
+                        {
+                            misread.Add(new CodeGraphMisread(path, reason));
+                        }
+                        continue;
+                    }
+                    answer = onDefault;
+                }
+                impacts[path] = answer;
+                var commit = notAtHead is null && headMisread is null ? null : answer.CommitSha;
+                if (answer.Found == true && !BlastRadii.TryParseAnswer(answer.BlastRadius, out _))
+                {
+                    // A misread, not missing data: CodeGraph has data for the file and the gate cannot tell how bad it is.
+                    unrecognised.Add(new UnrecognisedBlastRadius(path, answer.BlastRadius));
+                    continue;
+                }
+                blast.Add(answer.Found == true && BlastRadii.TryParseAnswer(answer.BlastRadius, out var radius)
+                    ? new FileBlastRadius(path, radius, true, commit)
+                    : new FileBlastRadius(path, BlastRadius.None, false, commit));
+            }
+            string? hotspotsEnded = null;
+            foreach (var path in paths)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (hotspots is not null && hotspots.TryGet(path, overlay.BaseSha, out var known))
+                {
+                    scores.Add(known!);
+                    hotspotAnswers[path] = known!;
+                    continue;
+                }
+                if (hotspotsEnded is not null)
+                {
+                    noData.Add(new NoCodeGraphData(path, hotspotsEnded));
+                    continue;
+                }
+                var (answer, failed) = await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, ct);
+                if (answer is null)
                 {
                     noData.Add(new NoCodeGraphData(path, failed!));
-                    ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
+                    hotspotsEnded = $"{CodeGraphMcpClient.FileHotspotTool} not asked: {failed}";
                     continue;
                 }
-                var why = Impact(atHead, head) ?? (SamePath(atHead.Path, path) ? null
-                    : OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, atHead.Path, path));
-                if (atHead.NotIndexed is not null)
+                if (Hotspot(answer, path) is { } why)
                 {
-                    // CodeGraph has no usable overlay of the head (e.g. the recorded one went stale): it answers no file of it, so this and
-                    // every later file is read from the default branch, and the pipeline asks for the overlay again.
-                    overlayUnusable = true;
-                    notAtHead = why;
-                }
-                else if (why is not null)
-                {
-                    // This file's head answer cannot be used: its default-branch blast radius is read instead, for this file only.
-                    headMisread = why;
-                }
-                else
-                {
-                    answer = atHead;
-                }
-            }
-            if (answer is null)
-            {
-                var before = headMisread ?? notAtHead;
-                var (onDefault, failed) = await Call(() => codeGraph.AnalyzeImpactFileAsync(project, path, null, ImpactDepth, ct),
-                    CodeGraphMcpClient.AnalyzeImpactFileTool, ct);
-                if (onDefault is null)
-                {
-                    // CodeGraph cannot be asked any more: no data — unless the head already misanswered this file, which stays a misread.
-                    var reason = $"blast radius: {before}; on the default branch: {failed}";
-                    if (headMisread is null)
-                    {
-                        noData.Add(new NoCodeGraphData(path, reason));
-                    }
-                    else
-                    {
-                        misread.Add(new CodeGraphMisread(path, reason));
-                    }
-                    ended = $"{CodeGraphMcpClient.AnalyzeImpactFileTool} not asked: {failed}";
+                    // A reachable CodeGraph's unusable answer: a misread (sc-26134), which blocks where the policy judges hotspots.
+                    misread.Add(new CodeGraphMisread(path, why, Hotspot: true));
                     continue;
                 }
-                var unusable = DefaultBranchImpact(onDefault) ?? (SamePath(onDefault.Path, path) ? null
-                    : OtherPath(CodeGraphMcpClient.AnalyzeImpactFileTool, onDefault.Path, path));
-                if (unusable is not null)
-                {
-                    // Only C4's typed notIndexed on the default branch, after no head answer was misread, is no data; any other unusable
-                    // answer of a reachable CodeGraph is a misread, and it blocks (sc-26134).
-                    var reason = $"blast radius: {before}; on the default branch: {unusable}";
-                    if (headMisread is null && onDefault.NotIndexed is not null)
-                    {
-                        noData.Add(new NoCodeGraphData(path, reason));
-                    }
-                    else
-                    {
-                        misread.Add(new CodeGraphMisread(path, reason));
-                    }
-                    continue;
-                }
-                answer = onDefault;
+                var score = Score(answer, path) with { LanguageIndexed = answer.LanguageIndexed, Language = answer.Language };
+                scores.Add(score);
+                hotspotAnswers[path] = score;
+                hotspots?.Add(score);
             }
-            impacts[path] = answer;
-            var commit = notAtHead is null && headMisread is null ? null : answer.CommitSha;
-            if (answer.Found == true && !BlastRadii.TryParseAnswer(answer.BlastRadius, out _))
-            {
-                // A misread, not missing data: CodeGraph has data for the file and the gate cannot tell how bad it is.
-                unrecognised.Add(new UnrecognisedBlastRadius(path, answer.BlastRadius));
-                continue;
-            }
-            blast.Add(answer.Found == true && BlastRadii.TryParseAnswer(answer.BlastRadius, out var radius)
-                ? new FileBlastRadius(path, radius, true, commit)
-                : new FileBlastRadius(path, BlastRadius.None, false, commit));
+            return Observations();
         }
-        var hotspotAnswers = new Dictionary<string, FileHotspot>();
-        string? hotspotsEnded = null;
-        foreach (var path in paths)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            ct.ThrowIfCancellationRequested();
-            if (hotspots is not null && hotspots.TryGet(path, overlay.BaseSha, out var known))
-            {
-                scores.Add(known!);
-                hotspotAnswers[path] = known!;
-                continue;
-            }
-            if (hotspotsEnded is not null)
-            {
-                noData.Add(new NoCodeGraphData(path, hotspotsEnded));
-                continue;
-            }
-            var (answer, failed) = await Call(() => codeGraph.FileHotspotAsync(project, path, ct), CodeGraphMcpClient.FileHotspotTool, ct);
-            if (answer is null)
-            {
-                noData.Add(new NoCodeGraphData(path, failed!));
-                hotspotsEnded = $"{CodeGraphMcpClient.FileHotspotTool} not asked: {failed}";
-                continue;
-            }
-            if (Hotspot(answer, path) is { } why)
-            {
-                // A reachable CodeGraph's unusable answer: a misread (sc-26134), which blocks where the policy judges hotspots.
-                misread.Add(new CodeGraphMisread(path, why, Hotspot: true));
-                continue;
-            }
-            var score = Score(answer, path) with { LanguageIndexed = answer.LanguageIndexed, Language = answer.Language };
-            scores.Add(score);
-            hotspotAnswers[path] = score;
-            hotspots?.Add(score);
+            // A deadline can interrupt even the first read after it already answered a blocking file. Hand those observations back
+            // without swallowing cancellation (the pipeline distinguishes its backstop from a human Pause/Stop or shutdown).
+            interrupted?.Invoke(Observations());
+            throw;
         }
-        // Each file's language is judged from whatever both answers say (LanguageCoverage.Of): a flag in either decides.
-        foreach (var path in paths)
+
+        CodeGraphRisk Observations()
         {
-            var impact = impacts.GetValueOrDefault(path);
-            var score = hotspotAnswers.GetValueOrDefault(path);
-            if (impact is null && score is null)
+            // Each file's language is judged from whatever answers arrived, including on an interrupted read.
+            foreach (var path in paths)
             {
-                continue;
+                var impact = impacts.GetValueOrDefault(path);
+                var score = hotspotAnswers.GetValueOrDefault(path);
+                if (impact is null && score is null)
+                {
+                    continue;
+                }
+                // Without an impact answer the factory's own inference (no flag, no graph data) is not made.
+                LanguageCoverage.Add(unindexed, LanguageCoverage.Of(path, impact?.LanguageIndexed, impact?.Language, score?.LanguageIndexed,
+                    score?.Language, impact is null ? true : impact.Found));
             }
-            // Without an impact answer the factory's own inference (no flag, no graph data) is not made: nothing says CodeGraph has no
-            // graph data for the file.
-            LanguageCoverage.Add(unindexed, LanguageCoverage.Of(path, impact?.LanguageIndexed, impact?.Language, score?.LanguageIndexed,
-                score?.Language, impact is null ? true : impact.Found));
+            return new CodeGraphRisk(headSha, blast, scores, noData, overlayUnusable, unindexed, unrecognised, misread);
         }
-        return new CodeGraphRisk(headSha, blast, scores, noData, overlayUnusable, unindexed, unrecognised, misread);
     }
 
     /// <summary>

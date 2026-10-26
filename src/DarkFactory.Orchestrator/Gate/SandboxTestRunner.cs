@@ -32,6 +32,8 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     internal TimeSpan DirectStopGrace { get; init; } = StopGrace;
     internal Action<Process>? DirectStopForTest { get; init; }
     internal Func<Process, CancellationToken, Task>? DirectWaitForTest { get; init; }
+    /// <summary>Starts an unsandboxed step's process. A test may refuse it (a program that cannot start at all).</summary>
+    internal Func<ProcessStartInfo, Process?>? DirectStartForTest { get; init; }
 
 
     /// <summary>The largest result file or build log read (a larger result file makes the run's report unreadable).</summary>
@@ -289,9 +291,17 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
             };
         }
         Process started;
+        string? markerToken = null;
         try
         {
-            started = Sandbox is null ? StartDirect(directory, step, worktree) : Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
+            if (Sandbox is null)
+            {
+                (started, markerToken) = StartDirect(directory, step, worktree);
+            }
+            else
+            {
+                started = Sandbox.Start(directory, step.Program, step.Args, new Dictionary<string, string>());
+            }
         }
         catch (System.ComponentModel.Win32Exception e) when (Sandbox is null)
         {
@@ -323,7 +333,7 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         {
             if (Sandbox is null)
             {
-                if (stopped) File.Delete(DirectTestProcess.Marker(worktree));
+                if (stopped) ReleaseOwnedMarker(worktree, markerToken ?? "");
                 started.Dispose();
             }
             else
@@ -493,9 +503,38 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
     /// <summary>The variables an unsandboxed run keeps from the owner's environment (no secrets: never the router key or a token).</summary>
     private static readonly string[] PassThrough = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "DOTNET_ROOT"];
 
-    private static Process StartDirect(string directory, TestStep step, string worktree)
+    /// <summary>The protection marker's ownership line: the token of the run that wrote it. A marker this run did not write
+    /// is never removed by it (another run's protection, or a root quarantine beside it).</summary>
+    private const string MarkerOwnership = "Owned by this run: ";
+
+    /// <summary>Writes this run's protection marker and answers its ownership token. The marker is written before the process
+    /// exists: a crash between the two leaves it, and the worktree stays protected until the owner proves the process gone.</summary>
+    internal static string WriteOwnedMarker(string worktree, string description)
     {
-        File.WriteAllText(DirectTestProcess.Marker(worktree), $"Test command: {Path.GetFileName(step.Program)}; termination not yet confirmed.\n");
+        var token = Guid.NewGuid().ToString("N");
+        File.WriteAllText(DirectTestProcess.Marker(worktree), $"{description}\n{MarkerOwnership}{token}\n");
+        return token;
+    }
+
+    /// <summary>Removes the protection marker only when it is the one this run wrote: another run's marker (a still
+    /// unconfirmed process) and any root quarantine beside it are never touched. A marker that is already gone is fine.</summary>
+    internal static void ReleaseOwnedMarker(string worktree, string token)
+    {
+        if (string.IsNullOrEmpty(token)) return; // no token, no ownership: never remove a marker this run did not write
+        var marker = DirectTestProcess.Marker(worktree);
+        try
+        {
+            if (!File.ReadAllText(marker).Contains(token, StringComparison.Ordinal)) return;
+            File.Delete(marker);
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+        catch (IOException) { } // the marker cannot be read: leave it (fail closed); it is another run's protection
+    }
+
+    private (Process Process, string Token) StartDirect(string directory, TestStep step, string worktree)
+    {
+        var token = WriteOwnedMarker(worktree, $"Test command: {Path.GetFileName(step.Program)}; termination not yet confirmed.");
         var grouped = !OperatingSystem.IsWindows();
         var psi = grouped ? new ProcessStartInfo(DirectTestProcess.Launcher) : new ProcessStartInfo(step.Program);
         psi.WorkingDirectory = directory;
@@ -532,16 +571,19 @@ public sealed class SandboxTestRunner(GitWorkspace git, WorkerSlots? slots, Time
         Process process;
         try
         {
-            process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {step.Program}.");
+            process = (DirectStartForTest ?? ((Func<ProcessStartInfo, Process?>)(psi => Process.Start(psi))))(psi)
+                ?? throw new InvalidOperationException($"Could not start {step.Program}.");
         }
         catch
         {
-            File.Delete(DirectTestProcess.Marker(worktree));
+            // The process never existed: only this run's own marker is removed, so the worktree is reusable. Another run's
+            // protection marker and any root quarantine beside it are left alone.
+            ReleaseOwnedMarker(worktree, token);
             throw;
         }
         File.AppendAllText(DirectTestProcess.Marker(worktree), $"Owned supervisor pid: {process.Id}.\n");
         process.StandardInput.Close();
-        return process;
+        return (process, token);
     }
 
     /// <summary>The last lines of a run's output (thread-safe: stdout and stderr both add).</summary>

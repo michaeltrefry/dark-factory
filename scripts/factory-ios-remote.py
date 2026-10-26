@@ -1139,7 +1139,7 @@ def hydrate_packages(root, worktree, data=None):
             code, _ = command(['/usr/bin/git', '--git-dir=' + str(mirror), '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0', *args], root, env=env)
             if code:
                 raise ValueError('pinned package object verification failed')
-        mirrors.append({'original': url, 'mirror': mirror.as_uri()})
+        mirrors.append({'original': url, 'mirror': mirror.resolve().as_uri()})
     for directory, _, files in os.walk(cache, topdown=False):
         for name in files:
             (pathlib.Path(directory) / name).chmod(0o444)
@@ -1389,6 +1389,18 @@ for relative in ('.swiftpm/configuration', 'Library/org.swift.swiftpm/configurat
     (directory / 'mirrors.json').write_text(json.dumps(config['mirrors']))
     if config['registries'] is not None:
         (directory / 'registries.json').write_text(json.dumps(config['registries']))
+# Only the collector's exact immutable mirror directories are trusted. Modern
+# upload-pack checks ownership too; source UID must not inherit the owner's git
+# configuration or a wildcard safe.directory exception.
+paths = []
+for entry in config['mirrors']['object']:
+    import urllib.parse
+    parsed = urllib.parse.urlsplit(entry['mirror'])
+    path = pathlib.Path(urllib.parse.unquote(parsed.path))
+    if parsed.scheme != 'file' or parsed.netloc or not path.is_absolute() or path.resolve() != path or not path.is_dir() or path.stat().st_mode & 0o222:
+        raise ValueError('invalid immutable package mirror')
+    paths.append(str(path))
+(home / '.factory-gitconfig').write_text('[safe]\n' + ''.join('\tdirectory = ' + json.dumps(path) + '\n' for path in paths))
 if config['registries'] is not None and len(sys.argv) > 3:
     for path in pathlib.Path(sys.argv[3]).rglob('registries.json'):
         if path.parent.name == 'configuration' and path.parent.parent.name in ('.swiftpm', 'swiftpm'):
@@ -1401,6 +1413,8 @@ def install_package_mirrors(principal, mirrors, registry=None):
     code, _ = principal.run(['/usr/bin/python3', '-I', '-c', CONFIG_SCRIPT, str(principal.home), json.dumps(config), str(getattr(principal, 'worktree', principal.home.parent / 'base'))], principal.home.parent)
     if code:
         raise PrepareFailure('package-hydration-failed')
+    principal.env.update({'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': '/dev/null',
+                          'GIT_CONFIG_GLOBAL': str(principal.home / '.factory-gitconfig')})
 
 
 BINARY_DISCOVERY_SCRIPT = r"""
@@ -1735,6 +1749,15 @@ def source_path(root, relative, allow_factory=False):
     return path
 
 
+def execution_sides(execution):
+    # A side needs the opposite archive only when its overlay copies files from the other revision. Same-revision overlays,
+    # replacements, deletions and the required side itself never consult it, so an unused archive is neither unpacked nor read.
+    sides = [execution['side']]
+    if execution['overlayPaths'] and execution['overlayFrom'] != execution['commit']:
+        sides.append('head' if execution['side'] == 'base' else 'base')
+    return sides
+
+
 def apply_execution(root, execution):
     target = root / execution['side']
     for relative in execution['deletePaths']:
@@ -1795,9 +1818,10 @@ def execution_main(request, text):
     if execution['side'] != request['SIDE']:
         write_execution_result(payload)
         return
+    setup_failure = None
     with RemoteWorkspace() as workspace:
         root = workspace.root
-        for side in ('base', 'head'):
+        for side in execution_sides(execution):
             unpack(pathlib.Path('sources') / (side + '.zip'), root / side)
         # Fetch/cache declared data before any source principal can run. No
         # recipe or source helper is imported/evaluated by this collector.
@@ -1809,113 +1833,112 @@ def execution_main(request, text):
         try:
             artifacts = prepare_artifacts(root, recipe) if recipe is not None else {}
         except (ValueError, OSError, subprocess.SubprocessError):
-            result.update(status='prepare-failed', failure={'code': 'artifact-fetch-failed', 'step': None})
-            write_execution_result(payload)
-            return
-        workspace.handoff()
-        try:
-            principal = Principal(root)
-        except PrepareFailure as error:
-            result.update(status='prepare-failed', failure={'code': error.code, 'step': None})
-            write_execution_result(payload)
-            return
-        registry = None
-        try:
-            principal.share(cwd)
-            derived = root / ('derived-' + execution['side'])
-            derived.mkdir()
-            principal.share(derived)
-            if recipe is not None:
-                try:
-                    # Successful prepare output is not compiler evidence. Keep
-                    # execution.log BUILD-only, exactly as the local runner does.
-                    run_prepare(principal, cwd, recipe, artifacts)
-                except PrepareFailure:
-                    raise
-                except (ValueError, OSError, subprocess.SubprocessError) as error:
-                    raise PrepareFailure('prepare-step-failed', 0) from error
+            setup_failure = PrepareFailure('artifact-fetch-failed', 0)
+        if setup_failure is None:
+            workspace.handoff()
             try:
-                # Prepare may generate lockfiles; only a bounded no-follow read
-                # by the restricted principal crosses back as untrusted data.
-                data = package_snapshot(principal, cwd)
-                mirrors = hydrate_packages(root, cwd, data)
-                has_registry = (root / 'packages/registry-plan.json').is_file()
-                if has_registry and globals().get('GUI_CONFIG') is None:
+                principal = Principal(root)
+            except PrepareFailure as error:
+                setup_failure = error
+        if setup_failure is None:
+            registry = None
+            try:
+                principal.share(cwd)
+                derived = root / ('derived-' + execution['side'])
+                derived.mkdir()
+                principal.share(derived)
+                if recipe is not None:
                     try:
-                        registry = RegistryMirror(root)
-                        principal.registry_endpoints(registry.endpoints)
-                    except OSError as error:
-                        raise PrepareFailure('package-ipc-unavailable') from error
-                if mirrors or registry:
-                    install_package_mirrors(principal, mirrors, registry) if registry else install_package_mirrors(principal, mirrors)
-                has_binary = hydrate_binary_packages(principal, root, cwd, mirrors, derived / 'SourcePackages')
-            except (ValueError, OSError, subprocess.SubprocessError) as error:
-                raise PrepareFailure(error.code if isinstance(error, PrepareFailure) else 'package-hydration-failed') from error
-            code, version = principal.run(['/usr/bin/xcodebuild', '-version'], root)
-            if code or version.strip() != 'Xcode ' + ENVIRONMENT['xcode'] + '\nBuild version ' + ENVIRONMENT['build']:
-                raise ValueError('pinned Xcode version unavailable')
-            device = None
-            if any(build.get('platform', 'iOS') == 'iOS' for build in execution['builds']):
-                code, inventory = principal.run(['/usr/bin/xcrun', 'simctl', 'list', '-j'], root)
-                if code:
-                    raise ValueError('simulator unavailable')
-                device_type, runtime = simulator(json.loads(inventory))
-                code, device = principal.run(['/usr/bin/xcrun', 'simctl', 'create', 'factory-' + request['NONCE'], device_type, runtime], root)
-                device = device.strip()
-                if code or not re.fullmatch('[0-9A-Fa-f-]{36}', device):
-                    raise ValueError('simulator creation failed')
-            def arguments(build):
-                return ['/usr/bin/xcodebuild', build['flag'], build['container'], '-scheme', build['scheme'],
-                        '-destination', 'platform=macOS' if build.get('platform') == 'macOS' else 'platform=iOS Simulator,id=' + device,
-                        '-derivedDataPath', str(derived), '-clonedSourcePackagesDirPath', str(derived / 'SourcePackages'),
-                        *(['CODE_SIGN_IDENTITY=-', 'DEVELOPMENT_TEAM=', 'PROVISIONING_PROFILE=', 'PROVISIONING_PROFILE_SPECIFIER='] if globals().get('GUI_CONFIG') is not None else ['CODE_SIGNING_ALLOWED=NO']),
-                        '-disableAutomaticPackageResolution', '-skipPackageUpdates',
-                        '-skipMacroValidation', '-skipPackagePluginValidation']
-            if mirrors or registry or has_binary or has_registry:
-                for build in execution['builds']:
-                    # Only this restricted principal evaluates Package.swift.
-                    # Local mirrors contain the exact lockfile commits.
-                    # Internet and ungranted local endpoints stay denied;
-                    # missing transitive pins or native trust refusals fail closed.
-                    resolve = [arg for arg in arguments(build) if arg != '-disableAutomaticPackageResolution']
-                    code, output = principal.run(resolve + ['-resolvePackageDependencies', '-onlyUsePackageVersionsFromResolvedFile'], cwd)
+                        # Successful prepare output is not compiler evidence. Keep
+                        # execution.log BUILD-only, exactly as the local runner does.
+                        run_prepare(principal, cwd, recipe, artifacts)
+                    except PrepareFailure:
+                        raise
+                    except (ValueError, OSError, subprocess.SubprocessError) as error:
+                        raise PrepareFailure('prepare-step-failed', 0) from error
+                try:
+                    # Prepare may generate lockfiles; only a bounded no-follow read
+                    # by the restricted principal crosses back as untrusted data.
+                    data = package_snapshot(principal, cwd)
+                    mirrors = hydrate_packages(root, cwd, data)
+                    has_registry = (root / 'packages/registry-plan.json').is_file()
+                    if has_registry and globals().get('GUI_CONFIG') is None:
+                        try:
+                            registry = RegistryMirror(root)
+                            principal.registry_endpoints(registry.endpoints)
+                        except OSError as error:
+                            raise PrepareFailure('package-ipc-unavailable') from error
+                    if mirrors or registry:
+                        install_package_mirrors(principal, mirrors, registry) if registry else install_package_mirrors(principal, mirrors)
+                    has_binary = hydrate_binary_packages(principal, root, cwd, mirrors, derived / 'SourcePackages')
+                except (ValueError, OSError, subprocess.SubprocessError) as error:
+                    raise PrepareFailure(error.code if isinstance(error, PrepareFailure) else 'package-hydration-failed') from error
+                code, version = principal.run(['/usr/bin/xcodebuild', '-version'], root)
+                if code or version.strip() != 'Xcode ' + ENVIRONMENT['xcode'] + '\nBuild version ' + ENVIRONMENT['build']:
+                    raise ValueError('pinned Xcode version unavailable')
+                device = None
+                if any(build.get('platform', 'iOS') == 'iOS' for build in execution['builds']):
+                    code, inventory = principal.run(['/usr/bin/xcrun', 'simctl', 'list', '-j'], root)
                     if code:
-                        raise PrepareFailure(package_resolution_failure(output))
-            result['status'] = 'ran'
-            # Like the local runner, complete every build before any test. A later target's failed build must not
-            # leave partial executed cases that mask compiler attribution/retries for the other targets.
-            for build in execution['builds']:
-                code, log = principal.run(arguments(build) + ['build-for-testing'], cwd)
-                # Standardize only the workspace's macOS /private/tmp alias;
-                # C# can attribute paths without access to this remote filesystem.
-                result['log'] += log.replace('/private' + str(cwd), str(cwd)) + '\n'
-                execution_json(payload)
-                if code:
-                    result['status'] = 'build-failed' if code == 65 else 'error'
-                    break
-            for build in execution['builds'] if result['status'] == 'ran' else []:
-                common = arguments(build)
-                for test in build['tests']:
-                    name = 'xcode-test-' + hashlib.sha256(test.encode('utf-8')).hexdigest()[:16]
-                    bundle = derived / (name + '.xcresult')
-                    code, output = principal.run(common + ['test-without-building', '-only-testing:' + test,
-                        '-parallel-testing-enabled', 'NO', '-resultBundlePath', str(bundle)], cwd, extra_environment=resolve_test_environment(execution.get('testEnvironment', {}), cwd))
-                    # Principal.run proves uid quiescence even on exit 0 before
-                    # the collector reads anything. Never execute a PR helper.
-                    report_code, report = principal.run(['/usr/bin/xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path', str(bundle)], root)
-                    result['files'].extend([{'name': name + '.out', 'content': output, 'exitCode': code},
-                                            {'name': name + '.json', 'content': report, 'exitCode': report_code}])
+                        raise ValueError('simulator unavailable')
+                    device_type, runtime = simulator(json.loads(inventory))
+                    code, device = principal.run(['/usr/bin/xcrun', 'simctl', 'create', 'factory-' + request['NONCE'], device_type, runtime], root)
+                    device = device.strip()
+                    if code or not re.fullmatch('[0-9A-Fa-f-]{36}', device):
+                        raise ValueError('simulator creation failed')
+                def arguments(build):
+                    return ['/usr/bin/xcodebuild', build['flag'], build['container'], '-scheme', build['scheme'],
+                            '-destination', 'platform=macOS' if build.get('platform') == 'macOS' else 'platform=iOS Simulator,id=' + device,
+                            '-derivedDataPath', str(derived), '-clonedSourcePackagesDirPath', str(derived / 'SourcePackages'),
+                            *(['CODE_SIGN_IDENTITY=-', 'DEVELOPMENT_TEAM=', 'PROVISIONING_PROFILE=', 'PROVISIONING_PROFILE_SPECIFIER='] if globals().get('GUI_CONFIG') is not None else ['CODE_SIGNING_ALLOWED=NO']),
+                            '-disableAutomaticPackageResolution', '-skipPackageUpdates',
+                            '-skipMacroValidation', '-skipPackagePluginValidation']
+                if mirrors or registry or has_binary or has_registry:
+                    for build in execution['builds']:
+                        # Only this restricted principal evaluates Package.swift.
+                        # Local mirrors contain the exact lockfile commits.
+                        # Internet and ungranted local endpoints stay denied;
+                        # missing transitive pins or native trust refusals fail closed.
+                        resolve = [arg for arg in arguments(build) if arg != '-disableAutomaticPackageResolution']
+                        code, output = principal.run(resolve + ['-resolvePackageDependencies', '-onlyUsePackageVersionsFromResolvedFile'], cwd)
+                        if code:
+                            raise PrepareFailure(package_resolution_failure(output))
+                result['status'] = 'ran'
+                # Like the local runner, complete every build before any test. A later target's failed build must not
+                # leave partial executed cases that mask compiler attribution/retries for the other targets.
+                for build in execution['builds']:
+                    code, log = principal.run(arguments(build) + ['build-for-testing'], cwd)
+                    # Standardize only the workspace's macOS /private/tmp alias;
+                    # C# can attribute paths without access to this remote filesystem.
+                    result['log'] += log.replace('/private' + str(cwd), str(cwd)) + '\n'
                     execution_json(payload)
-        except PrepareFailure as error:
-            result.update(status='prepare-failed', failure={'code': error.code, 'step': error.step})
-        finally:
-            try:
-                principal.close()
+                    if code:
+                        result['status'] = 'build-failed' if code == 65 else 'error'
+                        break
+                for build in execution['builds'] if result['status'] == 'ran' else []:
+                    common = arguments(build)
+                    for test in build['tests']:
+                        name = 'xcode-test-' + hashlib.sha256(test.encode('utf-8')).hexdigest()[:16]
+                        bundle = derived / (name + '.xcresult')
+                        code, output = principal.run(common + ['test-without-building', '-only-testing:' + test,
+                            '-parallel-testing-enabled', 'NO', '-resultBundlePath', str(bundle)], cwd, extra_environment=resolve_test_environment(execution.get('testEnvironment', {}), cwd))
+                        # Principal.run proves uid quiescence even on exit 0 before
+                        # the collector reads anything. Never execute a PR helper.
+                        report_code, report = principal.run(['/usr/bin/xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path', str(bundle)], root)
+                        result['files'].extend([{'name': name + '.out', 'content': output, 'exitCode': code},
+                                                {'name': name + '.json', 'content': report, 'exitCode': report_code}])
+                        execution_json(payload)
+            except PrepareFailure as error:
+                result.update(status='prepare-failed', failure={'code': error.code, 'step': error.step})
             finally:
-                if registry is not None:
-                    registry.close()
-        write_execution_result(payload)
-
+                try:
+                    principal.close()
+                finally:
+                    if registry is not None:
+                        registry.close()
+        if setup_failure is not None:
+            result.update(status='prepare-failed', failure={'code': setup_failure.code, 'step': None})
+    write_execution_result(payload)
 
 def main():
     global EXECUTION_DEADLINE

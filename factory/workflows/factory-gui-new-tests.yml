@@ -37,6 +37,7 @@ jobs:
     permissions: {}
     outputs:
       sides: ${{ steps.plan.outputs.sides }}
+      archive_sides: ${{ steps.plan.outputs.archive_sides }}
     steps:
       - name: Select requested execution side
         id: plan
@@ -47,13 +48,20 @@ jobs:
           import json, os
           execution = os.environ['EXECUTION']
           sides = ['base', 'head']
+          archive_sides = sides.copy()
           if execution:
-              side = json.loads(execution)['side']
+              parsed = json.loads(execution)
+              side = parsed['side']
               if side not in ('base', 'head'):
                   raise ValueError('invalid execution side')
               sides = [side]
+              archive_sides = sides.copy()
+              # The opposite archive is needed only when this execution's overlay copies from the other revision.
+              if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):
+                  archive_sides.append('head' if side == 'base' else 'base')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('sides=' + json.dumps(sides) + '\n')
+              output.write('archive_sides=' + json.dumps(archive_sides) + '\n')
           PY
       # Public immutable source only: never mint a cross-repository token or
       # silently reuse the collector repository's installation authority.
@@ -63,15 +71,19 @@ jobs:
           TRUSTED_REPOSITORIES: ${{ vars.FACTORY_GUI_TRUSTED_REPOSITORIES }}
           BASE: ${{ inputs.base }}
           HEAD: ${{ inputs.head }}
+          SIDES: ${{ steps.plan.outputs.archive_sides }}
         run: |
           python3 -I - <<'PYCODE'
-          import os, re, urllib.request
+          import json, os, re, urllib.request
           repo = os.environ['SOURCE_REPOSITORY']
           trusted = [v.strip().lower() for v in os.environ['TRUSTED_REPOSITORIES'].split(',')]
           if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*', repo) or repo.lower() not in trusted:
               raise ValueError('source repository is not allowlisted')
           os.mkdir('sources')
-          for side in ('base', 'head'):
+          sides = json.loads(os.environ['SIDES'])
+          if not isinstance(sides, list) or not sides or len(sides) > 2 or any(side not in ('base', 'head') for side in sides) or len(set(sides)) != len(sides):
+              raise ValueError('invalid requested source sides')
+          for side in sides:
               sha = os.environ[side.upper()]
               if not re.fullmatch('[0-9a-f]{40}', sha):
                   raise ValueError('invalid immutable source commit')
@@ -99,7 +111,7 @@ jobs:
       fail-fast: false
       matrix:
         side: ${{ fromJSON(needs.sources.outputs.sides) }}
-    runs-on: [self-hosted, macOS, ARM64, factory-gui-collector]
+    runs-on: [factory-gui-collector]
     # Hosted hard ceiling only; Python enforces the transported remaining deadline.
     timeout-minutes: 360
     permissions: {}

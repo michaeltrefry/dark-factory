@@ -31,7 +31,8 @@ public sealed record CacheManifest(
     [property: JsonPropertyName("sha256")] string Sha256,
     [property: JsonPropertyName("unpack")] string Unpack,
     [property: JsonPropertyName("file")] string? File,
-    [property: JsonPropertyName("entries")] IReadOnlyList<CachedEntry> Entries);
+    [property: JsonPropertyName("entries")] IReadOnlyList<CachedEntry> Entries,
+    [property: JsonPropertyName("downloaded_bytes")] long? DownloadedBytes = null);
 
 /// <summary>
 /// The harness-owned artifact cache (sc-26232): <c>&lt;WorkRoot&gt;/artifact-cache</c>, content-addressed — one entry per
@@ -67,7 +68,7 @@ public sealed class ArtifactCache(string root)
     private bool _rootReady;
 
     /// <summary>Entries this cache verified in full, by entry directory: the manifest's identity when it was (its modification time and length).</summary>
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, long Length, string Path)> _verified = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, long Length, string Path, long DownloadedBytes, long UnpackedBytes)> _verified = new(StringComparer.Ordinal);
 
     /// <summary>How many full verifications (every file hashed) this cache made: a test's count.</summary>
     internal int Verifications;
@@ -211,6 +212,8 @@ public sealed class ArtifactCache(string root)
     public async Task<string> StoreAsync(PrepareArtifact artifact, string download, string? fileName, CancellationToken ct)
     {
         await EnsureRootAsync(ct);
+        var downloadedBytes = new FileInfo(download).Length;
+        CheckLimits(artifact, downloadedBytes, 0);
         var partial = System.IO.Path.Combine(root, $".partial-{Guid.NewGuid():N}");
         System.IO.Directory.CreateDirectory(partial);
         try
@@ -236,7 +239,7 @@ public sealed class ArtifactCache(string root)
                     UnpackTar(download, content, artifact.Unpack == ArtifactUnpack.TarGz, artifact.MaxUnpackedBytes, ct);
                     break;
             }
-            var manifest = new CacheManifest(artifact.Sha256, UnpackName(artifact.Unpack), file, Walk(content, ct));
+            var manifest = new CacheManifest(artifact.Sha256, UnpackName(artifact.Unpack), file, Walk(content, ct), downloadedBytes);
             var manifestPath = System.IO.Path.Combine(partial, ManifestName);
             await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest), ct);
             SetMode(manifestPath, FileMode(false));
@@ -304,6 +307,7 @@ public sealed class ArtifactCache(string root)
             }
             if (_verified.TryGetValue(entry, out var known) && known.Ticks == manifestInfo.LastWriteTimeUtc.Ticks && known.Length == manifestInfo.Length)
             {
+                CheckLimits(artifact, known.DownloadedBytes, known.UnpackedBytes);
                 return new Verified(known.Path, null);
             }
             Interlocked.Increment(ref Verifications);
@@ -316,7 +320,8 @@ public sealed class ArtifactCache(string root)
                 return Verified.Mismatch;
             }
             if (JsonSerializer.Deserialize<CacheManifest>(File.ReadAllText(manifestPath)) is not { } manifest
-                || manifest.Sha256 != artifact.Sha256 || manifest.Unpack != UnpackName(artifact.Unpack) || manifest.Entries is null)
+                || manifest.Sha256 != artifact.Sha256 || manifest.Unpack != UnpackName(artifact.Unpack) || manifest.Entries is null
+                || manifest.DownloadedBytes is not (>= 0))
             {
                 return Verified.Mismatch;
             }
@@ -326,10 +331,20 @@ public sealed class ArtifactCache(string root)
             {
                 return Verified.Mismatch;
             }
+            long unpackedBytes = 0;
+            foreach (var item in actual)
+            {
+                if (item.Size < 0 || item.Size > long.MaxValue - unpackedBytes)
+                {
+                    return Verified.Mismatch;
+                }
+                unpackedBytes += item.Size;
+            }
+            var downloadedBytes = manifest.DownloadedBytes.Value;
             string? path;
             if (artifact.Unpack == ArtifactUnpack.None)
             {
-                path = manifest.File is { } file && actual is [{ Directory: false } only] && only.Path == file && only.Sha256 == artifact.Sha256
+                path = manifest.File is { } file && actual is [{ Directory: false } only] && only.Path == file && only.Sha256 == artifact.Sha256 && only.Size == downloadedBytes
                     ? System.IO.Path.Combine(content, file)
                     : null;
             }
@@ -341,7 +356,8 @@ public sealed class ArtifactCache(string root)
             {
                 return Verified.Mismatch;
             }
-            _verified[entry] = (manifestInfo.LastWriteTimeUtc.Ticks, manifestInfo.Length, path);
+            _verified[entry] = (manifestInfo.LastWriteTimeUtc.Ticks, manifestInfo.Length, path, downloadedBytes, unpackedBytes);
+            CheckLimits(artifact, downloadedBytes, unpackedBytes);
             return new Verified(path, null);
         }
         catch (Exception ex) when (ex is LinkInEntryException or JsonException or NotSupportedException)
@@ -351,6 +367,21 @@ public sealed class ArtifactCache(string root)
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return new Verified(null, $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // Verification is memoized by content identity, not recipe: a later recipe may tighten either limit.
+    // A valid entry over those limits is refused, not corrupted or deleted. Legacy manifests without the
+    // downloaded size cannot prove max_bytes (an archive is no longer kept), so Verify invalidates them for refetch.
+    private static void CheckLimits(PrepareArtifact artifact, long downloadedBytes, long unpackedBytes)
+    {
+        if (downloadedBytes > artifact.MaxBytes)
+        {
+            throw new ArtifactFetchException($"artifact {artifact.Name}: the download has {downloadedBytes} bytes, more than max_bytes {artifact.MaxBytes}");
+        }
+        if (artifact.Unpack != ArtifactUnpack.None && unpackedBytes > artifact.MaxUnpackedBytes)
+        {
+            throw new ArtifactFetchException($"artifact {artifact.Name}: the archive unpacks to more than {artifact.MaxUnpackedBytes} bytes (max_unpacked_bytes)");
         }
     }
 
@@ -467,6 +498,12 @@ public sealed class ArtifactCache(string root)
                 throw new ArtifactFetchException($"the archive holds more than {MaxEntries} entries");
             }
             if (entry.EntryType is TarEntryType.GlobalExtendedAttributes or TarEntryType.ExtendedAttributes)
+            {
+                continue;
+            }
+            // tar -C <dir> . commonly emits a root marker. It creates no child, and only a
+            // directory may be ignored: a root file/link must still fail the path/type checks.
+            if (entry.EntryType == TarEntryType.Directory && entry.Name is "." or "./")
             {
                 continue;
             }

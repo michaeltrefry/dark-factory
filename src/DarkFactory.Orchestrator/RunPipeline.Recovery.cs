@@ -49,6 +49,7 @@ public sealed partial class RunPipeline
                 return await OutcomeAsync(item, "Recovery refused: the item is already running.", ct);
             }
             await ledger.ReloadAsync(item, ct);
+            if (await ReservedRecordedWorkAsync(item, ct) is { } reserved) return await OutcomeAsync(item, reserved, ct);
             OwnerRecovery recovery;
             try
             {
@@ -65,11 +66,13 @@ public sealed partial class RunPipeline
                 Require(!Plans.PlanRelease.MergedOutsideChangeset(history), "the story already merged into its changeset");
                 var spec = await source.ReadSpecAsync(storyId, ct);
                 var primary = RepoResolver.Resolve(spec.Story.Description, defaultRepo);
+                FactoryRepositoryPolicy.EnsureWorkAllowed(primary, _reservedController);
                 var url = LinkedPullRequestUrl(history) ?? throw new InvalidOperationException("no recorded PR");
                 var repo = history.Any(e => e.Step == Steps.PlanStories)
                     ? Plans.Changeset.All(history).FirstOrDefault(c => SameRepo(c.Repo, GitHubGate.ParsePullUrl(url).Repo.FullName)) is { } pass
                         ? RepoRef.Parse(pass.Repo) : throw new InvalidOperationException("the linked plan pass has no recorded changeset")
                     : primary;
+                FactoryRepositoryPolicy.EnsureWorkAllowed(repo, _reservedController);
                 Require(SameRepo(item.Repo, repo.FullName), "the item's repository changed since its recorded work");
                 // A plan's changeset may live in a repository other than its primary one.
                 var changeset = Plans.Changeset.Of(history, repo);

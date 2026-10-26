@@ -220,6 +220,30 @@ public sealed class WorkerHeadlessTests
             sandbox.RunAsync(_dir, "/bin/echo", ["must-not-run"], CancellationToken.None));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Empty_uid_selection_never_skips_quarantined_slots_root_cleanup_proof(bool uncertain)
+    {
+        // No real user has this name: owner-side ps -U would have no processes. The checked helper's root inventory,
+        // independently, contains only other users (or fails); that proof alone may clear this marker.
+        var sandbox = RootSandbox(failCleanup: uncertain) with { User = "df-test-no-such-user" };
+        File.WriteAllText(sandbox.HelperPath + ".quarantine", "held");
+        var other = Path.Combine(_dir, "other-slot.quarantine");
+        File.WriteAllText(other, "other-held");
+        if (uncertain)
+        {
+            await Assert.ThrowsAsync<FactoryUnavailableException>(() => sandbox.StopAllAsync(CancellationToken.None));
+            Assert.True(File.Exists(sandbox.HelperPath + ".quarantine"));
+        }
+        else
+        {
+            Assert.True(await sandbox.StopAllAsync(CancellationToken.None));
+            Assert.False(File.Exists(sandbox.HelperPath + ".quarantine"));
+        }
+        Assert.Equal("other-held", File.ReadAllText(other));
+    }
+
     [Fact]
     public async Task Successful_worker_then_root_cleanup_uncertainty_is_not_an_application_result()
     {
@@ -369,4 +393,212 @@ public sealed class WorkerHeadlessTests
         }
         finally { own.KillIfStillRunning(); }
     }
+}
+
+[System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+public class LiveSandboxGuardTests
+{
+    private readonly string _dir = Directory.CreateTempSubdirectory("df-live-guard-").FullName;
+
+    private WorkerSlot[] Slots() => Enumerable.Range(1, 2).Select(n => new WorkerSlot(n,
+        new WorkerSandbox("_dftest" + n, "/never-run/helper" + n) { Lock = WorkerLock.For(_dir, n) })).ToArray();
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("true")]
+    [InlineData("0")]
+    public async Task Missing_explicit_live_optin_reaches_neither_configuration_readiness_nor_probe(string? optIn)
+    {
+        var calls = new List<string>();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => LiveWorkerSandboxTests.RunGuardedAsync(optIn,
+            () => { calls.Add("configure"); return Task.FromResult<IReadOnlyList<WorkerSlot>>(Slots()); },
+            _ => { calls.Add("ready"); return Task.CompletedTask; },
+            _ => { calls.Add("probe"); return Task.CompletedTask; }));
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public async Task All_live_slot_locks_are_held_before_first_readiness_and_until_the_probe_finishes()
+    {
+        var slots = Slots();
+        var calls = new List<string>();
+        await LiveWorkerSandboxTests.RunGuardedAsync("1", () => Task.FromResult<IReadOnlyList<WorkerSlot>>(slots),
+            slot =>
+            {
+                Assert.All(slots, s => Assert.True(s.Lock!.IsHeld));
+                Assert.Same(slots[slot.Number - 1].Sandbox, slot.Sandbox);
+                calls.Add("ready" + slot.Number);
+                return Task.CompletedTask;
+            },
+            live =>
+            {
+                Assert.All(live, s => Assert.True(s.Lock!.IsHeld));
+                Assert.Same(slots, live);
+                calls.Add("probe");
+                return Task.CompletedTask;
+            });
+        Assert.Equal(["ready1", "ready2", "probe"], calls);
+        Assert.All(slots, s => Assert.False(s.Lock!.IsHeld));
+    }
+
+    [Fact]
+    public async Task A_busy_later_slot_fails_fast_without_any_readiness_and_releases_earlier_locks()
+    {
+        var slots = Slots();
+        var calls = new List<string>();
+        using (WorkerLock.Acquire(_dir, 2))
+        {
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => LiveWorkerSandboxTests.RunGuardedAsync("1",
+                () => Task.FromResult<IReadOnlyList<WorkerSlot>>(slots),
+                _ => { calls.Add("ready"); return Task.CompletedTask; }, _ => { calls.Add("probe"); return Task.CompletedTask; }).WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Contains("slot 2", error.Message);
+            Assert.Contains("busy", error.Message);
+            Assert.Empty(calls);
+            Assert.True(await slots[0].Lock!.TryHoldAsync(() => Task.CompletedTask));
+        }
+        Assert.True(await slots[1].Lock!.TryHoldAsync(() => Task.CompletedTask));
+    }
+
+    [Theory]
+    [InlineData("empty")]
+    [InlineData("missing")]
+    [InlineData("shared")]
+    public async Task A_live_probe_refuses_missing_or_shared_slot_locks_before_readiness(string problem)
+    {
+        var slots = Slots();
+        IReadOnlyList<WorkerSlot> invalid = problem switch
+        {
+            "empty" => [],
+            "missing" => [slots[0] with { Sandbox = slots[0].Sandbox with { Lock = null } }],
+            _ => [slots[0], slots[1] with { Sandbox = slots[1].Sandbox with { Lock = slots[0].Lock } }],
+        };
+        var calls = 0;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => LiveWorkerSandboxTests.RunGuardedAsync("1",
+            () => Task.FromResult(invalid), _ => { calls++; return Task.CompletedTask; }, _ => { calls++; return Task.CompletedTask; }));
+        Assert.Equal(0, calls);
+    }
+
+    private const string Metadata = "450\n_dftest\n450\nBackground\nuser/450 = {\n type = user\n security context = {\n uid = 450\n }\n}\n";
+
+    [Fact]
+    public void Own_background_manager_and_own_security_context_are_recognized() =>
+        Assert.Null(LiveWorkerSandboxTests.HeadlessIdentityProblem("_dftest", Metadata));
+
+    [Theory]
+    [InlineData("identity")]
+    [InlineData("manager-uid")]
+    [InlineData("manager-name")]
+    [InlineData("domain-kind")]
+    [InlineData("context-uid")]
+    [InlineData("context-missing")]
+    [InlineData("context-duplicate")]
+    public void Owner_other_user_aqua_or_unrecognized_context_is_not_headless_proof(string problem)
+    {
+        var bad = problem switch
+        {
+            "identity" => Metadata.Replace("_dftest", "owner"),
+            "manager-uid" => Metadata.Replace("_dftest\n450\n", "_dftest\n501\n"),
+            "manager-name" => Metadata.Replace("Background", "Aqua"),
+            "domain-kind" => Metadata.Replace("type = user", "type = login"),
+            "context-uid" => Metadata.Replace("uid = 450", "uid = 501"),
+            "context-missing" => Metadata.Replace("security context", "unknown context"),
+            _ => Metadata.Replace("uid = 450", "uid = 450\n uid = 450"),
+        };
+        Assert.NotNull(LiveWorkerSandboxTests.HeadlessIdentityProblem("_dftest", bad));
+    }
+
+    [Fact]
+    public void Owner_file_denial_probe_requires_existing_private_file_and_includes_only_existing_credentials()
+    {
+        var home = Directory.CreateDirectory(Path.Combine(_dir, "home")).FullName;
+        var probe = Path.Combine(home, "private-probe");
+        File.WriteAllText(probe, "private-test-sentinel");
+        File.SetUnixFileMode(probe, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var credential = Path.Combine(home, ".config", "gh", "hosts.yml");
+        Directory.CreateDirectory(Path.GetDirectoryName(credential)!);
+        File.WriteAllText(credential, "credential-test-sentinel");
+        Assert.Equal([probe, credential], LiveWorkerSandboxTests.OwnerProbePaths(home, probe));
+        Assert.Equal("private-test-sentinel", File.ReadAllText(probe));
+        Assert.Equal("credential-test-sentinel", File.ReadAllText(credential));
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("outside")]
+    [InlineData("public")]
+    [InlineData("symlink")]
+    public void A_missing_outside_public_or_symlinked_owner_file_cannot_make_denial_vacuously_pass(string problem)
+    {
+        var home = Directory.CreateDirectory(Path.Combine(_dir, "home")).FullName;
+        var actual = Path.Combine(problem == "outside" ? _dir : home, "probe");
+        File.WriteAllText(actual, "sentinel");
+        File.SetUnixFileMode(actual, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var probe = actual;
+        if (problem == "missing") probe += ".not-present";
+        if (problem == "public") File.SetUnixFileMode(actual, UnixFileMode.UserRead | UnixFileMode.OtherRead);
+        if (problem == "symlink") { probe += ".link"; File.CreateSymbolicLink(probe, actual); }
+        Assert.Throws<InvalidOperationException>(() => LiveWorkerSandboxTests.OwnerProbePaths(home, probe));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("0")]
+    [InlineData("true")]
+    public void Automatic_owner_probe_is_not_created_without_explicit_live_authorization(string? optIn)
+    {
+        var home = Directory.CreateDirectory(Path.Combine(_dir, "home")).FullName;
+        LiveWorkerSandboxTests.OwnerProbeFixture? fixture = null;
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => fixture = LiveWorkerSandboxTests.CreateOwnerProbe(optIn, home, null));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(home));
+        }
+        finally { fixture?.Dispose(); }
+    }
+
+    [Fact]
+    public void Authorized_automatic_probe_is_nonsecret_private_owner_home_fixture_and_only_its_own_files_are_cleaned()
+    {
+        var home = Directory.CreateDirectory(Path.Combine(_dir, "home")).FullName;
+        var sibling = Path.Combine(home, "existing-owner-file");
+        File.WriteAllText(sibling, "owner-test-sentinel");
+        LiveWorkerSandboxTests.OwnerProbeFixture? fixture = null;
+        var error = Record.Exception(() => fixture = LiveWorkerSandboxTests.CreateOwnerProbe("1", home, null));
+        Assert.Null(error);
+        string file = fixture!.ProbePath, directory = Path.GetDirectoryName(file)!;
+        using (fixture)
+        {
+            Assert.StartsWith(home + Path.DirectorySeparatorChar, file);
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(file));
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(directory));
+            Assert.Equal([file], fixture.Paths);
+            Assert.Equal("Nonsecret dark-factory live sandbox identity probe.\n", File.ReadAllText(file));
+        }
+        Assert.False(File.Exists(file));
+        Assert.False(Directory.Exists(directory));
+        Assert.True(Directory.Exists(home));
+        Assert.Equal("owner-test-sentinel", File.ReadAllText(sibling));
+        Assert.Equal([sibling], Directory.GetFiles(home));
+    }
+
+    [Fact]
+    public void Explicit_existing_owner_probe_override_is_opened_only_and_never_deleted_by_fixture_cleanup()
+    {
+        var home = Directory.CreateDirectory(Path.Combine(_dir, "home")).FullName;
+        var existing = Path.Combine(home, "existing-private-probe");
+        File.WriteAllText(existing, "existing-test-sentinel");
+        File.SetUnixFileMode(existing, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        using (var fixture = LiveWorkerSandboxTests.CreateOwnerProbe("1", home, existing))
+        {
+            Assert.Equal(existing, fixture.ProbePath);
+            Assert.Equal([existing], fixture.Paths);
+            Assert.Equal([existing], Directory.GetFiles(home));
+            Assert.Empty(Directory.GetDirectories(home));
+        }
+        Assert.True(File.Exists(existing));
+        Assert.Equal("existing-test-sentinel", File.ReadAllText(existing));
+    }
+
 }
