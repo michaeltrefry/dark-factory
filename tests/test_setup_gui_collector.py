@@ -36,19 +36,70 @@ class FakeHost:
         self.acls = set()
         self.used = {0, 501, 502}
         self.fail = None
+        self.crash_after = None
+        self.groups = {}
+        self.fields = {}
+        self.services = set()
+        self.unremovable = set()
 
     def account(self, name):
         return self.accounts.get(name)
 
     def ids(self):
-        return self.used, self.used
+        return self.used | set(self.accounts[x]['uid'] for x in self.accounts), self.used | set(self.groups.values()) - {502}
 
     def group(self, name):
-        return self.accounts.get(name, {}).get('gid')
+        return self.groups.get(name)
+
+    def group_state(self, name):
+        return None if name not in self.groups else (self.groups[name], set())
+
+    def uid_free(self, uid):
+        users, groups = self.ids()
+        return uid not in users and uid not in groups
+
+    def _before(self, label):
+        if self.fail == label:
+            raise setup.Refused('simulated failure')
+
+    def _after(self, label):
+        if self.crash_after and self.crash_after(label):
+            self.crash_after = None
+            raise setup.Refused('simulated crash after effect')
+
+    def create_group(self, name, uid):
+        self.calls.append(('create_group', name, uid))
+        self._before('group')
+        self.groups[name] = uid
+        self._after('group')
 
     def create_account(self, name, uid, home):
+        if name not in self.groups:
+            self.create_group(name, uid)
         self.accounts[name] = dict(uid=uid, gid=uid, home=home, shell='/usr/bin/false')
-        self.calls.append(('account', name, uid, home))
+        self.fields[name] = {key: value(self.setup_plan()) for key, value in setup.ACCOUNT_FIELDS}
+
+    def setup_plan(self):
+        return getattr(self, 'plan', {'uid': 503, 'home': '/Users/_factorygui'})
+
+    def account_fields(self, name):
+        return None if name not in self.fields else dict(self.fields[name])
+
+    def write_account_field(self, name, key, value):
+        self.calls.append(('write_field', name, key, value))
+        self._before('field:' + key)
+        self.fields.setdefault(name, {})[key] = value
+        values = self.fields[name]
+        if all(key in values for key, _ in setup.ACCOUNT_FIELDS):
+            self.accounts[name] = dict(uid=int(values['UniqueID']), gid=int(values['PrimaryGroupID']),
+                                       home=values['NFSHomeDirectory'], shell=values['UserShell'])
+        else:
+            self.accounts.pop(name, None)
+        self._after('field:' + key)
+
+    def service_absent(self, label):
+        self.calls.append(('service_absent', label))
+        return label not in self.services
 
     def verify_account(self, name, uid, home):
         setup.require(self.accounts[name] == dict(uid=uid, gid=uid, home=str(home), shell='/usr/bin/false'), 'account mismatch')
@@ -75,8 +126,10 @@ class FakeHost:
 
     def stop(self, label):
         self.calls.append(('stop', label))
-        if self.fail == 'stop':
-            raise setup.Refused('simulated stop failure')
+        self._before('stop')
+        if label not in self.unremovable:
+            self.services.discard(label)
+        self._after('stop')
 
 
 class Contracts(unittest.TestCase):
@@ -124,6 +177,8 @@ class Contracts(unittest.TestCase):
         self.plan['old']['files']['servicePlist'] = setup.digest(service.read_bytes())
         self.authority = dict(expiresAt=time.time() + 600, appPermissionsVerified=True, newNameAbsent=True,
                               migratedWorkflows=[dict(path=path, sha256='a' * 64, collectorProtocol=True) for path in sorted(setup.MIGRATED_WORKFLOWS)])
+        self.host.plan = self.plan
+        self.host.services.add('actions.runner.old')
         self.bind()
         self.installer = setup.Installer(self.plan, self.host, self.root)
 
@@ -154,7 +209,7 @@ class Contracts(unittest.TestCase):
                 self.installer.validate(self.authority)
 
     def test_existing_group_name_is_not_reassigned(self):
-        self.host.group = lambda name: 777
+        self.host.groups['_factorygui'] = 777
         with self.assertRaises(setup.Refused):
             self.installer.validate(self.authority)
         self.assertEqual([], self.host.calls)
@@ -236,9 +291,58 @@ class Contracts(unittest.TestCase):
         with self.assertRaises(setup.Refused):
             setup.inventory('/Users/lwrunner/actions-runner', self.host, self.root)
 
+    def runTest(self):
+        pass
+
+    def fresh(self):
+        case = type(self)('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
+    def test_crash_after_each_account_creation_effect_resumes_exact(self):
+        labels = ['group'] + ['field:' + key for key, _ in setup.ACCOUNT_FIELDS]
+        self.assertEqual(7, len(labels))
+        for label in labels:
+            with self.subTest(after=label):
+                case = self.fresh()
+                case.host.crash_after = lambda step: step == label
+                with self.assertRaises(setup.Refused):
+                    case.apply()
+                case.host.crash_after = None
+                self.assertEqual('awaiting-owner-online-verification-old-untouched', case.apply()['status'])
+                name = case.plan['user']
+                self.assertEqual(1, len([c for c in case.host.calls if c[0] == 'create_group']))
+                self.assertEqual({key for key, _ in setup.ACCOUNT_FIELDS}, set(case.host.fields[name]))
+                for key, _ in setup.ACCOUNT_FIELDS:
+                    self.assertEqual(1, len([c for c in case.host.calls if c[0] == 'write_field' and c[2] == key]))
+                self.assertEqual(503, case.host.accounts[name]['uid'])
+                self.assertEqual('/Users/_factorygui', case.host.accounts[name]['home'])
+                self.assertTrue((case.root / 'Users/_factorygui').is_dir())
+
+    def test_partial_account_conflicting_attribute_is_refused_not_overwritten(self):
+        self.host.crash_after = lambda step: step == 'group'
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.host.crash_after = None
+        self.host.fields['_factorygui'] = {'IsHidden': '0'}
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertEqual('0', self.host.fields['_factorygui']['IsHidden'])
+        self.assertFalse(any(c[0] == 'write_field' and c[2] == 'IsHidden' for c in self.host.calls))
+
+    def test_unrelated_group_with_reserved_name_is_not_adopted(self):
+        self.installer.mkdir(self.installer.path(setup.STATE))
+        self.installer.receipt.update(planSha256=self.authority['planSha256'], uid=503)
+        self.installer.save()
+        self.host.groups['_factorygui'] = 900
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertEqual(900, self.host.groups['_factorygui'])
+
     def test_reserved_account_before_home_creation_resumes(self):
         self.installer.mkdir(self.installer.path(setup.STATE))
-        self.installer.receipt.update(planSha256=self.authority['planSha256'])
+        self.installer.receipt.update(planSha256=self.authority['planSha256'], uid=503)
         self.installer.save()
         self.host.create_account('_factorygui', 503, '/Users/_factorygui')
         self.assertFalse((self.root / 'Users/_factorygui').exists())
@@ -446,6 +550,63 @@ class Contracts(unittest.TestCase):
             self.apply()
         self.assertFalse(any(x[0] == 'stop' for x in self.host.calls))
 
+    def test_crash_after_bootout_effect_resumes_without_second_bootout(self):
+        self.apply()
+        self.online()
+        self.host.crash_after = lambda step: step == 'stop'
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.host.crash_after = None
+        self.assertNotIn('old-service-stopped', self.installer.receipt['stages'])
+        self.assertEqual('complete', self.apply()['status'])
+        self.assertEqual(1, len([c for c in self.host.calls if c[0] == 'stop']))
+        self.assertIn('old-service-stopped', self.installer.receipt['stages'])
+        self.assertFalse((self.root / 'Users/lwrunner/actions-runner/.runner').exists())
+
+    def test_real_service_absence_proof_checks_every_domain(self):
+        original = setup.subprocess.run
+        def fake(answer):
+            setup.subprocess.run = lambda argv, **kw: answer(argv[-1])
+            try:
+                return setup.Host().service_absent('actions.runner.old')
+            finally:
+                setup.subprocess.run = original
+        def result(code, error=''):
+            return types.SimpleNamespace(returncode=code, stderr=error.encode(), stdout=b'')
+        def notfound(target):
+            return result(1, "Could not find service \"actions.runner.old\" in domain for user gui: 502: %s" % target)
+        self.assertTrue(fake(lambda target: result(0) if target == 'gui/502' else notfound(target)))
+        self.assertFalse(fake(lambda target: result(0)))
+        self.assertFalse(fake(lambda target: result(0) if target == 'gui/502' else result(1, 'Operation not permitted')))
+        self.assertFalse(fake(lambda target: result(1, 'Could not find service but other text') if target != 'gui/502' else result(0)))
+        with self.assertRaises(setup.Refused):
+            fake(lambda target: result(1, 'Could not find domain for gui: 502'))
+
+    def test_unknown_service_state_blocks_and_preserves_old_files(self):
+        self.apply()
+        self.online()
+        self.host.unremovable.add('actions.runner.old')
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.runner').exists())
+        self.assertTrue((self.root / 'var/db/dark-factory/gui-collector/rollback/.runner').exists())
+        self.assertIn('old-backup-protected', self.installer.receipt['stages'])
+        self.assertNotIn('old-retired', self.installer.receipt['stages'])
+        self.assertNotEqual('complete', self.installer.receipt['status'])
+
+    def test_retirement_intent_mismatch_is_refused(self):
+        self.apply()
+        self.online()
+        receipt = self.root / 'var/db/dark-factory/gui-collector/receipt.json'
+        data = json.loads(receipt.read_text())
+        data['retirement'] = {'serviceLabel': 'actions.runner.another', 'domain': 'gui/502',
+                              'userId': 502, 'runnerRoot': '/Users/lwrunner/actions-runner'}
+        receipt.write_text(json.dumps(data))
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(c[0] == 'stop' for c in self.host.calls))
+        self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.runner').exists())
+
     def test_retirement_failure_keeps_protected_backup_and_old_files(self):
         self.apply()
         self.online()
@@ -454,7 +615,7 @@ class Contracts(unittest.TestCase):
             self.apply()
         self.assertTrue((self.root / 'Users/lwrunner/actions-runner/.credentials').exists())
         self.assertTrue((self.root / 'var/db/dark-factory/gui-collector/rollback/.credentials').exists())
-        self.assertEqual('rollback-local-files-restored-registration-requires-owner', self.installer.receipt['status'])
+        self.assertEqual('retirement-blocked-local-files-restored-registration-requires-owner', self.installer.receipt['status'])
 
     def test_partial_retirement_restores_deleted_credential(self):
         self.apply()
@@ -521,8 +682,7 @@ class Contracts(unittest.TestCase):
 # Named RED mutations, restored GREEN, entirely in-memory and only this installer's code.
 MUTATIONS = [
     ('uid-floor', "p['uid'] >= 500 and p['uid'] != 502", "p['uid'] >= 1", 'test_uid_must_be_free_and_not_lwrunner'),
-    ('adopt-home', "require(not self.path(p['home']).exists(),", "require(True,", 'test_private_home_never_adopted'),
-    ('private-group', "self.host.group(p['user']) is None", 'True', 'test_existing_group_name_is_not_reassigned'),
+    ('adopt-home', "require(authorized, 'refusing to adopt an existing HOME')", "require(True, 'refusing to adopt an existing HOME')", 'test_private_home_never_adopted'),
     ('checksum', "file_digest(archive) == p['archiveSha256']", 'True', 'test_checksum_mismatch_refused'),
     ('migration-four', "len(workflows) == 4 and {w['path'] for w in workflows} == MIGRATED_WORKFLOWS", 'True', 'test_four_migrations_required'),
     ('app-permission', "authority.get('appPermissionsVerified') is True", 'True', 'test_app_permissions_required'),
@@ -538,12 +698,12 @@ MUTATIONS = [
     ('daemon-user', "'UserName': p['user']", "'UserName': 'lwrunner'", 'test_launchdaemon_is_non_gui_service_user'),
     ('old-id', "removed == old['runnerId']", 'True', 'test_exact_old_id_required_for_retirement'),
     ('old-inventory', "digest(source.read_bytes()) == old['files'][name]", 'True', 'test_old_hash_mismatch_preserves_service_and_credentials'),
-    ('rollback-status', "'rollback-local-files-restored-registration-requires-owner'", "'complete'", 'test_retirement_failure_keeps_protected_backup_and_old_files'),
+    ('rollback-status', "'retirement-blocked-local-files-restored-registration-requires-owner'", "'complete'", 'test_retirement_failure_keeps_protected_backup_and_old_files'),
     ('archive-link', '(member.isfile() or member.isdir())', 'True', 'test_archive_symlink_refused_without_execution'),
     ('rollback-file', 'if not source.exists():', 'if False:', 'test_partial_retirement_restores_deleted_credential'),
     ('retired-reappears', "not old_file.exists() and not old_file.is_symlink()", 'True', 'test_credential_reappearing_is_not_complete'),
     ('private-mode', 'stat.S_IMODE(node.st_mode) == mode', 'True', 'test_wrong_private_home_mode_refuses_resume'),
-    ('reservation', "self.path(STATE / 'receipt.json').is_file()", 'True', 'test_existing_account_without_reservation_is_not_adopted'),
+    ('reservation', "require(authorized, 'existing group/account has no installer reservation receipt')", "require(True, 'existing group/account has no installer reservation receipt')", 'test_existing_account_without_reservation_is_not_adopted'),
     ('dryrun-write', 'p = self.p\n        require(set(p)', "p = self.p\n        self.host.run(['mutation-write'])\n        require(set(p)", 'test_dryrun_has_no_mutations'),
     ('handoff-promotion', 'output.write(data)', "output.write(b'{}')", 'test_owner_handoff_private_file_can_be_promoted'),
     ('handoff-acl', 'and host.acl_free(path)', 'and True', 'test_handoff_wrong_mode_and_acl_refused'),
@@ -566,6 +726,12 @@ MUTATIONS = [
     ('separate-collector-repo', "c['collectorRepository'].lower() not in {repo.lower() for repo in repositories}", 'True', 'test_collector_registration_cannot_be_in_source_repository'),
     ('premature-final-label', "if 'old-retired' in self.receipt['stages']:", 'if True:', 'test_final_label_before_old_retirement_cannot_authorize_backup'),
     ('promoted-label-resume', 'allowed_labels.append([CUSTOM_LABEL])', 'pass', 'test_final_label_after_durable_retirement_is_valid_on_resume'),
+    ('account-attribute-conflict', "require(fields[key] == expected(p), 'existing account attribute conflicts with reservation: ' + key)", "require(True, 'existing account attribute conflicts with reservation: ' + key)", 'test_partial_account_conflicting_attribute_is_refused_not_overwritten'),
+    ('service-absence-proof', "require(self.host.service_absent(old['serviceLabel']),\n                            'old service is still present", "require(True,\n                            'old service is still present", 'test_unknown_service_state_blocks_and_preserves_old_files'),
+    ('retirement-intent', 'if intent is not None:', 'if False:', 'test_retirement_intent_mismatch_is_refused'),
+    ('resume-skip-bootout', "if not self.host.service_absent(old['serviceLabel']):", 'if True:', 'test_crash_after_bootout_effect_resumes_without_second_bootout'),
+    ('duplicate-field-write', "self.host.write_account_field(name, key, value)", "self.host.write_account_field(name, key, value)\n            self.host.write_account_field(name, key, value)", 'test_crash_after_each_account_creation_effect_resumes_exact'),
+    ('service-domain-proof', "if 'Could not find service' not in error or target not in error:", 'if False:', 'test_real_service_absence_proof_checks_every_domain'),
 ]
 
 

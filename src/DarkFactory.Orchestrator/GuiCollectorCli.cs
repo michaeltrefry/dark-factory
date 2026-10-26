@@ -71,12 +71,14 @@ public static class GuiCollectorCli
                 // never scripts read from this path or from the caller's potentially source-writable current directory.
                 var checkout = Path.GetFullPath(request.Checkout);
                 JsonObject plan;
+                GuiCollectorArchive.VerifiedSnapshot verifiedArchive;
                 if (request.Plan is not null)
                 {
                     plan = JsonNode.Parse(ReadRegular(request.Plan))!.AsObject();
                     await GuiCollectorHost.VerifyAsync(plan["configuration"]!.AsObject(), ct);
                     var verified = await GuiCollectorArchive.AcquireAsync(http, directory, plan["archive"]!.GetValue<string>(), ct);
-                    plan["archive"] = verified;
+                    verifiedArchive = await GuiCollectorArchive.VerifySnapshotAsync(verified, ct);
+                    plan["archive"] = verifiedArchive.Path;
                 }
                 else
                 {
@@ -84,22 +86,23 @@ public static class GuiCollectorCli
                     host["collectorRepository"] = reservedRepository.FullName;
                     await GuiCollectorHost.VerifyAsync(host, ct);
                     var verified = await GuiCollectorArchive.AcquireAsync(http, directory, request.Archive, ct);
+                    verifiedArchive = await GuiCollectorArchive.VerifySnapshotAsync(verified, ct);
                     var oldRunner = (await gateway.RunnersAsync(GuiCollectorDeployment.SourceRepository, ct))
                         .SingleOrDefault(r => r.Name == "lensworks-guest")
                         ?? throw new InvalidOperationException("The exact old lensworks-guest registration is absent; prepare never chooses another registration.");
-                    plan = MakePlan(request with { Archive = verified }, checkout, oldRunner, host);
+                    plan = MakePlan(request with { Archive = verifiedArchive.Path }, checkout, oldRunner, host, verifiedArchive.Sha256);
                 }
                 var trusted = plan["configuration"]!["trustedRepositories"] as JsonArray
                     ?? throw new InvalidOperationException("Collector configuration requires its explicit trusted repository list.");
                 foreach (var required in new[] { GuiCollectorDeployment.SourceRepository.FullName, gateway.FixtureRepository.FullName })
                     if (!trusted.Any(r => string.Equals(r?.GetValue<string>(), required, StringComparison.OrdinalIgnoreCase))) trusted.Add(required);
                 // All root inputs live in one private owner directory. Root snapshots them with openat/no-follow before use.
-                var archivePath = Path.Combine(directory, "runner.tar.gz");
+                var archivePath = verifiedArchive.Path;
                 var helperPath = Path.Combine(directory, "factory-gui-exec");
-                var bytes = ReadRegular(plan["archive"]!.GetValue<string>());
-                if (GuiCollectorDeployment.Hash(bytes) != plan["archiveSha256"]!.GetValue<string>())
+                if (verifiedArchive.Sha256 != plan["archiveSha256"]!.GetValue<string>())
                     throw new InvalidOperationException("Runner archive does not match the plan's pinned hash.");
-                WritePrivate(archivePath, bytes);
+                // Acquire already made a fresh owner-private snapshot. Reuse its streamed size/hash proof and canonical
+                // path for root's handoff; never allocate or copy another whole 512 MiB archive into memory.
                 var helper = System.Text.Encoding.UTF8.GetBytes(RemoteGuiWorkflow.Helper);
                 if (plan["helperSha256"]?.GetValue<string>() is { } helperHash && helperHash != GuiCollectorDeployment.Hash(helper))
                     throw new InvalidOperationException("Plan helper checksum differs from this reviewed checkout.");
@@ -322,7 +325,7 @@ public static class GuiCollectorCli
         return RepoRef.Parse(name);
     }
 
-    static JsonObject MakePlan(Request request, string checkout, GuiCollectorDeployment.Runner oldRunner, JsonObject config)
+    static JsonObject MakePlan(Request request, string checkout, GuiCollectorDeployment.Runner oldRunner, JsonObject config, string verifiedArchiveSha256)
     {
         if (request.Archive is null) throw new InvalidOperationException("Official runner archive verification is required before constructing the draft plan.");
         var name = "factory-gui-" + Guid.NewGuid().ToString("N");
@@ -343,7 +346,7 @@ public static class GuiCollectorCli
         var files = new JsonObject();
         return new JsonObject {
             ["version"] = 1, ["user"] = user, ["uid"] = uid, ["home"] = home, ["runnerName"] = name,
-            ["archive"] = Path.GetFullPath(request.Archive), ["archiveSha256"] = GuiCollectorDeployment.Hash(ReadRegular(request.Archive)),
+            ["archive"] = Path.GetFullPath(request.Archive), ["archiveSha256"] = verifiedArchiveSha256,
             ["helper"] = "", ["helperSha256"] = GuiCollectorDeployment.Hash(RemoteGuiWorkflow.Helper), ["configuration"] = config,
             ["old"] = new JsonObject { ["runnerRoot"] = oldRoot, ["runnerId"] = oldRunner.Id,
                 ["runnerName"] = oldRunner.Name, ["serviceLabel"] = "", ["servicePlist"] = "", ["files"] = files }

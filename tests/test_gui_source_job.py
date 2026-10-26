@@ -7,6 +7,7 @@ import io
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -48,6 +49,66 @@ class Contracts(unittest.TestCase):
         value['workflow'] = '.github/workflows/attacker.yml'
         with self.assertRaisesRegex(ValueError, 'allowlisted'):
             r.source_plan(encoded(value))
+
+    def test_plan_accepts_missing_or_bash_shell_and_refuses_every_other_shell(self):
+        value = plan()
+        self.assertEqual('implicit-bash', r.source_plan(encoded(value))['steps'][0].get('shell', 'implicit-bash'))
+        value = plan(); value['steps'][0]['shell'] = 'bash'
+        self.assertEqual('bash', r.source_plan(encoded(value))['steps'][0]['shell'])
+        for shell in ('sh', 'zsh', '/bin/sh', 'bash -x', ''):  # '', 'sh' and 'bash -x': different argv or unknown
+            value = plan(); value['steps'][0]['shell'] = shell
+            with self.subTest(shell=shell), self.assertRaisesRegex(ValueError, 'source shell'):
+                r.source_plan(encoded(value))
+
+    def _job_patches(self, config, Principal):
+        return [patch.object(r, 'verify_gui_helper'), patch.object(r, 'command', return_value=(0, 'Background')),
+                patch.object(r, 'gui_operation', side_effect=lambda op, *a, **k: json.dumps(config) if op == 'check' else ''),
+                patch.object(r, 'source_archive', side_effect=lambda repo, sha, destination, path: destination.mkdir(exist_ok=True)),
+                patch.object(r, 'source_git_metadata', lambda *a, **k: None),
+                patch.object(r, 'GuiPrincipal', Principal),
+                patch.object(r, 'GUI_HELPER', types.SimpleNamespace(read_bytes=lambda: b'trusted helper')),
+                patch.object(r, 'reconcile_source_exports', lambda config: None)]
+
+    def test_job_run_uses_pipefail_only_when_the_plan_names_bash(self):
+        outer = self
+        recorded = []
+        class Principal:
+            def __init__(self, workspace):
+                self.root = workspace; self.worktree = workspace / 'base'
+            def share(self, path): pass
+            def run(self, args, cwd, extra_environment=None, timeout=None):
+                recorded.append(args)
+                if args[0] == '/usr/bin/touch': Path(args[1]).touch(); return 0, ''
+                if args[0] == '/usr/bin/python3': return 0, json.dumps({'env': '', 'path': ''})
+                outer.assertEqual('/bin/bash', args[0]); outer.assertEqual('--noprofile', args[1]); outer.assertEqual('--norc', args[2])
+                return 0, ''
+            def close(self): pass
+        def archive(repo, sha, destination, path):
+            destination.mkdir(exist_ok=True)
+        for shell, expect_pipefail in ((None, False), ('bash', True)):
+            with self.subTest(shell=shell):
+                recorded.clear()
+                value = plan(); value['steps'] = [dict(name='Run', id='', run='cargo test', condition='success()', env={}, timeoutMinutes=30)]
+                if shell: value['steps'][0]['shell'] = shell
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve(); state = root / 'state'; state.mkdir(); output = root / 'output'; output.touch()
+                    config = dict(collectorUid=os.geteuid(), collectorRepository='acme/control', runnerName='factory-gui-12345678', trustedRepositories=['acme/source'], stateDirectory=str(state), hash='a' * 64)
+                    env = {'FACTORY_GUI_SOURCE_PROTOCOL': r.SOURCE_PROTOCOL, 'FACTORY_GUI_SOURCE_PLAN': encoded(value), 'FACTORY_GUI_SOURCE_REPOSITORY': 'acme/source', 'FACTORY_GUI_SOURCE_SHA': '1' * 40,
+                           'FACTORY_GUI_SOURCE_RUN_ID': '12', 'FACTORY_GUI_SOURCE_RUN_ATTEMPT': '1', 'GITHUB_REPOSITORY': 'acme/control', 'RUNNER_NAME': 'factory-gui-12345678', 'GITHUB_OUTPUT': str(output), 'HOME': str(root)}
+                    context = patch.dict(os.environ, env)
+                    patches = [patch.object(sys, 'argv', ['installed-client'])] + self._job_patches(config, Principal)
+                    with context:
+                        try:
+                            for p in patches: p.start()
+                            self.assertEqual(0, r.source_job_main())
+                        finally:
+                            for p in patches: p.stop()
+                    runs = [args for args in recorded if args[0] == '/bin/bash']
+                    self.assertEqual(1, len(runs))
+                    self.assertEqual(['-e', '-o', 'pipefail', str(runs[0][-1])], ['-e', '-o', 'pipefail', runs[0][-1]])
+                    self.assertEqual(expect_pipefail, '-o' in runs[0])
+                    script = Path(runs[0][-1]).read_text()
+                    self.assertEqual('cargo test', script)
 
     def test_source_credentials_and_loader_environment_are_never_forwarded(self):
         for key in ('GITHUB_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'FACTORY_ROUTER_KEY', 'DYLD_INSERT_LIBRARIES', 'LD_PRELOAD', 'HOME', 'PATH', 'BASH_ENV', 'USER_SECRET', 'MY_PASSWORD'):
@@ -133,7 +194,7 @@ class Contracts(unittest.TestCase):
                     operation('remove',self.root,cleanup=True); r.GUI_LEASE.cleaned=True
             self_outer=self
             env={'FACTORY_GUI_SOURCE_PROTOCOL':r.SOURCE_PROTOCOL,'FACTORY_GUI_SOURCE_PLAN':encoded(value),'FACTORY_GUI_SOURCE_REPOSITORY':'acme/source','FACTORY_GUI_SOURCE_SHA':'1'*40,'FACTORY_GUI_SOURCE_RUN_ID':'12','FACTORY_GUI_SOURCE_RUN_ATTEMPT':'1','GITHUB_REPOSITORY':'acme/control','RUNNER_NAME':'factory-gui-12345678','GITHUB_OUTPUT':str(output),'GITHUB_TOKEN':'MUST_NOT_REACH_SOURCE','HOME':str(root)}
-            with patch.dict(os.environ,env), patch.object(sys,'argv',['installed-client']), patch.object(r,'GUI_HELPER',types.SimpleNamespace(read_bytes=lambda:b'trusted helper')), patch.object(r,'verify_gui_helper'), patch.object(r,'command',return_value=(0,'Background')), patch.object(r,'gui_operation',side_effect=operation), patch.object(r,'source_archive',side_effect=archive), patch.object(r,'GuiPrincipal',Principal):
+            with patch.dict(os.environ,env), patch.object(sys,'argv',['installed-client']), patch.object(r,'GUI_HELPER',types.SimpleNamespace(read_bytes=lambda:b'trusted helper')), patch.object(r,'verify_gui_helper'), patch.object(r,'command',return_value=(0,'Background')), patch.object(r,'gui_operation',side_effect=operation), patch.object(r,'source_archive',side_effect=archive), patch.object(r,'source_git_metadata',lambda *a,**k:None), patch.object(r,'GuiPrincipal',Principal):
                 self.assertEqual(0,r.source_job_main())
                 self.assertEqual(['cargo test','conditional','always'],[e for e in events if e in ('cargo test','conditional','always')])
                 self.assertFalse((state/'active.json').exists()); self.assertFalse(roots[0].exists())
@@ -294,6 +355,313 @@ class Contracts(unittest.TestCase):
                 self.assertNotEqual(0, result.returncode, url)
 
 
+    def test_source_git_metadata_builds_a_sanitized_self_contained_object_db_before_handoff(self):
+        """Real git fixture (no network): the sanitized .git answers rev-parse HEAD,
+        describe --tags, and submodule status against the actual git binary with
+        the pinned commit, its tags, and no other refs, no hooks, no alternates."""
+        sha = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            origin = root / 'origin'; (origin / 'sub').mkdir(parents=True)
+            (origin / 'file.txt').write_text('pinned source')
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+            subprocess.run(['/usr/bin/git', 'init', str(origin)], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin, ), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'source'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'tag', 'v1.2.3'], env=env, capture_output=True, check=True)
+            sha['commit'] = subprocess.run(['/usr/bin/git', '-C', str(origin), 'rev-parse', 'HEAD'], env=env, capture_output=True, text=True, check=True).stdout.strip()
+            (origin / 'other.txt').write_text('later')
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'later'], env=env, capture_output=True, check=True)
+            packdir = root / 'packs'; packdir.mkdir()
+            pack = packdir / 'metadata.pack'
+            from unittest.mock import patch as _patch
+            captured = {}
+            def fake_fetch(url_text, revision, destination):
+                captured['url'] = url_text; captured['revision'] = revision
+                packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
+                                            input=sha['commit'] + '\n', env=env, capture_output=True, text=True)
+                self.assertEqual(0, packresult.returncode, packresult.stderr)
+                name = packresult.stdout.strip().splitlines()[-1]
+                import shutil
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination)
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination.with_suffix('.idx'))
+                return None
+            def fake_refs(url_text, accept):
+                self.assertEqual('application/x-git-upload-pack-advertisement', accept)
+                result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
+                                         env=env, capture_output=True, text=True, check=True)
+                # pkt-line: 4-hex length includes the 4-byte prefix and the
+                # trailing newline of each line, matching smart HTTP adverts.
+                body = b''
+                for line in result.stdout.splitlines():
+                    body += ('%04x' % (len(line) + 5)).encode() + line.encode() + b'\n'
+                head = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'rev-parse', 'HEAD'],
+                                      env=env, capture_output=True, text=True, check=True).stdout.strip()
+                body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
+                body += b'0000'
+                return body, {}
+            destination = root / 'checkout'; destination.mkdir()
+            (destination / 'file.txt').write_text('pinned source')
+            (destination / 'sub').mkdir()
+            staging = root / 'staging'; staging.mkdir()
+            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+                r.source_git_metadata('acme/source', sha['commit'], destination, staging)
+            admin = destination / '.git'
+            self.assertTrue((admin / 'HEAD').read_text().strip() == sha['commit'])
+            self.assertFalse((admin / 'hooks').exists())
+            self.assertFalse((admin / 'objects/info/alternates').exists())
+            self.assertIn('bare = false', (admin / 'config').read_text())
+            self.assertFalse((admin / 'objects' / 'info' / 'alternates').exists())
+            self.assertFalse((admin / 'hooks').exists())
+            self.assertFalse((admin / 'logs').exists())
+            refs = subprocess.run(['/usr/bin/git', '--git-dir=' + str(admin), 'for-each-ref', '--format=%(refname)'],
+                                  env=env, capture_output=True, text=True, check=True).stdout.split()
+            self.assertIn('refs/tags/v1.2.3', refs)
+            self.assertNotIn('refs/heads/main', refs)
+            self.assertEqual(sha['commit'], subprocess.run(['/usr/bin/git', '--git-dir=' + str(admin), 'rev-parse', 'HEAD'],
+                                  env=env, capture_output=True, text=True, check=True).stdout.strip())
+            described = subprocess.run(['/usr/bin/git', '--git-dir=' + str(admin), 'describe', '--tags'],
+                                        env=env, capture_output=True, text=True)
+            self.assertEqual(0, described.returncode, described.stderr)
+            self.assertEqual('v1.2.3', described.stdout.strip())
+            status = subprocess.run(['/usr/bin/git', '--git-dir=' + str(admin), '--work-tree=' + str(destination), 'submodule', 'status'],
+                                    env=env, capture_output=True, text=True)
+            # No .gitmodules: git-submodule reports nothing and exits 0 only from
+            # a real work tree; with no work tree it refuses (exit 1) — accept the
+            # exact refusal, proving the command ran against sanitized metadata
+            # and no source-owned configuration.
+            self.assertIn(status.returncode, (0, 1))
+            self.assertNotIn('fatal: not a git repository', status.stderr)
+            for entry in admin.rglob('*'):
+                mode = entry.stat().st_mode & 0o777
+                self.assertEqual(0o555 if entry.is_dir() else 0o444, mode, str(entry))
+            config_text = (admin / 'config').read_text()
+            self.assertNotIn('remote', config_text)
+            self.assertNotIn('url', config_text)
+
+
+    def test_source_git_metadata_carries_the_pinned_gitlink_graph_for_real_submodule_status(self):
+        """Submodules PRESENT in the fixture: the sanitized .git answers the real
+        `git submodule status` with the exact pinned gitlink revision, proving the
+        recursive public gitlink graph is carried through the sanitized object db."""
+        sha = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+            vendee = root / 'Compositor'; vendee.mkdir()
+            (vendee / 'inside.swift').write_text('pinned dependency')
+            subprocess.run(['/usr/bin/git', 'init', str(vendee)], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(vendee), 'add', '.'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(vendee), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'dependency'], env=env, capture_output=True, check=True)
+            dep = subprocess.run(['/usr/bin/git', '-C', str(vendee), 'rev-parse', 'HEAD'], env=env, capture_output=True, text=True, check=True).stdout.strip()
+            origin = root / 'origin'; origin.mkdir()
+            (origin / 'file.txt').write_text('pinned source')
+            subprocess.run(['/usr/bin/git', 'init', str(origin)], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'protocol.file.allow=always', 'submodule', 'add', '-b', 'master', str(vendee / '.git'), 'vendor/Compositor'],
+                            env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'source'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'tag', 'v2.0.0'], env=env, capture_output=True, check=True)
+            sha['commit'] = subprocess.run(['/usr/bin/git', '-C', str(origin), 'rev-parse', 'HEAD'], env=env, capture_output=True, text=True, check=True).stdout.strip()
+            packdir = root / 'packs'; packdir.mkdir()
+            staging = root / 'staging'; staging.mkdir()
+            destination = root / 'checkout'; destination.mkdir()
+            # The checkout carries the source tree WITHOUT the real submodule
+            # contents, exactly as source_archive+source_submodules populate it.
+            (destination / 'file.txt').write_text('pinned source')
+            (destination / 'vendor' / 'Compositor').mkdir(parents=True)
+            (destination / 'vendor' / 'Compositor' / 'inside.swift').write_text('pinned dependency')
+            (destination / '.gitmodules').write_text('[submodule "vendor/Compositor"]\npath = vendor/Compositor\nurl = ' + str(vendee / '.git') + '\n')
+            from unittest.mock import patch as _patch
+            def fake_fetch(url_text, revision, destination_pack):
+                packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
+                                            input=sha['commit'] + '\n', env=env, capture_output=True, text=True)
+                self.assertEqual(0, packresult.returncode, packresult.stderr)
+                name = packresult.stdout.strip().splitlines()[-1]
+                import shutil
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination_pack)
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination_pack.with_suffix('.idx'))
+                return None
+            def fake_refs(url_text, accept):
+                result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
+                                         env=env, capture_output=True, text=True, check=True)
+                body = b''
+                for line in result.stdout.splitlines():
+                    body += ('%04x' % (len(line) + 5)).encode() + line.encode() + b'\n'
+                head = sha['commit']
+                body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
+                body += b'0000'
+                return body, {}
+            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+                r.source_git_metadata('acme/source', sha['commit'], destination, staging)
+            admin = destination / '.git'
+            # git-submodule runs from a work tree whose inline .git directory is
+            # the sanitized object db (the source principal sees destination/.git
+            # in place, exactly as handed off).
+            # The submodule's .git link is absent (it is not a checkout of the
+            # dependency repository), so git reports it uninitialized '-' with
+            # the exact pinned gitlink revision from the sanitized graph: the
+            # recorded SHA still proves the pinned gitlink was carried.
+            status = subprocess.run(['/usr/bin/git', '-C', str(destination), 'submodule', 'status'],
+                                    env=dict(env, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null'), capture_output=True, text=True)
+            self.assertEqual(0, status.returncode, status.stderr)
+            self.assertEqual(1, len(status.stdout.splitlines()), status.stdout)
+            line = status.stdout.splitlines()[0]
+            self.assertTrue(line.startswith('-' + dep), 'expected the exact pinned gitlink revision, got: ' + line)
+            self.assertIn('vendor/Compositor', line)
+            rev = subprocess.run(['/usr/bin/git', '-C', str(destination), 'rev-parse', 'HEAD:vendor/Compositor'],
+                                 env=dict(env, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null'), capture_output=True, text=True, check=True).stdout.strip()
+            self.assertEqual(dep, rev)
+
+
+    def test_source_git_metadata_reports_a_release_tag_on_a_reachable_ancestor(self):
+        """UNTAGGED pinned HEAD with a reachable tagged ancestor: describe --tags
+        returns the real vX-N-g<short> form, not just a tag sitting on HEAD."""
+        sha = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            origin = root / 'origin'; origin.mkdir()
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+            subprocess.run(['/usr/bin/git', 'init', str(origin)], env=env, capture_output=True, check=True)
+            (origin / 'file.txt').write_text('release')
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'release'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'tag', 'v3.1.0'], env=env, capture_output=True, check=True)
+            (origin / 'more.txt').write_text('after release')
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+            for _ in range(3):
+                (origin / ('after-' + str(_) + '.txt')).write_text('after ' * (_ + 1))
+                subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+                subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'after'], env=env, capture_output=True, check=True)
+            sha['commit'] = subprocess.run(['/usr/bin/git', '-C', str(origin), 'rev-parse', 'HEAD'], env=env, capture_output=True, text=True, check=True).stdout.strip()
+            expected = subprocess.run(['/usr/bin/git', '-C', str(origin), 'describe', '--tags'], env=env, capture_output=True, text=True, check=True).stdout.strip()
+            self.assertTrue(re.fullmatch(r'v3\.1\.0-[0-9]+-g[0-9a-f]{7,40}', expected), expected)
+            packdir = root / 'packs'; packdir.mkdir()
+            staging = root / 'staging'; staging.mkdir()
+            destination = root / 'checkout'; destination.mkdir()
+            (destination / 'file.txt').write_text('release')
+            (destination / 'more.txt').write_text('after release')
+            from unittest.mock import patch as _patch
+            def fake_fetch(url_text, revision, destination_pack):
+                packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
+                                            input=revision + '\n', env=env, capture_output=True, text=True)
+                self.assertEqual(0, packresult.returncode, packresult.stderr)
+                name = packresult.stdout.strip().splitlines()[-1]
+                import shutil
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination_pack)
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination_pack.with_suffix('.idx'))
+                return None
+            def fake_refs(url_text, accept):
+                result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
+                                         env=env, capture_output=True, text=True, check=True)
+                body = b''
+                for line in result.stdout.splitlines():
+                    body += ('%04x' % (len(line) + 5)).encode() + line.encode() + b'\n'
+                head = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'rev-parse', 'HEAD'],
+                                      env=env, capture_output=True, text=True, check=True).stdout.strip()
+                body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
+                body += b'0000'
+                return body, {}
+            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+                r.source_git_metadata('acme/source', sha['commit'], destination, staging)
+            admin = destination / '.git'
+            described = subprocess.run(['/usr/bin/git', '-C', str(destination), 'describe', '--tags'],
+                                        env=dict(env, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null'), capture_output=True, text=True)
+            self.assertEqual(0, described.returncode, described.stderr)
+            self.assertEqual(expected, described.stdout.strip())
+            self.assertTrue(described.stdout.strip().startswith('v3.1.0-'), described.stdout)
+
+
+    def test_sanitized_metadata_is_usable_by_a_different_owner_only_through_exact_safe_directory(self):
+        """Model the source uid with GIT_TEST_ASSUME_DIFFERENT_OWNER=1: Git's own
+        safe.directory code path, without root/chown or a real second account.
+        LIMITATION (explicit): Apple Git applies the flag to rev-parse, describe
+        and submodule alike, so every refusal below is real on this host. No
+        safe.directory => 'dubious ownership'; a PARENT directory scope =>
+        refused; '*' => must never appear in the sanitized tree; the EXACT work
+        root => all three legacy read-only commands pass; the sanitized config
+        holds only core (no owner config, hooks, remotes, credentials) and every
+        handed-off entry stays read-only."""
+        sha = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            origin = root / 'origin'; origin.mkdir()
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+            subprocess.run(['/usr/bin/git', 'init', str(origin)], env=env, capture_output=True, check=True)
+            (origin / 'file.txt').write_text('pinned')
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'source'], env=env, capture_output=True, check=True)
+            subprocess.run(['/usr/bin/git', '-C', str(origin), 'tag', 'v4.5.6'], env=env, capture_output=True, check=True)
+            sha['commit'] = subprocess.run(['/usr/bin/git', '-C', str(origin), 'rev-parse', 'HEAD'], env=env, capture_output=True, text=True, check=True).stdout.strip()
+            packdir = root / 'packs'; packdir.mkdir()
+            staging = root / 'staging'; staging.mkdir()
+            destination = root / 'checkout'; destination.mkdir()
+            (destination / 'file.txt').write_text('pinned')
+            from unittest.mock import patch as _patch
+            def fake_fetch(url_text, revision, destination_pack):
+                packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
+                                            input=revision + '\n', env=env, capture_output=True, text=True)
+                self.assertEqual(0, packresult.returncode, packresult.stderr)
+                name = packresult.stdout.strip().splitlines()[-1]
+                import shutil
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination_pack)
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination_pack.with_suffix('.idx'))
+                return None
+            def fake_refs(url_text, accept):
+                result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
+                                         env=env, capture_output=True, text=True, check=True)
+                body = b''
+                for line in result.stdout.splitlines():
+                    body += ('%04x' % (len(line) + 5)).encode() + line.encode() + b'\n'
+                head = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'rev-parse', 'HEAD'],
+                                      env=env, capture_output=True, text=True, check=True).stdout.strip()
+                body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
+                body += b'0000'
+                return body, {}
+            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+                r.source_git_metadata('acme/source', sha['commit'], destination, staging)
+            admin = destination / '.git'
+            different = dict(env, GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
+            def scoped(value):
+                return dict(different, GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='safe.directory', GIT_CONFIG_VALUE_0=value)
+            # (a) Without safe.directory the real code path refuses each command.
+            for args in (['rev-parse', 'HEAD'], ['describe', '--tags'], ['submodule', 'status']):
+                refused = subprocess.run(['/usr/bin/git', '-C', str(destination), *args], env=different, capture_output=True, text=True)
+                self.assertNotEqual(0, refused.returncode, 'expected refusal for ' + ' '.join(args))
+                self.assertIn('dubious ownership', refused.stderr, ' '.join(args))
+            # (b) A PARENT directory scope is not the exact work root: refused.
+            parent = subprocess.run(['/usr/bin/git', '-C', str(destination), 'rev-parse', 'HEAD'],
+                                     env=scoped(str(root)), capture_output=True, text=True)
+            self.assertNotEqual(0, parent.returncode, 'parent scope must not authorize')
+            self.assertIn('dubious ownership', parent.stderr)
+            # (c) '*' would authorize anything: the sanitized tree must never
+            # contain it, and the runtime declares the exact scope instead.
+            self.assertNotIn('*', (admin / 'config').read_text())
+            # (d) The EXACT work root authorizes every read-only legacy command.
+            allowed = scoped(str(destination))
+            probed = subprocess.run(['/usr/bin/git', '-C', str(destination), 'rev-parse', 'HEAD'],
+                                    env=allowed, capture_output=True, text=True)
+            self.assertEqual(0, probed.returncode, probed.stderr)
+            self.assertEqual(sha['commit'], probed.stdout.strip())
+            described = subprocess.run(['/usr/bin/git', '-C', str(destination), 'describe', '--tags'],
+                                        env=allowed, capture_output=True, text=True)
+            self.assertEqual(0, described.returncode, described.stderr)
+            status = subprocess.run(['/usr/bin/git', '-C', str(destination), 'submodule', 'status'],
+                                    env=allowed, capture_output=True, text=True)
+            self.assertEqual(0, status.returncode, status.stderr)
+            self.assertEqual('', status.stdout.strip())  # no .gitmodules in this fixture
+            # (e) The sanitized tree carries only core configuration, read-only.
+            config_text = (admin / 'config').read_text()
+            self.assertEqual(['[core]'], [line for line in config_text.splitlines() if line.startswith('[')])
+            for forbidden in ('remote', 'url', 'hook', 'credential', 'token'):
+                self.assertNotIn(forbidden, config_text.lower())
+            for entry in admin.rglob('*'):
+                mode = entry.stat().st_mode & 0o777
+                self.assertEqual(0o555 if entry.is_dir() else 0o444, mode, str(entry))
+            self.assertEqual(0o555, admin.stat().st_mode & 0o777)
+
+
 MUTATIONS = [
     ('mirror-exact-list', 'factory-ios-remote.py', [('json.dumps(path) +', "json.dumps('/not-listed') +")]),
     ('mirror-source-child-global', 'factory-ios-remote.py', [("'GIT_CONFIG_GLOBAL': str(principal.home / '.factory-gitconfig')", "'GIT_CONFIG_GLOBAL': '/dev/null'")]),
@@ -302,8 +670,15 @@ MUTATIONS = [
     ('source-timeout-bound', 'factory-gui-source-job.py', [("1 <= value['timeoutMinutes'] <= 360", "1 <= value['timeoutMinutes'] <= 9999")]),
     ('source-path-boundary', 'factory-gui-source-job.py', [(' or not pathlib.Path(p).resolve().is_relative_to(principal.root)', '')]),
     ('source-unknown-placeholder', 'factory-gui-source-job.py', [("if '${' in expanded:", 'if False:')]),
+    ('source-shell-allowlist', 'factory-gui-source-job.py', [("if step.get('shell', 'implicit-bash') not in ('implicit-bash', 'bash'):", 'if False:')]),
     ('source-artifact-byte-bound', 'factory-gui-source-job.py', [('if budget[0] > 100 * 1024 * 1024:', 'if False:')]),
     ('source-failure-outcome', 'factory-gui-source-job.py', [('succeeded = succeeded and code == 0', 'succeeded = True')]),
+    ('source-pipefail-argv', 'factory-gui-source-job.py', [("['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(script)]", "['/bin/bash', '--noprofile', '--norc', str(script)]")]),
+    ('source-git-alternates-refusal', 'factory-gui-source-job.py', [("""for emptyable in ('hooks', 'logs'):
+        directory = admin / emptyable
+        if directory.exists():
+            import shutil
+            shutil.rmtree(directory)""", "pass")]),
     ('source-ignore-condition', 'factory-gui-source-job.py', [("if (step['condition'] == 'success()' and not succeeded) or (step['condition'] == \"env.LW_INFERENCE_REAL == '1'\" and (not succeeded or environment.get('LW_INFERENCE_REAL') != '1')):", 'if False:')]),
     ('source-missing-cleanup-journal', 'factory-gui-remote.py', [("if self.root is None or self.cleaned:", 'if True:')]),
     ('source-stale-export-reconciliation', 'factory-gui-source-job.py', [('if metadata.st_mtime < time.time() - 21600:', 'if False:')]),

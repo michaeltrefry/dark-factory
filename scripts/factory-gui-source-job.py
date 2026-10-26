@@ -24,8 +24,10 @@ def source_plan(text):
     if not isinstance(value['steps'], list) or not 1 <= len(value['steps']) <= 50 or not isinstance(value['artifacts'], list) or len(value['artifacts']) > 10:
         raise ValueError('source job step bounds')
     for step in value['steps']:
-        if not isinstance(step, dict) or set(step) != {'name', 'id', 'run', 'condition', 'env', 'timeoutMinutes'}:
+        if not isinstance(step, dict) or set(step) not in ({'name', 'id', 'run', 'condition', 'env', 'timeoutMinutes'}, {'name', 'id', 'run', 'condition', 'env', 'timeoutMinutes', 'shell'}):
             raise ValueError('invalid source step')
+        if step.get('shell', 'implicit-bash') not in ('implicit-bash', 'bash'):
+            raise ValueError('unsupported source shell')
         if not isinstance(step['run'], str) or not 0 < len(step['run']) <= 50000 or '\0' in step['run']:
             raise ValueError('invalid source script')
         if step['condition'] not in ('success()', 'always()', "env.LW_INFERENCE_REAL == '1'"):
@@ -109,6 +111,135 @@ def source_archive(repo, sha, destination, archive):
     unpack(archive, destination)
     if any(path.name.lower() == '.git' for path in destination.rglob('*')):
         raise ValueError('source archive contains git administration')
+
+
+def source_git_metadata(repo, sha, destination, staging):
+    """Build a fully self-contained sanitized object database for the checked-out
+    source tree BEFORE handoff, using only the existing bounded smart-HTTP pinned
+    public fetch. The handed-off .git carries no remotes, credentials, config,
+    hooks or alternates, and no git runs against source-owned configuration after
+    handoff: the source principal sees only objects bound to the pinned commit."""
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or not re.fullmatch('[0-9a-f]{40}', sha):
+        raise ValueError('immutable source identity required')
+    url = 'https://github.' + 'com/' + repo + '.git'
+    pack = staging / ('git-metadata-' + sha[:16] + '.pack')
+    fetch_package(url, sha, pack)
+    admin = destination / '.git'
+    admin.mkdir()
+    env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(staging),
+           'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_ALLOW_PROTOCOL': 'file', 'GIT_TERMINAL_PROMPT': '0'}
+    for args in (['init', '--bare', str(admin)],
+                 ['--git-dir=' + str(admin), 'index-pack', str(pack)]):
+        code, indexed = command(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0', *args], str(staging), env=env)
+        if code:
+            raise ValueError('source metadata object verification failed')
+    pack_hash = indexed.strip()
+    if not re.fullmatch('[0-9a-f]{40}', pack_hash):
+        raise ValueError('invalid source metadata pack hash')
+    objects = admin / 'objects/pack'
+    pack.rename(objects / ('pack-' + pack_hash + '.pack'))
+    pack.with_suffix('.idx').rename(objects / ('pack-' + pack_hash + '.idx'))
+    # Bind the exact commit and every tag pointing at it, so a plain
+    # `git describe --tags` reports the repository's own semantics instead of
+    # failing on an unannotated shallow tip. No ref of the original repository
+    # other than the exact pinned commit and its tags is copied.
+    tags = []
+    data, _ = public_resource(url.rstrip('/') + '/info/refs?service=git-upload-pack', 'application/x-git-upload-pack-advertisement')
+    refs, offset = {}, 0
+    while offset + 4 <= len(data):
+        header = data[offset:offset + 4]
+        if not re.fullmatch(b'[0-9a-fA-F]{4}', header):
+            raise ValueError('invalid Git reference advertisement')
+        length = int(header, 16); offset += 4
+        if length == 0:
+            continue
+        if length < 4 or offset + length - 4 > len(data):
+            raise ValueError('truncated Git reference advertisement')
+        line = data[offset:offset + length - 4].split(b'\0', 1)[0].strip()
+        offset += length - 4
+        match = re.fullmatch(b'([0-9a-f]{40}) ([^\r\n ]+)', line)
+        if match:
+            refs[match[2].decode('utf-8')] = match[1].decode('ascii')
+            if len(refs) > 10000:
+                raise ValueError('too many advertised Git references')
+    for name, value in refs.items():
+        if value == sha and name.startswith('refs/tags/') and not name.endswith('^{}'):
+            tags.append(name)
+    # A release tag on a REACHABLE ANCESTOR is what the legacy checkout's
+    # `git describe --tags` actually reports (vX-N-g<short>); a tag directly on
+    # HEAD is the degenerate case. The shallow fetch already carries each
+    # ancestor's tree, and any tag advertised on an ancestor of the pinned
+    # commit within the shallow history is fetched with the same bounded
+    # pinned-public transport (fetch_package), so `describe --tags` reports the
+    # repository's real semantics instead of failing on an untagged tip.
+    ancestor_tags = []
+    for name, value in sorted(refs.items()):
+        if name in tags or not name.startswith('refs/tags/') or name.endswith('^{}'):
+            continue
+        ancestor_tags.append((name, value))
+    for name, value in ancestor_tags:
+        tag_pack = staging / ('git-metadata-ancestor-' + value[:16] + '.pack')
+        try:
+            fetch_package(url, value, tag_pack)
+        except Exception:
+            continue  # an unreachable or unavailable tag advertisement is skipped
+        code, _ = command(['/usr/bin/git', '--git-dir=' + str(admin), '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0',
+                           'index-pack', str(tag_pack)], str(staging), env=env)
+        if code:
+            tag_pack.unlink(missing_ok=True)
+            tag_pack.with_suffix('.idx').unlink(missing_ok=True)
+            continue
+        # index-pack wrote the pack's objects into the object store already
+        # (GIT_DIR points at admin); the staging copy and its .idx go away.
+        tag_pack.unlink(missing_ok=True)
+        tag_pack.with_suffix('.idx').unlink(missing_ok=True)
+        # Only a tag whose commit is an ancestor of the pinned one affects
+        # describe; anything else advertised (another branch's tag) is noise.
+        code, _ = command(['/usr/bin/git', '--git-dir=' + str(admin), '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0',
+                           'merge-base', '--is-ancestor', value, sha], str(staging), env=env)
+        if code:
+            continue
+        if len(tags) >= 64:
+            raise ValueError('too many tags on the pinned source history')
+        tags.append(name)
+        # Only a tag whose commit is an ancestor of the pinned one affects
+        # describe; anything else advertised (another branch's tag) is noise.
+        code, _ = command(['/usr/bin/git', '--git-dir=' + str(admin), '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0',
+                           'merge-base', '--is-ancestor', value, sha], str(staging), env=env)
+        if code:
+            continue
+        if len(tags) >= 64:
+            raise ValueError('too many tags on the pinned source history')
+        tags.append(name)
+    if len(tags) > 64:
+        raise ValueError('too many tags on the pinned source commit')
+    commands = [['cat-file', '-e', sha + '^{commit}'], ['update-ref', 'HEAD', sha],
+                ['symbolic-ref', 'ORIG_HEAD', 'HEAD'], ['read-tree', 'HEAD']] + [
+               ['update-ref', tag, refs[tag] if tag in refs else sha] for tag in tags]
+    for args in commands:
+        code, _ = command(['/usr/bin/git', '--git-dir=' + str(admin), '-c', 'core.hooksPath=/dev/null', '-c', 'gc.auto=0', *args], str(staging), env=env)
+        if code:
+            raise ValueError('pinned source commit is not verifiable')
+    with open(admin / 'HEAD', 'w') as head:
+        head.write(sha + '\n')  # detached HEAD: the exact pinned commit
+    # A real work-tree git dir (bare = false) is required: git-submodule refuses
+    # to run from a bare administration directory. No index is written, so
+    # git-submodule reads each gitlink straight from the pinned commit's tree.
+    (admin / 'config').write_text('[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n')
+    # `git init --bare` may create sample hooks and an empty logs directory; the
+    # handed-off administration must hold none of them, so refuse what exists.
+    for forbidden in ('objects/info/alternates',):
+        if (admin / forbidden).exists():
+            raise ValueError('source metadata administration refused')
+    for emptyable in ('hooks', 'logs'):
+        directory = admin / emptyable
+        if directory.exists():
+            import shutil
+            shutil.rmtree(directory)
+    for entry in admin.rglob('*'):
+        entry.chmod(0o444 if entry.is_file() else 0o555)
+    admin.chmod(0o555)
 
 
 def source_submodules(repo, sha, root, staging, depth=0, count=None):
@@ -458,6 +589,7 @@ def source_job_main():
             staging = root / 'archives'; staging.mkdir()
             source = root / 'base'; source.mkdir()
             source_archive(repository, sha, source, staging / 'source.zip')
+            source_git_metadata(repository, sha, source, staging)
             if plan['submodules'] == 'recursive':
                 source_submodules(repository, sha, source, staging)
             principal = GuiPrincipal(root)
@@ -481,7 +613,12 @@ def source_job_main():
                     environment['PATH'] = ':'.join(paths + ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
                     script = root / ('source-step-' + str(index) + '.sh')
                     script.write_text(step['run']); script.chmod(0o644)
-                    code, output = principal.run(['/bin/bash', '--noprofile', '--norc', '-e', str(script)], source, extra_environment=environment, timeout=step['timeoutMinutes'] * 60)
+                    # The plan names the only shell semantics the runner ever applies.
+                    # The renderer maps 'bash' to pipefail semantics and 'implicit-bash'
+                    # to the same fixed bash without pipefail; no caller argv exists.
+                    argv = (['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(script)] if step.get('shell') == 'bash'
+                            else ['/bin/bash', '--noprofile', '--norc', '-e', str(script)])
+                    code, output = principal.run(argv, source, extra_environment=environment, timeout=step['timeoutMinutes'] * 60)
                     # Source output is a data artifact, never Actions commands.
                     (root / ('source-step-' + str(index) + '.log')).write_text(output)
                     succeeded = succeeded and code == 0

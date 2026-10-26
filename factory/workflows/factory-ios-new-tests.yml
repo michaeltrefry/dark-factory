@@ -46,10 +46,14 @@ jobs:
           execution = os.environ['EXECUTION']
           sides = ['base', 'head']
           if execution:
-              side = json.loads(execution)['side']
+              parsed = json.loads(execution)
+              side = parsed['side']
               if side not in ('base', 'head'):
                   raise ValueError('invalid execution side')
               sides = [side]
+              # The opposite archive is needed only when this execution's overlay copies from the other revision.
+              if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):
+                  sides.append('head' if side == 'base' else 'base')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('sides=' + json.dumps(sides) + '\n')
           PY
@@ -62,11 +66,15 @@ jobs:
           REPO: ${{ github.repository }}
           BASE: ${{ inputs.base }}
           HEAD: ${{ inputs.head }}
+          SIDES: ${{ steps.plan.outputs.sides }}
         run: |
           python3 -I - <<'PY'
-          import os, re, urllib.request
+          import json, os, re, urllib.request
           os.mkdir('sources')
-          for name in ('base', 'head'):
+          sides = json.loads(os.environ['SIDES'])
+          if not isinstance(sides, list) or not sides or len(sides) > 2 or any(side not in ('base', 'head') for side in sides) or len(set(sides)) != len(sides):
+              raise ValueError('invalid requested source sides')
+          for name in sides:
               sha = os.environ[name.upper()]
               if not re.fullmatch('[0-9a-f]{40}', sha):
                   raise ValueError('invalid commit')

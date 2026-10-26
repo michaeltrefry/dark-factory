@@ -1939,9 +1939,22 @@ runner/service deletion, same-name replacement or GUI-domain bootout occurs. Fai
 missing local files from those backups; deleting a GitHub registration is **not** undone by
 restoring credential bytes, so a rollback receipt explicitly requires owner reconciliation.
 It does not claim an automatic remote rollback. An uncertain registration attempt is never
-blindly repeated: reconcile the unique new name/ID before retrying. Partial directory-service
-creation or an existing identity/installation differing from the plan fails closed rather than
-adopting or rewriting it. Installed bytes are never silently overwritten.
+blindly repeated: reconcile the unique new name/ID before retrying. Installed bytes are never
+silently overwritten.
+
+Crash recovery is explicit, not inferred from "no other run exists". The account step writes a
+protected journal intent before creating the private group and before each of the six DS
+attributes, and records each completion. A resume finishes exactly the reserved UID/GID/group and
+user fields that are missing; an existing attribute differing from the reservation, an unrelated
+group with that name or GID, another account's UID, or an existing HOME without this plan's
+reservation is refused, never adopted or clobbered. A crash after any individual side effect
+resumes without duplicating it or registering twice.
+
+Local retirement persists the exact service label, `gui/502` domain, user ID and runner root
+before any bootout. Success is proven only when launchctl reports that exact service absent from
+every domain it could occupy (`gui/502`, `user/502`, `system`); a crash after bootout therefore
+resumes without a second bootout, while an unreadable domain, wrong-domain presence, or any
+other launchctl error stays blocked with old files and the protected backup intact.
 
 Safe local evidence (all commands faked, only temporary files; no .NET build needed):
 

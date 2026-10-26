@@ -70,7 +70,7 @@ public static class GuiCollectorArchive
                     if (source.Length != asset.Size || source.Length > MaxBytes)
                         throw new InvalidOperationException("The supplied runner archive has the wrong published size.");
                     await using var input = new FileStream(source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
-                    await CopyVerifiedAsync(input, output, asset, ct);
+                    await CopyVerifiedAsync(input, output, asset.Hash, asset.Size, ct);
                 }
                 else
                 {
@@ -78,7 +78,7 @@ public static class GuiCollectorArchive
                     if (answer.Content.Headers.ContentLength is { } length && (length > MaxBytes || length != asset.Size))
                         throw new InvalidOperationException("The runner download has the wrong published size.");
                     await using var input = await answer.Content.ReadAsStreamAsync(ct);
-                    await CopyVerifiedAsync(input, output, asset, ct);
+                    await CopyVerifiedAsync(input, output, asset.Hash, asset.Size, ct);
                 }
             }
             catch { File.Delete(target); throw; }
@@ -100,6 +100,42 @@ public static class GuiCollectorArchive
             if (!Directory.EnumerateFileSystemEntries(child).Any()) Directory.Delete(child);
             throw;
         }
+    }
+
+    public sealed record VerifiedSnapshot(string Path, string Sha256, long Bytes);
+
+    /// <summary>Reuses the bounded official release proof without materializing a runner archive in memory. The private
+    /// acquired snapshot is retained in place for root's no-follow handoff; there is no second whole-archive copy.</summary>
+    public static async Task<VerifiedSnapshot> VerifySnapshotAsync(string archivePath, CancellationToken ct)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(Timeout);
+        ct = deadline.Token;
+        var archive = RegularFile(archivePath);
+        var receipt = RegularFile(System.IO.Path.Combine(archive.DirectoryName!, "verified-release.json"));
+        if (receipt.Length > MetadataBytes) throw new InvalidOperationException("The verified archive receipt exceeds its bound.");
+        await using var proofStream = new FileStream(receipt.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
+        using var proof = JsonDocument.Parse(await ReadBoundedAsync(proofStream, MetadataBytes, ct));
+        var root = proof.RootElement;
+        var expected = root.GetProperty("sha256").GetString();
+        var bytes = root.GetProperty("bytes").GetInt64();
+        if (root.GetProperty("archive").GetString() != archive.Name || root.GetProperty("metadata").GetString() != Latest.AbsoluteUri
+            || expected is null || !Regex.IsMatch(expected, "^[0-9a-f]{64}$", RegexOptions.CultureInvariant)
+            || bytes is <= 0 or > MaxBytes || archive.Length != bytes)
+            throw new InvalidOperationException("The runner snapshot does not match its pinned official release proof.");
+        await using var input = new FileStream(archive.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
+        await CopyVerifiedAsync(input, Stream.Null, expected, bytes, ct);
+        return new(archive.FullName, expected, bytes);
+    }
+
+    static FileInfo RegularFile(string path)
+    {
+        var file = new FileInfo(System.IO.Path.GetFullPath(path));
+        if (!file.Exists || file.LinkTarget is not null || (file.Attributes & (FileAttributes.Directory | FileAttributes.Device | FileAttributes.ReparsePoint)) != 0)
+            throw new InvalidOperationException("Runner snapshot and proof must be regular files, never links.");
+        for (var parent = file.Directory; parent is not null; parent = parent.Parent)
+            if (parent.LinkTarget is not null) throw new InvalidOperationException("Runner snapshot parents must be canonical, never links.");
+        return file;
     }
 
     private sealed record Asset(string Name, Uri Url, string Hash, long Size);
@@ -171,8 +207,10 @@ public static class GuiCollectorArchive
         }
     }
 
-    private static async Task CopyVerifiedAsync(Stream input, Stream output, Asset asset, CancellationToken ct)
+    internal static async Task CopyVerifiedAsync(Stream input, Stream output, string expectedHash, long expectedBytes, CancellationToken ct)
     {
+        if (!Regex.IsMatch(expectedHash, "^[0-9a-f]{64}$", RegexOptions.CultureInvariant) || expectedBytes is <= 0 or > MaxBytes)
+            throw new InvalidOperationException("The archive proof does not contain a bounded pinned size and SHA256.");
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[81920];
         long total = 0;
@@ -180,11 +218,11 @@ public static class GuiCollectorArchive
         while ((count = await input.ReadAsync(buffer, ct)) != 0)
         {
             total += count;
-            if (total > MaxBytes || total > asset.Size) throw new InvalidOperationException("The runner archive exceeds its published size or the 512 MiB bound.");
+            if (total > MaxBytes || total > expectedBytes) throw new InvalidOperationException("The runner archive exceeds its published size or the 512 MiB bound.");
             hash.AppendData(buffer, 0, count);
             await output.WriteAsync(buffer.AsMemory(0, count), ct);
         }
-        if (total != asset.Size || !Convert.ToHexString(hash.GetHashAndReset()).Equals(asset.Hash, StringComparison.OrdinalIgnoreCase))
+        if (total != expectedBytes || !Convert.ToHexString(hash.GetHashAndReset()).Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("The runner archive does not match the official published size and SHA256 checksum.");
     }
 

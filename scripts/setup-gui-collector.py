@@ -34,6 +34,12 @@ MIGRATED_WORKFLOWS = {'.github/workflows/' + name for name in (
     'inference-adapter.yml', 'live-raw-acceptance.yml', 'rust-catalog-tests.yml', 's47-procedural-ui-tour.yml')}
 AUTH_FILES = ('.runner', '.credentials', '.credentials_rsaparams', '.service')
 HEX = re.compile(r'[a-f0-9]{64}')
+ACCOUNT_FIELDS = (('UniqueID', lambda plan: str(plan['uid'])),
+                  ('PrimaryGroupID', lambda plan: str(plan['uid'])),
+                  ('NFSHomeDirectory', lambda plan: plan['home']),
+                  ('UserShell', lambda plan: '/usr/bin/false'),
+                  ('Password', lambda plan: '*'),
+                  ('IsHidden', lambda plan: '1'))
 
 
 class Refused(Exception):
@@ -142,13 +148,51 @@ class Host:
         except KeyError:
             return None
 
-    def create_account(self, name, uid, home):
-        # No password is set and no GUI login is created. No owner HOME ACL is edited.
+    def group_state(self, name):
+        try:
+            group = grp.getgrnam(name)
+            return group.gr_gid, set(group.gr_mem)
+        except KeyError:
+            return None
+
+    def uid_free(self, uid):
+        users, groups = self.ids()
+        return uid not in users and uid not in groups
+
+    def create_group(self, name, uid):
         self.run(['/usr/sbin/dseditgroup', '-o', 'create', '-i', str(uid), name])
-        for key, value in [('UniqueID', str(uid)), ('PrimaryGroupID', str(uid)),
-                           ('NFSHomeDirectory', str(home)), ('UserShell', '/usr/bin/false'),
-                           ('Password', '*'), ('IsHidden', '1')]:
-            self.run(['/usr/bin/dscl', '.', '-create', '/Users/' + name, key, value])
+
+    def account_fields(self, name):
+        try:
+            listing = self.run(['/usr/bin/dscl', '.', '-read', '/Users/' + name])
+        except Refused:
+            return None
+        values = {}
+        for line in listing.splitlines():
+            key, separator, value = line.partition(': ')
+            if separator and key in dict(ACCOUNT_FIELDS):
+                values[key] = value
+        return values
+
+    def write_account_field(self, name, key, value):
+        self.run(['/usr/bin/dscl', '.', '-create', '/Users/' + name, key, value])
+
+    def service_absent(self, label):
+        # Absent means launchctl proved absence in every domain this label could be loaded in.
+        # A missing/unknown domain, wrong-domain presence or any other error is not absence.
+        domain = subprocess.run(['/bin/launchctl', 'print', 'gui/502'], stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=120)
+        require(domain.returncode == 0, 'lwrunner GUI launchd domain is not readable; service state unknown')
+        for target in ('gui/502/' + label, 'user/502/' + label, 'system/' + label):
+            result = subprocess.run(['/bin/launchctl', 'print', target],
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+            if result.returncode == 0:
+                return False
+            # Only launchctl's exact "no such service in this domain" answer proves absence.
+            error = result.stderr.decode(errors='replace')
+            if 'Could not find service' not in error or target not in error:
+                return False
+        return True
 
     def verify_account(self, name, uid, home):
         require(self.account(name) == dict(uid=uid, gid=uid, home=str(home), shell='/usr/bin/false'),
@@ -316,15 +360,37 @@ class Installer:
         require(c['collectorRepository'].lower() not in {repo.lower() for repo in repositories},
                 'collector must be registered separately from every source repository; PR jobs can bypass source wrappers')
         require(self.host.account('lwrunner')['uid'] == 502, 'existing lwrunner identity differs')
+        binding = self.raw_plan_sha256 or digest(json.dumps(p, sort_keys=True).encode())
+        receipt_path = self.path(STATE / 'receipt.json')
+        authorized = False
+        if receipt_path.exists() or receipt_path.is_symlink():
+            self.secure(receipt_path, 0, 0o600)
+            previous = json.loads(receipt_path.read_text())
+            require(previous.get('planSha256') == binding and previous.get('uid') == p['uid'],
+                    'existing installation reservation belongs to another plan/identity')
+            authorized = True
         account = self.host.account(p['user'])
+        fields = self.host.account_fields(p['user'])
+        group = self.host.group_state(p['user'])
         uids, gids = self.host.ids()
+        if group is not None or fields is not None or account is not None:
+            require(authorized, 'existing group/account has no installer reservation receipt')
+        if group is not None:
+            require(p['uid'] in gids and group[0] == p['uid'] and not group[1] - {p['user']},
+                    'group name/UUID belongs to an unrelated group')
+        # Only a durable reservation may adopt the exact intent this plan authored. Anything else
+        # (an unrelated account, group, HOME or UID) is refused rather than clobbered.
         if account is None:
-            require(p['uid'] not in uids and p['uid'] not in gids and self.host.group(p['user']) is None,
-                    'reserved UID/GID or private group name already in use')
-            require(not self.path(p['home']).exists(), 'refusing to adopt an existing HOME')
+            if group is None:
+                require(p['uid'] not in uids and p['uid'] not in gids, 'reserved UID/GID already in use')
+            require(authorized or p['uid'] not in uids, 'reserved UID belongs to another account')
+            if self.path(p['home']).exists() or self.path(p['home']).is_symlink():
+                require(authorized, 'refusing to adopt an existing HOME')
         else:
-            require(self.path(STATE / 'receipt.json').is_file(), 'existing account has no installer reservation receipt')
-            self.host.verify_account(p['user'], p['uid'], p['home'])
+            require(account['uid'] == p['uid'] and account['home'] == p['home'], 'existing account differs from reservation')
+            for key, expected in ACCOUNT_FIELDS:
+                if key in (fields or {}):
+                    require(fields[key] == expected(p), 'existing account attribute conflicts with reservation: ' + key)
             home = self.path(p['home'])
             if home.exists() or home.is_symlink():
                 self.secure(home, p['uid'], 0o700)
@@ -335,7 +401,6 @@ class Installer:
                 'gui-collector-authority-v1', 'unknown authority receipt kind/version')
         online = authority.get('online') or {}
         require(not online or set(online) == {'runnerId', 'runnerName', 'status', 'labels'}, 'unknown online authority fields')
-        binding = self.raw_plan_sha256 or digest(json.dumps(p, sort_keys=True).encode())
         require(authority.get('planSha256') == binding, 'authority does not bind this exact plan')
         require(type(authority.get('expiresAt')) in (int, float) and time.time() < authority['expiresAt'] <= time.time() + 3600,
                 'authority receipt expired or not short lived')
@@ -432,7 +497,22 @@ class Installer:
             return False
         try:
             if 'old-service-stopped' not in self.receipt['stages']:
-                self.host.stop(old['serviceLabel'])
+                intent = self.receipt.get('retirement')
+                if intent is not None:
+                    require(intent == {'serviceLabel': old['serviceLabel'], 'domain': 'gui/502',
+                                       'userId': 502, 'runnerRoot': old['runnerRoot']},
+                            'protected retirement intent does not match this exact service')
+                else:
+                    self.receipt['retirement'] = {'serviceLabel': old['serviceLabel'], 'domain': 'gui/502',
+                                                  'userId': 502, 'runnerRoot': old['runnerRoot']}
+                    self.save()
+                # Absence of exactly this service in lwrunner's domain is the only success
+                # evidence. A crash after bootout can therefore resume; wrong-domain or
+                # unknown launchctl errors stay blocked, never "ignored".
+                if not self.host.service_absent(old['serviceLabel']):
+                    self.host.stop(old['serviceLabel'])
+                    require(self.host.service_absent(old['serviceLabel']),
+                            'old service is still present (or its state is unknowable) after bootout')
                 self.stage('old-service-stopped')
             for name, source in sources.items():
                 if source.exists():
@@ -445,9 +525,42 @@ class Installer:
                 if not source.exists():
                     owner = 502 if name != 'servicePlist' or source.is_relative_to(self.path('/Users/lwrunner')) else 0
                     self.put(source, (backup / name).read_bytes(), 0o644 if name == 'servicePlist' else 0o600, owner)
-            self.receipt['status'] = 'rollback-local-files-restored-registration-requires-owner'
+            self.receipt['status'] = 'retirement-blocked-local-files-restored-registration-requires-owner'
             self.save()
             raise
+
+    def provision_account(self):
+        """Finish the exact reserved identity across crashes, never adopting anything else."""
+        p = self.p
+        name, uid, home = p['user'], p['uid'], p['home']
+        journal = self.receipt.setdefault('account', {'group': 'pending', 'fields': {}})
+        group = self.host.group_state(name)
+        if group is not None:
+            require(group[0] == uid and not group[1] - {name}, 'group name/UUID belongs to an unrelated group')
+            journal['group'] = 'done'
+        else:
+            require(self.host.uid_free(uid), 'reserved UID/GID already belongs to another account')
+            journal['group'] = 'pending'
+            self.save()
+            self.host.create_group(name, uid)
+            journal['group'] = 'done'
+            self.save()
+        fields = self.host.account_fields(name)
+        for key, expected in ACCOUNT_FIELDS:
+            value = expected(p)
+            if fields is not None and key in fields:
+                require(fields[key] == expected(p), 'existing account attribute conflicts with reservation: ' + key)
+                journal['fields'][key] = 'done'
+                continue
+            # Intent is durable BEFORE the side effect, so a crash cannot make the record
+            # look like an unknown account or leave a field unaccounted for.
+            journal['fields'][key] = 'pending'
+            self.save()
+            self.host.write_account_field(name, key, value)
+            journal['fields'][key] = 'done'
+            fields = self.host.account_fields(name)
+            self.save()
+        self.save()
 
     def apply(self, authority, token_reader):
         # Serialize all local apply/resume operations, including across root processes.
@@ -479,8 +592,7 @@ class Installer:
                 self.atomic_state(name + '.json', self.inputs[name + 'Bytes'])
         p = self.p
         home = self.path(p['home'])
-        if self.host.account(p['user']) is None:
-            self.host.create_account(p['user'], p['uid'], p['home'])
+        self.provision_account()
         self.host.verify_account(p['user'], p['uid'], p['home'])
         self.mkdir(home, p['uid'])
         self.mkdir(self.path(p['configuration']['stateDirectory']), p['uid'])

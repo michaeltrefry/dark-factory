@@ -15,6 +15,7 @@ import time
 import unittest
 import zipfile
 from unittest import mock
+import uuid
 
 module = runpy.run_path(sys.argv[1], run_name='sealed_gui_fixture')
 g = module['main'].__globals__
@@ -774,6 +775,137 @@ class GuiContracts(unittest.TestCase):
         signal_fake.assert_not_called()
         self.assertTrue(record.exists())
 
+
+    def test_short_and_full_core_simulator_identifiers_normalize_once_and_wrong_inventory_is_refused(self):
+        short = g['gui_environment']({'runtime': 'iOS-26-5', 'deviceType': 'iPhone-17', 'xcode': '26.5', 'build': '17F42'})
+        full = g['gui_environment']({'runtime': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                                     'deviceType': 'com.apple.CoreSimulator.SimDeviceType.iPhone-17', 'xcode': '26.5', 'build': '17F42'})
+        expected = ('com.apple.CoreSimulator.SimRuntime.iOS-26-5', 'com.apple.CoreSimulator.SimDeviceType.iPhone-17')
+        self.assertEqual(expected, (short['runtime'], short['deviceType']))
+        self.assertEqual(short, full)  # a full identifier gains no second prefix
+        self.assertNotIn('com.apple.CoreSimulator.SimRuntime.com.apple', full['runtime'])
+        with mock.patch.dict(g, ENVIRONMENT=short):
+            self.assertEqual((expected[1], expected[0]), g['simulator']({'runtimes': [{'identifier': expected[0], 'isAvailable': True}],
+                                                                         'devicetypes': [{'identifier': expected[1]}]}))
+            for inventory in ({'runtimes': [{'identifier': 'iOS-26-5', 'isAvailable': True}], 'devicetypes': [{'identifier': expected[1]}]},
+                              {'runtimes': [{'identifier': expected[0], 'isAvailable': True}], 'devicetypes': [{'identifier': 'iPhone-17'}]},
+                              {'runtimes': [{'identifier': expected[0], 'isAvailable': False}], 'devicetypes': [{'identifier': expected[1]}]},
+                              {'runtimes': [{'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-18-5', 'isAvailable': True}],
+                               'devicetypes': [{'identifier': expected[1]}]}):
+                with self.subTest(inventory=inventory), self.assertRaises(ValueError): g['simulator'](inventory)
+
+    def test_gui_prepare_failure_publishes_typed_result_only_after_cleanup_proof(self):
+        class Lease:
+            def __init__(self): self.cleaned, self.roots = False, []
+            def record(self, root, devices=None, intents=None): self.roots.append(root)
+            def evidence(self):
+                root = self.roots[-1] if self.roots else None
+                if not self.cleaned or root is None or root.exists():
+                    raise ValueError('GUI cleanup has not been proven')
+                return {'cleaned': True, 'workspaceGone': True}
+        class RefusedPrincipal:
+            def __init__(self, root): raise AssertionError('no source principal before artifacts')
+        plan = self.execution_plan()
+        plan['prepare'] = {'artifacts': [], 'steps': [{'name': 'noop', 'argv': ['/usr/bin/true'], 'workingDirectory': '',
+                                                       'environment': {}, 'timeoutSeconds': 5}]}
+        for cleanup_failure in (False, True):
+            with self.subTest(cleanup_failure=cleanup_failure):
+                lease = Lease()
+                with self.execution_directory({'base': 'base', 'head': 'head'}) as directory:
+                    (self.root / 'result.json').unlink(missing_ok=True)
+                    real_rmtree = g['shutil'].rmtree
+                    def rmtree(path, *a, **k):
+                        if pathlib.Path(path).name.startswith('factory-ios-') and cleanup_failure:
+                            raise OSError('cleanup refused')
+                        return real_rmtree(path, *a, **k)
+                    error = None
+                    with mock.patch.dict(g, GUI_CONFIG={'hash': 'a' * 64, 'trustedRepositories': ['acme/source']}, GUI_LEASE=lease, Principal=RefusedPrincipal), \
+                            mock.patch.dict(os.environ, SOURCE_REPOSITORY='acme/source'), \
+                            mock.patch.dict(g, prepare_artifacts=mock.Mock(side_effect=OSError('download refused'))), \
+                            mock.patch.object(g['shutil'], 'rmtree', side_effect=rmtree):
+                        try: g['execution_main'](self.execution_request('base'), json.dumps(plan))
+                        except Exception as caught: error = caught
+                        published = (directory / 'result.json').exists()
+                        if not cleanup_failure:
+                            result = json.loads((directory / 'result.json').read_text())
+                    if cleanup_failure:
+                        # The cleanup failure itself must surface (not be masked by the lease-evidence gate), and nothing publishes.
+                        self.assertTrue(isinstance(error, OSError) and not published,
+                                        f'cleanup failure must surface and suppress evidence: {error!r}, published={published}')
+                    else:
+                        self.assertEqual(('prepare-failed', 'artifact-fetch-failed', True),
+                                         (result['execution']['status'], result['execution']['failure']['code'],
+                                          (result.get('guiLease') or {}).get('cleaned')),
+                                         'the typed prepare refusal is published only once the lease proves the workspace gone')
+
+    def execution_plan(self):
+        base, head = '1' * 40, '2' * 40
+        return {'side': 'base', 'commit': base, 'overlayFrom': head, 'overlayPaths': ['Tests/New.swift'], 'deletePaths': [],
+                'testEnvironment': {}, 'replacements': {}, 'sourceRepository': 'acme/source',
+                'builds': [{'flag': '-project', 'container': 'Widget.xcodeproj', 'scheme': 'Widget', 'tests': [TEST], 'platform': 'macOS'}],
+                'prepare': None}
+
+    def execution_request(self, side):
+        return {'BASE': '1' * 40, 'HEAD': '2' * 40, 'SIDE': side, 'NONCE': 'a' * 32, 'TESTS': json.dumps([TEST])}
+
+    @contextlib.contextmanager
+    def execution_directory(self, sources):
+        # sources: side name -> a zip payload marker ('base'/'head') or raw bytes; a missing key means no archive at all.
+        directory = self.root / ('execution-' + uuid.uuid4().hex)
+        directory.mkdir()
+        (directory / 'sources').mkdir()
+        for name, content in sources.items():
+            if isinstance(content, bytes):
+                (directory / 'sources' / (name + '.zip')).write_bytes(content)
+                continue
+            with zipfile.ZipFile(directory / 'sources' / (name + '.zip'), 'w') as archive:
+                archive.writestr('repository/Tests/New.swift', 'from head' if name == 'head' else 'old test')
+                archive.writestr('repository/Production.swift', name + ' production')
+        prior = pathlib.Path.cwd()
+        os.chdir(directory)
+        try:
+            yield directory
+        finally:
+            os.chdir(prior)
+
+    def test_head_only_execution_never_reads_an_unused_base_archive_and_required_bad_side_fails(self):
+        class SimplePrincipal:
+            def __init__(self, root): self.root, self.home, self.worktree = root, root / 'home', root / 'head'; self.home.mkdir()
+            def share(self, path): pass
+            def run(self, args, cwd, **kwargs):
+                if args == ['/usr/bin/xcodebuild', '-version']: return 0, 'Xcode 26.5\nBuild version 17F42'
+                if 'build-for-testing' in args: return 0, ''
+                if 'test-without-building' in args: return 0, 'ran'
+                return 0, json.dumps({'testNodes': [{'nodeType': 'Test Case', 'nodeIdentifier': TEST, 'result': 'Passed'}]})
+            def close(self): shutil.rmtree(self.root)
+        plan = self.execution_plan()
+        plan.update(side='head', commit='2' * 40, overlayFrom='2' * 40, overlayPaths=[])
+        environment = {'runtime': 'runtime', 'deviceType': 'phone', 'xcode': '26.5', 'build': '17F42'}
+        for absent in (False, True):
+            archives = {'head': 'head', **({} if absent else {'base': b'not an archive'})}
+            with self.subTest(absent=absent), self.execution_directory(archives):
+                with mock.patch.dict(g, GUI_CONFIG={'hash': 'a' * 64, 'trustedRepositories': ['acme/source']}, GUI_LEASE=mock.Mock(evidence=mock.Mock(return_value={})),
+                        ENVIRONMENT=environment, Principal=SimplePrincipal, package_snapshot=lambda *a: {},
+                        hydrate_packages=lambda *a: {}, hydrate_binary_packages=lambda *a: False), \
+                        mock.patch.dict(os.environ, SOURCE_REPOSITORY='acme/source'):
+                    outcome, failure = None, None
+                    try:
+                        g['execution_main'](self.execution_request('head'), json.dumps(plan))
+                        outcome = json.loads(pathlib.Path('result.json').read_text())['execution']['status']
+                    except Exception as caught:
+                        failure = caught
+                self.assertEqual('ran', outcome,
+                                 f'a same-revision overlay needs no opposite archive, so an invalid unused base is never read: {failure!r}')
+        required = dict(plan, overlayFrom='1' * 40, overlayPaths=['Tests/New.swift'])
+        with self.execution_directory({'head': 'head', 'base': b'not an archive'}):
+            error = None
+            with mock.patch.dict(g, GUI_CONFIG={'hash': 'a' * 64, 'trustedRepositories': ['acme/source']}, GUI_LEASE=mock.Mock(evidence=mock.Mock(return_value={})),
+                    ENVIRONMENT=environment, Principal=SimplePrincipal), \
+                    mock.patch.dict(os.environ, SOURCE_REPOSITORY='acme/source'):
+                try: g['execution_main'](self.execution_request('head'), json.dumps(required))
+                except Exception as caught: error = caught
+            self.assertTrue(isinstance(error, zipfile.BadZipFile) and not pathlib.Path('result.json').exists(),
+                            f'an overlay that does need the opposite revision fails reading that archive: {error!r}')
 
 if __name__ == '__main__':
     sys.argv = [sys.argv[0]]

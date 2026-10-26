@@ -284,6 +284,16 @@ def verify_gui_helper():
         raise ValueError('stale installed GUI helper')
 
 
+def gui_environment(config):
+    # The protected configuration may use Xcode's short simulator names (iOS-26-5 / iPhone-17) while CoreSimulator
+    # inventory and the chooser use full identifiers. Normalize exactly once; a full identifier gains no second prefix.
+    def full(value, prefix):
+        return value if value.startswith(prefix) else prefix + value
+    return {'runtime': full(config['runtime'], 'com.apple.CoreSimulator.SimRuntime.'),
+            'deviceType': full(config['deviceType'], 'com.apple.CoreSimulator.SimDeviceType.'),
+            'xcode': config['xcode'], 'build': config['build']}
+
+
 def main():
     global GUI_CONFIG, GUI_LEASE, ENVIRONMENT, EXECUTION_DEADLINE
     verify_gui_helper()
@@ -297,7 +307,7 @@ def main():
     source = os.environ.get('SOURCE_REPOSITORY')
     if not isinstance(source, str) or source.lower() not in [repo.lower() for repo in GUI_CONFIG['trustedRepositories']]:
         raise ValueError('GUI source repository is not in the protected allowlist')
-    ENVIRONMENT = {key: GUI_CONFIG[key] for key in ('runtime', 'deviceType', 'xcode', 'build')}
+    ENVIRONMENT = gui_environment(GUI_CONFIG)
     pathlib.Path('result.json').unlink(missing_ok=True)
     with GuiLease(GUI_CONFIG) as lease:
         GUI_LEASE = lease

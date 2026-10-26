@@ -15,7 +15,12 @@ public static class GuiSourceWorkflow
     public const string Client = "/usr/local/libexec/dark-factory/factory-gui-source-job";
     public const string Protocol = "factory-gui-source-v1";
     public const string DefaultRepository = RemoteGuiSourceWorkflow.Repository;
-    public sealed record SourceStep(string Name, string? Id, string Run, string Condition, Dictionary<string, string> Env, int TimeoutMinutes);
+    public sealed record SourceStep(string Name, string? Id, string Run, string Condition, Dictionary<string, string> Env, int TimeoutMinutes)
+    {
+        private string? shell;
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public string? Shell { get => shell; init => shell = value == "implicit-bash" ? null : value; }
+    }
     public sealed record SourceArtifact(string Name, string[] Paths, string Condition, string IfNoFilesFound, int RetentionDays);
     public sealed record JobPlan(int Version, string Workflow, string JobId, int TimeoutMinutes, string Submodules,
         Dictionary<string, string> Env, SourceStep[] Steps, SourceArtifact[] Artifacts);
@@ -88,7 +93,9 @@ public static class GuiSourceWorkflow
             Require(Child(step, "shell") is null || Scalar(Child(step, "shell")) is "bash" or "bash --noprofile --norc -e -o pipefail {0}", "Unknown source shell semantics.");
             programs.Add(new(Scalar(Child(step, "name")), Child(step, "id") is { } id ? Scalar(id) : null,
                 script, Condition(Child(step, "if")), Environment(Child(step, "env"), jobLevel: false),
-                Child(step, "timeout-minutes") is { } bound ? Number(bound, 1, timeout) : timeout));
+                Child(step, "timeout-minutes") is { } bound ? Number(bound, 1, timeout) : timeout) {
+                Shell = Child(step, "shell") is null ? null : "bash"
+            });
         }
         Require(submodules is not null && programs.Count is > 0 and <= 50 && artifacts.Count <= 10
             && artifacts.Select(a => a.Name).Distinct().Count() == artifacts.Count, "Incomplete or ambiguous source job inventory.");
@@ -188,6 +195,7 @@ public static class GuiSourceWorkflow
                 { "name", "Publish actual source-head outcome after retained evidence delivery" }, { "if", "always()" },
                 { "env", new YamlMappingNode {
                     { "FACTORY_GUI_SOURCE_JOB", plan.JobId }, { "FACTORY_GUI_DEFAULT_BRANCH", defaultBranch },
+                    { "FACTORY_GUI_COLLECTOR_REPOSITORY", collectorRepository },
                     { "FACTORY_GUI_SOURCE_TOKEN", "${{ github.token }}" },
                     { "FACTORY_GUI_SOURCE_CONCLUSION", "${{ steps.factory-source.outputs.source_conclusion }}" },
                     { "FACTORY_GUI_SOURCE_TARGET_URL", "${{ steps.factory-source.outputs.source_target_url }}" },
@@ -308,6 +316,7 @@ public static class GuiSourceWorkflow
         {
             Require(step.Run.Length is > 0 and <= 40_000 && !step.Run.Contains("${{", StringComparison.Ordinal)
                 && step.TimeoutMinutes >= 1 && step.TimeoutMinutes <= plan.TimeoutMinutes, "Invalid source-step program or timeout.");
+            Require(step.Shell is null or "bash", "Unsupported source shell; explicit Bash must retain pipefail semantics.");
             ValidateCondition(step.Condition);
             foreach (var entry in step.Env) ValidateEnvironment(entry.Key, entry.Value, false);
         }

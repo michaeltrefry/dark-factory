@@ -20,6 +20,9 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp, bool g
         { ["actions"] = "write" };
     private const int MaxApiBytes = 512 * 1024;
     private const int MaxArchiveBytes = 3 * 1024 * 1024;
+    // The sealed transfer contains at most two 100 MiB source ZIPs plus artifact ZIP overhead. It is validated,
+    // not downloaded as test evidence; result archives retain their much smaller bound below.
+    private const long MaxSourceTransferBytes = 201L * 1024 * 1024;
     private static string Root(RepoRef repo) => $"repos/{Uri.EscapeDataString(repo.Owner)}/{Uri.EscapeDataString(repo.Name)}";
 
     public async Task<IosSealedWorkflow?> ReadDefaultWorkflowAsync(RepoRef repo, CancellationToken ct)
@@ -127,8 +130,37 @@ public sealed class IosWorkflowGitHub(HttpClient http, GitHubApp gateApp, bool g
         var token = await ReadToken(repo, ct);
         using var json = await JsonAsync($"{Root(repo)}/actions/runs/{run.Id}/artifacts?per_page=100", token, ct);
         var root = json.RootElement;
-        var artifacts = root.GetProperty("artifacts").EnumerateArray().ToArray();
-        if (root.GetProperty("total_count").GetInt32() != artifacts.Length) throw new InvalidDataException("Incomplete artifacts listing.");
+        RemoteIosNewTests.Unique(root);
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("artifacts", out var listing) || listing.ValueKind != JsonValueKind.Array
+            || !root.TryGetProperty("total_count", out var total) || total.ValueKind != JsonValueKind.Number || !total.TryGetInt32(out var count))
+            throw new InvalidDataException("Malformed artifacts listing.");
+        var inventory = listing.EnumerateArray().ToArray();
+        if (count != inventory.Length || inventory.Length > 3) throw new InvalidDataException("Incomplete or oversized artifacts listing.");
+        var results = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var ids = new HashSet<long>();
+        foreach (var artifact in inventory)
+        {
+            if (artifact.ValueKind != JsonValueKind.Object || !artifact.TryGetProperty("name", out var named) || named.ValueKind != JsonValueKind.String)
+                throw new InvalidDataException("Malformed artifact identity.");
+            var name = named.GetString()!;
+            var sourceTransfer = name == "factory-ios-sources";
+            if (!sourceTransfer && name != "factory-ios-result-" + correlation + "-base" && name != "factory-ios-result-" + correlation + "-head")
+                throw new InvalidDataException("Unknown artifact or result correlation.");
+            if (!names.Add(name) || !artifact.TryGetProperty("id", out var identity) || identity.ValueKind != JsonValueKind.Number
+                || !identity.TryGetInt64(out var id) || id <= 0 || !ids.Add(id)
+                || !artifact.TryGetProperty("expired", out var expired) || expired.ValueKind != JsonValueKind.False
+                || !artifact.TryGetProperty("size_in_bytes", out var sized) || sized.ValueKind != JsonValueKind.Number || !sized.TryGetInt64(out var size)
+                || size < 0 || size > (sourceTransfer ? MaxSourceTransferBytes : MaxArchiveBytes)
+                || !artifact.TryGetProperty("workflow_run", out var provenance) || provenance.ValueKind != JsonValueKind.Object
+                || !provenance.TryGetProperty("id", out var parent) || parent.ValueKind != JsonValueKind.Number
+                || !parent.TryGetInt64(out var parentId) || parentId != run.Id || parentId <= 0)
+                throw new InvalidDataException("Duplicate or invalid artifact provenance, expiry or size.");
+            if (!sourceTransfer) results.Add(name, artifact);
+        }
+        // The source-transfer artifact is produced by BOTH sealed workflows in the SAME run. Its metadata must be
+        // valid, but it is not a result side and must never alter single-side versus two-side evidence selection.
+        var artifacts = results.Values.ToArray();
         // General execution dispatches schedule only the requested side's VM. Its one artifact still has the
         // ordinary side provenance checks; ParseExecution additionally binds its side and hash to the original plan.
         if (artifacts.Length == 1)
