@@ -2109,6 +2109,20 @@ only by explicit owner deployment into a protected default-branch GitHub Environ
 repository secret, source process, runner service or owner-PAT fallback. This is a disclosed one-time
 credential publication, not an action performed by unit tests.
 
+The initial source migration targets the default branch; the non-default-PR request bridge is
+excluded there, so an absent default publisher cannot leave the migration waiting on its own
+pending bridge status. Actual failed or pending pre-merge checks still block the exact compiled
+owner migration. After root installation, configuration pinning and final-label promotion, the
+owner CLI automatically reconciles that migration PR's authenticated **merge commit**, never its
+PR head or the latest unrelated default commit. It journals the four exact push workflow run IDs
+and attempts before cancel/rerun requests, waits for fresh-environment reruns, and requires each
+executed source job, its actual-head status and the head's controller/check CI to pass. Missing
+runs, skipped source jobs and no reported CI are not readiness. An uncertain POST is observed on
+resume, not blindly repeated. The journal keeps a thirteen-hour bound (four serialized source
+jobs of at most 180 minutes plus dispatch/upload time); resume does not reset it. No root/worker
+lock is held during this wait, and deployment is not marked complete without the recorded proof.
+No manual GitHub rerun click or general CI bypass is part of bootstrap.
+
 Genuine installation prerequisites include root authorization for the reviewed fixed bootstrap and
 workers' v6 helpers, Gate App Actions read/write plus the installation's approval, and access to the
 private controller repository. An owner without those authorities cannot complete live acceptance;

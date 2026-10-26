@@ -15,7 +15,7 @@ public static class GuiCollectorCli
     public sealed record HostedState(GuiCollectorDeployment.HostedPlan Plan, long? PullRequest = null);
     public sealed record Prepared(string PlanFile, string Checkout, GuiCollectorDeployment.Evidence Original,
         GuiCollectorDeployment.Workflow[] Migrated, long? MigrationPullRequest = null, long? RegisteredRunnerId = null, bool InventoryVerified = false,
-        long? CollectorPullRequest = null, HostedState[]? Hosted = null);
+        long? CollectorPullRequest = null, HostedState[]? Hosted = null, GuiCollectorDeployment.BootstrapReadiness? BootstrapCi = null);
 
     public static Command Build(Func<Request, CancellationToken, Task<int>>? execute = null)
     {
@@ -293,10 +293,23 @@ public static class GuiCollectorCli
             await gateway.PinInstalledConfigurationAsync(fresh.DefaultBranch, configurationHash, ct);
             await GuiCollectorSettings.PersistAsync(repo.FullName, trustedRepositories, configurationHash, ct);
             await gateway.PromoteRunnerAsync(currentPlan, complete, ct);
+            // The migration's first push may have captured an empty/old configuration pin before installation.
+            // Re-run only its exact four source jobs after promotion; root/slot locks are not held during CI.
+            var readiness = await gateway.ReconcileBootstrapCiAsync(prepared.Original, prepared.Migrated, migration,
+                runnerId, configurationHash, prepared.BootstrapCi, (value, _) => {
+                    prepared = prepared with { BootstrapCi = value };
+                    Save(journal, prepared);
+                    return Task.CompletedTask;
+                }, ct);
+            if (!readiness.Complete)
+            {
+                Console.WriteLine("Collector installed, but its exact migration push has not proved fresh-configuration source CI within its journaled deadline. Deployment is NOT complete; resume reconciles the recorded run IDs/attempts without blind reruns.");
+                return 2;
+            }
             var completionPath = Path.Combine(directory, "completion.json");
             var firstCompletion = !File.Exists(completionPath);
             Save(completionPath, new { planSha256 = fresh.PlanSha256, repository = repo.FullName,
-                runnerId, runnerName = newName, removedOldRunnerId = removed, configurationSha256 = configurationHash });
+                runnerId, runnerName = newName, removedOldRunnerId = removed, configurationSha256 = configurationHash, bootstrapCi = readiness });
             Console.WriteLine("Collector registered, authenticated online, exact old registration removed, protected local retirement verified and public factory settings persisted. Deployment complete.");
             if (firstCompletion) Console.WriteLine("Restart an already-running factory host once to load its persisted GUI settings. No per-job flags are needed.");
             return 0;

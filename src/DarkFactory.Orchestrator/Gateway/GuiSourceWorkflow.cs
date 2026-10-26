@@ -32,6 +32,9 @@ public static class GuiSourceWorkflow
         [".github/workflows/s47-procedural-ui-tour.yml"] = "deterministic-fixtures-and-tour"
     };
 
+    internal static string JobId(string path) => Jobs.TryGetValue(path, out var job) ? job
+        : throw Refused("Unknown source workflow identity.");
+
     public static string Migrate(string path, string originalYaml, string collectorRepository = DefaultRepository, string defaultBranch = "main")
     {
         Require(Jobs.ContainsKey(path), "Unknown source workflow; only the exact four inventoried LensWorks jobs may migrate.");

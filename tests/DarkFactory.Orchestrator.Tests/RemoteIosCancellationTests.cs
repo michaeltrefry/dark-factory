@@ -54,8 +54,9 @@ public sealed class RemoteIosCancellationTests
     public async Task Polling_uses_the_deadline_not_the_old_180_poll_limit()
     {
         var github = new Workflow { CompleteAfterReads = 182 };
-        var result = await Remote(github).RunAsync(Repo, Request, CancellationToken.None);
+        var result = await Remote(github, poll: TimeSpan.Zero).RunAsync(Repo, Request, CancellationToken.None);
         Assert.Equal("pass", result.Outcome);
+        Assert.Equal(182, github.Reads);
     }
 
     [Fact]
@@ -76,9 +77,9 @@ public sealed class RemoteIosCancellationTests
         Assert.Equal((0, 1), (github.Cancels, github.Dispatches));
     }
 
-    private static RemoteIosNewTests Remote(Workflow github, TimeSpan? timeout = null, string? directory = null) => new(github, directory)
+    private static RemoteIosNewTests Remote(Workflow github, TimeSpan? timeout = null, string? directory = null, TimeSpan? poll = null) => new(github, directory)
     {
-        PollInterval = TimeSpan.FromMilliseconds(1), Timeout = timeout ?? TimeSpan.FromSeconds(3), CleanupTimeout = TimeSpan.FromMilliseconds(500)
+        PollInterval = poll ?? TimeSpan.FromMilliseconds(1), Timeout = timeout ?? TimeSpan.FromSeconds(3), CleanupTimeout = TimeSpan.FromMilliseconds(500)
     };
 
     private sealed class Workflow : IIosWorkflowGitHub
@@ -90,6 +91,7 @@ public sealed class RemoteIosCancellationTests
         public TimeSpan WorkflowDelay;
         private string nonce = "";
         private int reads;
+        public int Reads => reads;
         private bool cancelled;
         public async Task<IosSealedWorkflow?> ReadDefaultWorkflowAsync(RepoRef repo, CancellationToken ct)
         {
