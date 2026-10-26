@@ -14,6 +14,7 @@ import plistlib
 import pwd
 import grp
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -34,6 +35,13 @@ MIGRATED_WORKFLOWS = {'.github/workflows/' + name for name in (
     'inference-adapter.yml', 'live-raw-acceptance.yml', 'rust-catalog-tests.yml', 's47-procedural-ui-tour.yml')}
 AUTH_FILES = ('.runner', '.credentials', '.credentials_rsaparams', '.service')
 HEX = re.compile(r'[a-f0-9]{64}')
+MAX_REGISTRATION_ATTEMPTS = 2
+REGISTRATION_RETRY_WINDOW = 3600
+ABSENCE_FRESH_SECONDS = 300
+GATE_SCRIPT = ("import os,sys\n"
+               "try:\n    byte=os.read(int(sys.argv[1]),1)\nexcept OSError:\n    byte=b''\n"
+               "if byte != b'g':\n    os._exit(125)\n"
+               "os.execv(sys.argv[2], sys.argv[2:])\n")
 ACCOUNT_FIELDS = (('UniqueID', lambda plan: str(plan['uid'])),
                   ('PrimaryGroupID', lambda plan: str(plan['uid'])),
                   ('NFSHomeDirectory', lambda plan: plan['home']),
@@ -42,8 +50,25 @@ ACCOUNT_FIELDS = (('UniqueID', lambda plan: str(plan['uid'])),
                   ('IsHidden', lambda plan: '1'))
 
 
+def _absent_diagnostic(stderr, label, domain_text):
+    """True only for launchctl's literal "no such service in this domain" message.
+
+    Apple's launchctl prints "Bad request." on its own line followed by
+    ``Could not find service "<label>" in domain for <domain_text>`` and exits 113.
+    Any extra or differing text — permission failures, unknown domains, other services —
+    means the state is unknown and must never be treated as absence.
+    """
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    expected = 'Could not find service "%s" in domain for %s' % (label, domain_text)
+    return bool(lines) and lines[-1] == expected and all(line == 'Bad request.' for line in lines[:-1])
+
+
 class Refused(Exception):
     pass
+
+
+class ReconciliationRequired(Refused):
+    """A retryable unstarted intent needs the owner gateway's fresh absence proof."""
 
 
 def require(condition, reason):
@@ -109,14 +134,82 @@ def file_digest(path):
     return checksum.hexdigest()
 
 
+class GatedProcess:
+    """A registration child that cannot exec (or POST) until the gate byte is written."""
+
+    def __init__(self, process, write_fd, pid, start_identity):
+        self.process, self.write_fd, self.pid, self.start_identity = process, write_fd, pid, start_identity
+
+    def release(self):
+        os.write(self.write_fd, b'g')
+        os.close(self.write_fd)
+
+    def abort(self):
+        os.close(self.write_fd)
+
+    def wait(self):
+        return self.process.wait(timeout=120)
+
+
 class Host:
     """Only this adapter runs machine commands; tests replace it completely."""
-    def run(self, argv, *, uid=None, gid=None, home=None, cwd='/', token=None):
+
+    def env(self, home, token):
         env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(home or '/var/empty'),
                'LANG': 'en_US.UTF-8'}
         if token:
             # Native actions/runner CommandSettings protocol. Never --token or PAT.
             env['ACTIONS_RUNNER_INPUT_TOKEN'] = token
+        return env
+
+    def process_identity(self, pid, uid):
+        """Exact uid+lstart for a live pid, None only for ps's confirmed no-such-process.
+
+        Any other ps failure (permission, unknown code, malformed output) is ambiguous and
+        refused: an unreadable process must never authorize a dead-child retry."""
+        require(type(pid) is int and pid > 1 and type(uid) is int, 'invalid process identity request')
+        result = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'uid=', '-o', 'lstart='],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        output = result.stdout.decode(errors='replace')
+        errors = result.stderr.decode(errors='replace')
+        if result.returncode != 0:
+            if result.returncode == 1 and not output.strip() and not errors.strip():
+                return None
+            raise Refused('process state is unknown (ps refused or answered unexpectedly)')
+        parts = ' '.join(output.split()).split(' ', 1)
+        require(len(parts) == 2 and parts[0] == str(uid) and parts[1].strip(),
+                'process identity is ambiguous')
+        return parts[0] + ' ' + parts[1]
+
+    def start_gated(self, argv, *, uid, gid, home, cwd='/', token=None):
+        read_fd, write_fd = os.pipe()
+        def demote():
+            os.setgroups([gid])
+            os.setgid(gid)
+            os.setuid(uid)
+            os.umask(0o077)
+        try:
+            process = subprocess.Popen([sys.executable, '-I', '-c', GATE_SCRIPT, str(read_fd), *argv],
+                                       cwd=cwd, env=self.env(home, token), stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       pass_fds=(read_fd,), preexec_fn=demote)
+        finally:
+            os.close(read_fd)
+        try:
+            identity = self.process_identity(process.pid, uid)
+            require(isinstance(identity, str) and identity, 'child start identity is unverifiable')
+        except Exception:
+            # Close the gate (the child exits on EOF) and wait a bounded time; never signal it.
+            os.close(write_fd)
+            try:
+                process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        return GatedProcess(process, write_fd, process.pid, identity)
+
+    def run(self, argv, *, uid=None, gid=None, home=None, cwd='/', token=None):
+        env = self.env(home, token)
         def demote():
             os.setgroups([gid])
             os.setgid(gid)
@@ -180,17 +273,24 @@ class Host:
     def service_absent(self, label):
         # Absent means launchctl proved absence in every domain this label could be loaded in.
         # A missing/unknown domain, wrong-domain presence or any other error is not absence.
+        require(isinstance(label, str) and label and '"' not in label and '\n' not in label,
+                'invalid service label')
         domain = subprocess.run(['/bin/launchctl', 'print', 'gui/502'], stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=120)
         require(domain.returncode == 0, 'lwrunner GUI launchd domain is not readable; service state unknown')
-        for target in ('gui/502/' + label, 'user/502/' + label, 'system/' + label):
+        # launchctl's actual "not found" diagnostic names the quoted service and its domain
+        # separately; the full target string never appears in the message. Anything else —
+        # permission denied, an unknown domain, a wrong uid/kind or a present service — is not
+        # absence. See _absent_diagnostic for the exact accepted native forms.
+        for target, domain_text in (('gui/502/' + label, 'user gui: 502'),
+                                    ('user/502/' + label, 'uid: 502'),
+                                    ('system/' + label, 'system')):
             result = subprocess.run(['/bin/launchctl', 'print', target],
                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
             if result.returncode == 0:
                 return False
-            # Only launchctl's exact "no such service in this domain" answer proves absence.
             error = result.stderr.decode(errors='replace')
-            if 'Could not find service' not in error or target not in error:
+            if not _absent_diagnostic(error, label, domain_text):
                 return False
         return True
 
@@ -395,12 +495,17 @@ class Installer:
             if home.exists() or home.is_symlink():
                 self.secure(home, p['uid'], 0o700)
         require(set(authority) <= {'version', 'kind', 'planSha256', 'expiresAt', 'appPermissionsVerified',
-                                   'newNameAbsent', 'migratedWorkflows', 'online', 'removedOldRunnerId'},
+                                   'newNameAbsent', 'migratedWorkflows', 'online', 'removedOldRunnerId',
+                                   'registrationAbsence'},
                 'unknown authority fields; secret-bearing input must never be persisted')
         require(authority.get('version', 1) == 1 and authority.get('kind', 'gui-collector-authority-v1') ==
                 'gui-collector-authority-v1', 'unknown authority receipt kind/version')
         online = authority.get('online') or {}
         require(not online or set(online) == {'runnerId', 'runnerName', 'status', 'labels'}, 'unknown online authority fields')
+        absence = authority.get('registrationAbsence')
+        require(absence is None or set(absence) == {'attemptNonce', 'runnerName', 'checkedAt', 'status',
+                                                   'appPermissionsVerified'},
+                'unknown registration absence fields')
         require(authority.get('planSha256') == binding, 'authority does not bind this exact plan')
         require(type(authority.get('expiresAt')) in (int, float) and time.time() < authority['expiresAt'] <= time.time() + 3600,
                 'authority receipt expired or not short lived')
@@ -457,6 +562,109 @@ class Installer:
                 and info['agentId'] > 0 and str(info.get('gitHubUrl', '')).rstrip('/') ==
                 'https://github.com/' + self.p['configuration']['collectorRepository'], 'new registration metadata mismatch')
         return info['agentId']
+
+    def registration_absence(self, authority):
+        """Accept a retry only when the previous attempt provably never started and the
+        owner-side gateway freshly proved the exact new name absent for that attempt."""
+        p = self.p
+        attempt = self.receipt.get('registrationAttempt')
+        require(isinstance(attempt, dict), 'no persisted registration attempt to reconcile')
+        state = attempt.get('state')
+        require(state in ('reserved', 'unreleased'),
+                'registration was released or its state is unknown; nothing is retried')
+        if state == 'reserved':
+            require(attempt.get('pid') is None and attempt.get('startIdentity') is None,
+                    'a registration process exists although the intent is reserved')
+        else:
+            pid, identity = attempt.get('pid'), attempt.get('startIdentity')
+            require(type(pid) is int and isinstance(identity, str) and identity,
+                    'unreleased registration has no verifiable child identity')
+            require(self.host.process_identity(pid, self.p['uid']) != identity,
+                    'the gated registration child is still running')
+        def blocked(reason):
+            # A retryable unstarted intent is reported to the engine as a structured challenge
+            # (exit 0), never a generic root failure it might blindly retry.
+            raise ReconciliationRequired(reason)
+        absence = authority.get('registrationAbsence')
+        if not (absence is not None and absence.get('status') == 'absent'
+                and absence.get('appPermissionsVerified') is True):
+            blocked('a fresh owner-side proof that the exact new runner name is absent is required')
+        if absence.get('runnerName') != p['runnerName']:
+            blocked('absence proof is for another runner name')
+        if absence.get('attemptNonce') != attempt.get('nonce'):
+            blocked('absence proof is not bound to this exact registration attempt')
+        checked = absence.get('checkedAt')
+        if not (type(checked) in (int, float) and attempt.get('startedAt') <= checked <= time.time()
+                and time.time() - checked <= ABSENCE_FRESH_SECONDS):
+            blocked('absence proof is stale or predates this registration attempt')
+        runner = self.path(p['configuration']['runnerRoot'])
+        for name in AUTH_FILES[:3]:
+            if (runner / name).exists() or (runner / name).is_symlink():
+                blocked('local registration credentials exist although the attempt was never launched')
+        return True
+
+    def begin_registration(self, authority, token_reader, runner, home, binding):
+        p = self.p
+        if 'registration-attempted' in self.receipt['stages']:
+            self.registration_absence(authority)
+        attempts = self.receipt.get('registrationAttempts', 0)
+        require(attempts < MAX_REGISTRATION_ATTEMPTS, 'registration attempt budget is exhausted')
+        now = time.time()
+        first = self.receipt.setdefault('registrationFirstStartedAt', now)
+        require(now <= first + REGISTRATION_RETRY_WINDOW, 'registration retry window has expired')
+        self.receipt['registrationAttempts'] = attempts + 1
+        self.receipt['registrationAttempt'] = {'nonce': secrets.token_hex(16), 'number': attempts + 1,
+                                               'startedAt': now, 'createdAt': now, 'state': 'reserved',
+                                               'pid': None, 'startIdentity': None}
+        self.save()
+        self.stage('registration-attempted')
+        token = token_reader()
+        require(isinstance(token, str) and re.fullmatch(r'[A-Za-z0-9_\-.]{10,2048}', token),
+                'invalid short-lived registration token')
+        gate = self.host.start_gated([str(runner / 'config.sh'), '--unattended', '--url',
+                                      'https://github.com/' + p['configuration']['collectorRepository'],
+                                      '--name', p['runnerName'], '--no-default-labels', '--labels',
+                                      bootstrap_label(binding), '--work', '_work', '--disableupdate'],
+                                     uid=p['uid'], gid=p['uid'], home=home, cwd=runner, token=token)
+        token = None
+        if not (isinstance(gate.start_identity, str) and gate.start_identity):
+            gate.abort()
+            require(False, 'child start identity is unverifiable; registration not released')
+        self.receipt['registrationAttempt'].update(state='unreleased', pid=gate.pid,
+                                                   startIdentity=gate.start_identity)
+        self.save()
+        # Durable BEFORE the gate opens: after this point no proof can authorize a retry.
+        self.receipt['registrationAttempt']['state'] = 'released'
+        self.save()
+        gate.release()
+        require(gate.wait() == 0, 'registration command failed')
+
+    def registration_status(self, binding):
+        """Read-only root challenge for the owner-side gateway."""
+        attempt = self.receipt.get('registrationAttempt')
+        require('registration-attempted' in self.receipt.get('stages', [])
+                and isinstance(attempt, dict), 'no registration reconciliation is pending')
+        runner = self.path(self.p['configuration']['runnerRoot'])
+        require(not (runner / '.runner').exists(), 'a local registration already exists')
+        state = attempt.get('state')
+        if state == 'reserved':
+            unstarted = attempt.get('pid') is None and attempt.get('startIdentity') is None
+        elif state == 'unreleased':
+            unstarted = (type(attempt.get('pid')) is int and isinstance(attempt.get('startIdentity'), str)
+                         and self.host.process_identity(attempt['pid'], self.p['uid']) != attempt['startIdentity'])
+        else:
+            unstarted = False
+        config = json.dumps(self.p['configuration'], sort_keys=True, indent=2).encode() + b'\n'
+        return {'version': 1, 'status': 'registration-reconciliation-required', 'planSha256': binding,
+                'runnerName': self.p['runnerName'], 'uid': self.p['uid'],
+                'helperSha256': self.p['helperSha256'], 'sourceJobSha256': self.p['sourceJobSha256'],
+                'configurationSha256': digest(config), 'attempts': self.receipt.get('registrationAttempts', 0),
+                'firstStartedAt': self.receipt.get('registrationFirstStartedAt'),
+                'registrationIntent': {'attemptNonce': attempt.get('nonce'),
+                                       'createdAt': attempt.get('createdAt'),
+                                       'state': state, 'pid': attempt.get('pid'),
+                                       'startIdentity': attempt.get('startIdentity'),
+                                       'localUnstartedVerified': unstarted}}
 
     def retire(self, authority):
         old = self.p['old']
@@ -624,16 +832,13 @@ class Installer:
         self.secure(runner, p['uid'], 0o700)
         self.stage('runner-staged')
         if not (runner / '.runner').exists():
-            require('registration-attempted' not in self.receipt['stages'],
-                    'uncertain registration: owner must reconcile exact new name/ID; never register twice blindly')
-            token = token_reader()
-            require(isinstance(token, str) and re.fullmatch(r'[A-Za-z0-9_\-.]{10,2048}', token), 'invalid short-lived registration token')
-            self.stage('registration-attempted')
-            self.host.run([str(runner / 'config.sh'), '--unattended', '--url',
-                           'https://github.com/' + p['configuration']['collectorRepository'], '--name', p['runnerName'],
-                           '--no-default-labels', '--labels', bootstrap_label(binding), '--work', '_work', '--disableupdate'],
-                          uid=p['uid'], gid=p['uid'], home=home, cwd=runner, token=token)
-            token = None
+            if 'registration-attempted' not in self.receipt['stages']:
+                require(authority.get('registrationAbsence') is None,
+                        'unexpected absence proof for a registration that was never attempted')
+            self.begin_registration(authority, token_reader, runner, home, binding)
+        else:
+            require(authority.get('registrationAbsence') is None,
+                    'remote absence was proven but a local registration exists: reconcile before retrying')
         runner_id = self.registration(runner)
         self.receipt['runnerId'] = runner_id
         self.stage('registered')
@@ -726,7 +931,7 @@ def inventory(old_root, host=None, root=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
-    for mode in ('preflight', 'dry-run', 'apply', 'inventory'):
+    for mode in ('preflight', 'dry-run', 'apply', 'inventory', 'registration-status'):
         modes.add_argument('--' + mode, action='store_true')
     parser.add_argument('--plan')
     parser.add_argument('--authority')
@@ -737,6 +942,23 @@ def main():
             require(sys.platform == 'darwin' and os.geteuid() == 0,
                     'inventory requires explicitly authorized root on macOS; reads only and never invokes sudo')
             print(json.dumps(inventory(args.old_root), sort_keys=True))
+            return 0
+        if args.registration_status:
+            require(sys.platform == 'darwin' and os.geteuid() == 0,
+                    'registration status requires explicitly authorized root on macOS; reads only')
+            require(args.plan is not None and args.authority is not None, 'plan and authority are required')
+            owner_uid = int(os.environ.get('SUDO_UID', os.getuid()))
+            host = Host()
+            plan_bytes = handoff_bytes(args.plan, owner_uid, host, 65536)
+            authority_bytes = handoff_bytes(args.authority, owner_uid, host, 65536)
+            plan, authority = json.loads(plan_bytes), json.loads(authority_bytes)
+            installer = Installer(plan, host, raw_plan_sha256=digest(plan_bytes))
+            binding = installer.validate(authority)
+            state = installer.path(STATE / 'receipt.json')
+            require(state.is_file(), 'no protected installation receipt')
+            installer.secure(state, 0, 0o600)
+            installer.receipt = json.loads(state.read_text())
+            print(json.dumps(installer.registration_status(binding), sort_keys=True))
             return 0
         require(args.plan is not None and args.authority is not None, 'plan and authority are required for setup modes')
         if args.apply:
@@ -778,6 +1000,18 @@ def main():
                       'note': 'Owner authority attestation is required; this tool does not migrate workflows or mint tokens.'}
         print(json.dumps(result, sort_keys=True))
         return 0
+    except ReconciliationRequired as error:
+        # The engine gets a real read-only challenge (exit 0), so it never blindly retries root.
+        if 'installer' in locals() and 'args' in locals() and args.apply:
+            try:
+                challenge = installer.registration_status(installer.raw_plan_sha256)
+            except Refused:
+                pass
+            else:
+                print(json.dumps(challenge, sort_keys=True))
+                return 0
+        print(json.dumps({'version': 1, 'status': 'refused', 'reason': str(error)}))
+        return 2
     except Refused as error:
         # Only our fixed refusal strings are public; never raw command output or input errors.
         print(json.dumps({'version': 1, 'status': 'refused', 'reason': str(error)}))

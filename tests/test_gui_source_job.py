@@ -377,15 +377,15 @@ class Contracts(unittest.TestCase):
             pack = packdir / 'metadata.pack'
             from unittest.mock import patch as _patch
             captured = {}
-            def fake_fetch(url_text, revision, destination):
-                captured['url'] = url_text; captured['revision'] = revision
+            def fake_fetch(url_text, revision, destination, depth=1, wanted=None):
+                captured['url'] = url_text; captured['revision'] = revision; captured['depths'] = captured.get('depths', []) + [depth]
                 packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
                                             input=sha['commit'] + '\n', env=env, capture_output=True, text=True)
                 self.assertEqual(0, packresult.returncode, packresult.stderr)
                 name = packresult.stdout.strip().splitlines()[-1]
                 import shutil
-                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination)
-                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination.with_suffix('.idx'))
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), Path(str(destination)).resolve())
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), Path(str(destination)).resolve().with_suffix('.idx'))
                 return None
             def fake_refs(url_text, accept):
                 self.assertEqual('application/x-git-upload-pack-advertisement', accept)
@@ -405,7 +405,7 @@ class Contracts(unittest.TestCase):
             (destination / 'file.txt').write_text('pinned source')
             (destination / 'sub').mkdir()
             staging = root / 'staging'; staging.mkdir()
-            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+            with _patch.object(r, 'fetch_package_pack', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
                 r.source_git_metadata('acme/source', sha['commit'], destination, staging)
             admin = destination / '.git'
             self.assertTrue((admin / 'HEAD').read_text().strip() == sha['commit'])
@@ -474,14 +474,17 @@ class Contracts(unittest.TestCase):
             (destination / 'vendor' / 'Compositor' / 'inside.swift').write_text('pinned dependency')
             (destination / '.gitmodules').write_text('[submodule "vendor/Compositor"]\npath = vendor/Compositor\nurl = ' + str(vendee / '.git') + '\n')
             from unittest.mock import patch as _patch
-            def fake_fetch(url_text, revision, destination_pack):
+            def fake_fetch(url_text, revision, destination_pack, depth=1, wanted=None):
+                # Emulate fetch_package_pack's bounded shallow pack at the
+                # caller's depth; index-pack runs with cwd=staging, so absolute
+                # paths resolve.
                 packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
                                             input=sha['commit'] + '\n', env=env, capture_output=True, text=True)
                 self.assertEqual(0, packresult.returncode, packresult.stderr)
                 name = packresult.stdout.strip().splitlines()[-1]
                 import shutil
-                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination_pack)
-                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination_pack.with_suffix('.idx'))
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), Path(str(destination_pack)).resolve())
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), Path(str(destination_pack)).resolve().with_suffix('.idx'))
                 return None
             def fake_refs(url_text, accept):
                 result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
@@ -493,7 +496,7 @@ class Contracts(unittest.TestCase):
                 body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
                 body += b'0000'
                 return body, {}
-            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+            with _patch.object(r, 'fetch_package_pack', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
                 r.source_git_metadata('acme/source', sha['commit'], destination, staging)
             admin = destination / '.git'
             # git-submodule runs from a work tree whose inline .git directory is
@@ -516,61 +519,112 @@ class Contracts(unittest.TestCase):
 
 
     def test_source_git_metadata_reports_a_release_tag_on_a_reachable_ancestor(self):
-        """UNTAGGED pinned HEAD with a reachable tagged ancestor: describe --tags
-        returns the real vX-N-g<short> form, not just a tag sitting on HEAD."""
-        sha = {}
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            origin = root / 'origin'; origin.mkdir()
-            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
-            subprocess.run(['/usr/bin/git', 'init', str(origin)], env=env, capture_output=True, check=True)
-            (origin / 'file.txt').write_text('release')
-            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
-            subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'release'], env=env, capture_output=True, check=True)
-            subprocess.run(['/usr/bin/git', '-C', str(origin), 'tag', 'v3.1.0'], env=env, capture_output=True, check=True)
-            (origin / 'more.txt').write_text('after release')
-            subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
-            for _ in range(3):
-                (origin / ('after-' + str(_) + '.txt')).write_text('after ' * (_ + 1))
-                subprocess.run(['/usr/bin/git', '-C', str(origin), 'add', '.'], env=env, capture_output=True, check=True)
-                subprocess.run(['/usr/bin/git', '-C', str(origin), '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'after'], env=env, capture_output=True, check=True)
-            sha['commit'] = subprocess.run(['/usr/bin/git', '-C', str(origin), 'rev-parse', 'HEAD'], env=env, capture_output=True, text=True, check=True).stdout.strip()
-            expected = subprocess.run(['/usr/bin/git', '-C', str(origin), 'describe', '--tags'], env=env, capture_output=True, text=True, check=True).stdout.strip()
-            self.assertTrue(re.fullmatch(r'v3\.1\.0-[0-9]+-g[0-9a-f]{7,40}', expected), expected)
-            packdir = root / 'packs'; packdir.mkdir()
-            staging = root / 'staging'; staging.mkdir()
-            destination = root / 'checkout'; destination.mkdir()
-            (destination / 'file.txt').write_text('release')
-            (destination / 'more.txt').write_text('after release')
-            from unittest.mock import patch as _patch
-            def fake_fetch(url_text, revision, destination_pack):
-                packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
-                                            input=revision + '\n', env=env, capture_output=True, text=True)
-                self.assertEqual(0, packresult.returncode, packresult.stderr)
-                name = packresult.stdout.strip().splitlines()[-1]
-                import shutil
-                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination_pack)
-                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination_pack.with_suffix('.idx'))
-                return None
-            def fake_refs(url_text, accept):
-                result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
-                                         env=env, capture_output=True, text=True, check=True)
-                body = b''
-                for line in result.stdout.splitlines():
-                    body += ('%04x' % (len(line) + 5)).encode() + line.encode() + b'\n'
-                head = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'rev-parse', 'HEAD'],
-                                      env=env, capture_output=True, text=True, check=True).stdout.strip()
-                body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
-                body += b'0000'
-                return body, {}
-            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
-                r.source_git_metadata('acme/source', sha['commit'], destination, staging)
-            admin = destination / '.git'
-            described = subprocess.run(['/usr/bin/git', '-C', str(destination), 'describe', '--tags'],
-                                        env=dict(env, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null'), capture_output=True, text=True)
-            self.assertEqual(0, described.returncode, described.stderr)
-            self.assertEqual(expected, described.stdout.strip())
-            self.assertTrue(described.stdout.strip().startswith('v3.1.0-'), described.stdout)
+        """Real depth-1 object sets, not pack-objects --revs full-history fakes.
+        Prove parent ABSENT initially, truthful shallow boundaries before/after
+        explicit deepening, annotated objects installed, and both tag forms read
+        by native Git from an untagged HEAD. No network/root/second UID runs.
+        """
+        for history_limit in (4096, 2):
+            with self.subTest(history_limit=history_limit), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(); origin = root / 'origin'; origin.mkdir()
+                env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+                def git(*args, cwd=origin, data=None, check=True):
+                    result = subprocess.run(['/usr/bin/git', *args], cwd=cwd, env=env, input=data,
+                                            capture_output=True, text=True)
+                    if check: self.assertEqual(0, result.returncode, result.stderr)
+                    return result
+                git('init')
+                for value in ('root', 'release', 'head'):
+                    (origin / 'file.txt').write_text(value); git('add', '.')
+                    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', value)
+                    if value == 'release':
+                        git('-c', 'user.email=t@t', '-c', 'user.name=t', 'tag', '-a', '-m', 'release', 'v3.1.0')
+                        git('tag', 'light3.2.0')
+                head = git('rev-parse', 'HEAD').stdout.strip()
+                parent = git('rev-parse', 'HEAD^').stdout.strip()
+                grandparent = git('rev-parse', 'HEAD^^').stdout.strip()
+                tag_object = git('rev-parse', 'v3.1.0').stdout.strip()
+                expected = git('describe', '--tags').stdout.strip()
+                expected_light = git('describe', '--tags', '--match', 'light*').stdout.strip()
+                # An unrelated commit's tag must be skipped BEFORE any fetch.
+                tree = git('rev-parse', 'HEAD^{tree}').stdout.strip()
+                foreign = git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit-tree', tree, data='unrelated\n').stdout.strip()
+                git('tag', 'unrelated-tag', foreign)
+                staging = root / 'staging'; staging.mkdir()
+                destination = root / 'checkout'; destination.mkdir()
+                (destination / 'file.txt').write_text('head')
+                admin = destination / '.git'; fetched = []
+                initial_parent_absent = []
+                def fake_fetch(url, revision, pack, depth=1, wanted=None):
+                    fetched.append((revision, depth))
+                    if depth == 4096:
+                        # This runs AFTER initial pack installation. It cannot
+                        # pass if the first pack smuggled in connecting parents.
+                        initial_parent_absent.append(git('--git-dir=' + str(admin), 'cat-file', '-e', parent,
+                                                         check=False).returncode != 0)
+                        self.assertTrue(initial_parent_absent[-1], 'depth-1 pack must NOT contain the parent')
+                        self.assertEqual(head, (admin / 'shallow').read_text().strip())
+                    # Explicit object enumeration: depth chooses the commit set
+                    # BEFORE packing. pack-objects receives object IDs WITHOUT
+                    # --revs, so it cannot silently traverse any parent history.
+                    commits = git('rev-list', '--max-count=' + str(min(depth, history_limit)), revision + '^{commit}').stdout.splitlines()
+                    ids = set(commits)
+                    if git('cat-file', '-t', revision).stdout.strip() == 'tag': ids.add(revision)
+                    for commit in commits:
+                        tree = git('rev-parse', commit + '^{tree}').stdout.strip(); ids.add(tree)
+                        for line in git('ls-tree', '-r', '-t', tree).stdout.splitlines():
+                            cells = line.split()
+                            if cells[1] in ('tree', 'blob'): ids.add(cells[2])
+                    prefix = staging / ('fixture-' + str(len(fetched)))
+                    packed = git('pack-objects', str(prefix), data='\n'.join(sorted(ids)) + '\n').stdout.strip()
+                    import shutil
+                    shutil.copyfile(str(prefix) + '-' + packed + '.pack', pack)
+                    # Production index-pack, not the fixture, creates the index.
+                def fake_refs(url, accept):
+                    body = b''
+                    for line in git('show-ref', '--dereference').stdout.splitlines():
+                        body += ('%04x' % (len(line) + 5)).encode() + line.encode() + b'\n'
+                    return body + b'0000', {}
+                with patch.object(r, 'fetch_package_pack', side_effect=fake_fetch), patch.object(r, 'public_resource', side_effect=fake_refs):
+                    try:
+                        r.source_git_metadata('acme/source', head, destination, staging)
+                    except Exception as error:
+                        self.fail('valid pinned shallow Git metadata must be usable: ' + repr(error))
+                self.assertEqual([True], initial_parent_absent)
+                self.assertEqual([(head, 1), (head, 4096), (tag_object, 1)], fetched)
+                self.assertEqual('tag', git('--git-dir=' + str(admin), 'cat-file', '-t', tag_object).stdout.strip())
+                self.assertEqual(expected, git('-C', str(destination), 'describe', '--tags').stdout.strip())
+                self.assertEqual(expected_light, git('-C', str(destination), 'describe', '--tags', '--match', 'light*').stdout.strip())
+                self.assertEqual(head, git('-C', str(destination), 'rev-parse', 'HEAD').stdout.strip())
+                self.assertEqual('', git('-C', str(destination), 'submodule', 'status').stdout.strip())
+                if history_limit == 2:
+                    self.assertEqual(parent, (admin / 'shallow').read_text().strip())
+                    self.assertNotEqual(0, git('--git-dir=' + str(admin), 'cat-file', '-e', grandparent, check=False).returncode)
+                    self.assertEqual('2', git('-C', str(destination), 'rev-list', '--count', 'HEAD').stdout.strip())
+                else:
+                    self.assertFalse((admin / 'shallow').exists(), 'complete connecting history must remove the old HEAD boundary')
+                    self.assertEqual('3', git('-C', str(destination), 'rev-list', '--count', 'HEAD').stdout.strip())
+                self.assertFalse((admin / 'hooks').exists()); self.assertFalse((admin / 'objects/info/alternates').exists())
+                self.assertNotIn('*', (admin / 'config').read_text())
+
+
+    def test_source_git_metadata_refuses_unreadable_or_over_budget_commit_graphs(self):
+        # Unit-level command responses exercise only the bound; the preceding
+        # native-Git contract proves real object membership and shallow walking.
+        for bad in ('too-many', 'malformed', 'failed'):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); target = root / 'source'; target.mkdir()
+                staging = root / 'staging'; staging.mkdir()
+                def fetch(url, revision, pack, **kwargs):
+                    pack.write_bytes(b'fixture'); pack.with_suffix('.idx').write_bytes(b'fixture-index')
+                def command(argv, *args, **kwargs):
+                    if 'rev-list' in argv:
+                        return ((1, '') if bad == 'failed' else (0, 'not-a-commit') if bad == 'malformed'
+                                else (0, ('1' * 40 + '\n') * 4097))
+                    return 0, '1' * 40
+                with patch.object(r, 'fetch_package_pack', side_effect=fetch), patch.object(r, 'command', side_effect=command), patch.object(r, 'public_resource', return_value=(b'0000', {})):
+                    with self.assertRaisesRegex(ValueError, 'history is unreadable or exceeds 4096'):
+                        r.source_git_metadata('acme/source', '1' * 40, target, staging)
 
 
     def test_sanitized_metadata_is_usable_by_a_different_owner_only_through_exact_safe_directory(self):
@@ -599,14 +653,18 @@ class Contracts(unittest.TestCase):
             destination = root / 'checkout'; destination.mkdir()
             (destination / 'file.txt').write_text('pinned')
             from unittest.mock import patch as _patch
-            def fake_fetch(url_text, revision, destination_pack):
+            def fake_fetch(url_text, revision, destination_pack, depth=1, wanted=None):
+                # Emulate fetch_package_pack at the caller's depth: pack-objects
+                # --revs from the named revision carries exactly the objects a
+                # bounded shallow pack at that depth holds (never a full clone).
                 packresult = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'pack-objects', '--revs', str(packdir) + '/p'],
                                             input=revision + '\n', env=env, capture_output=True, text=True)
                 self.assertEqual(0, packresult.returncode, packresult.stderr)
                 name = packresult.stdout.strip().splitlines()[-1]
                 import shutil
-                shutil.copyfile(packdir / ('p-' + name + '.pack'), destination_pack)
-                shutil.copyfile(packdir / ('p-' + name + '.idx'), destination_pack.with_suffix('.idx'))
+                # index-pack runs with cwd=staging: absolute paths resolve.
+                shutil.copyfile(packdir / ('p-' + name + '.pack'), Path(str(destination_pack)).resolve())
+                shutil.copyfile(packdir / ('p-' + name + '.idx'), Path(str(destination_pack)).resolve().with_suffix('.idx'))
                 return None
             def fake_refs(url_text, accept):
                 result = subprocess.run(['/usr/bin/git', '--git-dir=' + str(origin / '.git'), 'for-each-ref', '--format=%(objectname) %(refname)'],
@@ -619,7 +677,7 @@ class Contracts(unittest.TestCase):
                 body += ('%04x' % (len(head + ' HEAD') + 5)).encode() + (head + ' HEAD').encode() + b'\n'
                 body += b'0000'
                 return body, {}
-            with _patch.object(r, 'fetch_package', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
+            with _patch.object(r, 'fetch_package_pack', side_effect=fake_fetch), _patch.object(r, 'public_resource', side_effect=fake_refs):
                 r.source_git_metadata('acme/source', sha['commit'], destination, staging)
             admin = destination / '.git'
             different = dict(env, GIT_TEST_ASSUME_DIFFERENT_OWNER='1')
@@ -674,6 +732,24 @@ MUTATIONS = [
     ('source-artifact-byte-bound', 'factory-gui-source-job.py', [('if budget[0] > 100 * 1024 * 1024:', 'if False:')]),
     ('source-failure-outcome', 'factory-gui-source-job.py', [('succeeded = succeeded and code == 0', 'succeeded = True')]),
     ('source-pipefail-argv', 'factory-gui-source-job.py', [("['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(script)]", "['/bin/bash', '--noprofile', '--norc', str(script)]")]),
+    ('source-git-repository-skeleton', 'factory-gui-source-job.py', [(
+        "    code, _ = command(['/usr/bin/git', 'init', '--bare', str(admin)], str(staging), env=env)\n    if code:\n        raise ValueError('source metadata repository could not be initialized')",
+        '    pass')]),
+    ('source-git-pack-install', 'factory-gui-source-job.py', [(
+        "        pack.rename(pack_store / ('pack-' + pack_hash + '.pack'))",
+        '        pass')]),
+    ('source-git-connecting-depth', 'factory-gui-source-job.py', [(
+        "    fetch(sha, 'history', 4096)",
+        '    pass')]),
+    ('source-git-ancestor-direction', 'factory-gui-source-job.py', [(
+        '        if ancestor != 0:',
+        '        if ancestor == 0:')]),
+    ('source-git-tag-install', 'factory-gui-source-job.py', [(
+        '                install(pack)\n            except Exception:',
+        '                pass\n            except Exception:')]),
+    ('source-git-history-budget', 'factory-gui-source-job.py', [('len(lines) > 4096', 'False')]),
+    ('source-git-truthful-shallow-boundary', 'factory-gui-source-job.py', [("            boundary.write_text(''.join(root + '\\n' for root in roots))", '            pass')]),
+    ('source-git-clear-old-shallow-boundary', 'factory-gui-source-job.py', [('        boundary.unlink(missing_ok=True)', '        pass')]),
     ('source-git-alternates-refusal', 'factory-gui-source-job.py', [("""for emptyable in ('hooks', 'logs'):
         directory = admin / emptyable
         if directory.exists():

@@ -1801,6 +1801,16 @@ to the existing hosted executor; nonhosted macOS stays local. Conditional/unknow
 and disagreements cannot fall back to hosted/local execution. A scheme mixing GUI and non-GUI
 new tests is executed wholly on GUI CI. Other stacks and GPU placement are unchanged.
 
+Source-job Git queries use sanitized metadata built before handoff, never the owner's checkout,
+credentials, hooks, remotes or configuration. A verified depth-1 pack is followed by an explicit
+bounded connecting-history pack (at most 4,096 commits); installed object membership determines
+Git's real shallow boundaries, and an older boundary is replaced after deepening. Only reachable
+advertised tags are retained, with annotated tag objects verified and installed separately.
+Native local fixtures prove the initial parent is absent, both complete and still-shallow history,
+and annotated/lightweight `describe --tags` results. The protected share changes the checkout's
+ownership to the source UID before Git runs there; no wildcard `safe.directory` is installed.
+Tags beyond the bounded history are not claimed available.
+
 ### One-time deployment (not performed by unit tests or this change)
 
 The existing `lensworks-guest` registration and its generic labels are **not** proof of its OS
@@ -1941,6 +1951,47 @@ restoring credential bytes, so a rollback receipt explicitly requires owner reco
 It does not claim an automatic remote rollback. An uncertain registration attempt is never
 blindly repeated: reconcile the unique new name/ID before retrying. Installed bytes are never
 silently overwritten.
+
+Registration recovery is bounded and plan-bound, with a gated child process. The receipt
+durably records a fresh random `attemptNonce`, attempt number and `createdAt` with state
+`reserved` **before a process may exist**. The runner's `config.sh` is then started behind a
+pipe gate: it cannot exec until the installer writes a release byte. After spawning, root
+records the child PID and its `ps` start identity and persists state `unreleased`; only then
+does it persist `released` and open the gate. A crash while reserved or unreleased leaves the
+child unable to exec (the pipe reaches EOF when its parent dies). At most two attempts are made
+within one hour.
+
+A retry requires a provably unreleased intent — state `reserved` with no PID, or state
+`unreleased` whose recorded PID/start identity is confirmed dead and not reused — plus fresh
+owner-gateway authority `registrationAbsence`
+`{attemptNonce, runnerName, checkedAt, status: "absent", appPermissionsVerified: true}`. The
+nonce must equal that persisted attempt, the name must be the exact new runner, and the check
+must be no older than five minutes and no earlier than the attempt. The installer also requires
+no local `.runner`/credential files. State `released`, an unknown state, a live unreleased child,
+stale or mismatched proof, present/active status, exhausted budget, an expired window, local
+credentials contradicting absence, and a local registration contradicting remote absence are all
+refused. Once a registration may have POSTed, only owner reconciliation can proceed.
+
+Child liveness is never guessed. Root reads the exact child PID and start identity as
+`ps uid= lstart=`; `process_identity` returns the identity only when the process is live with the
+expected UID and a nonempty start time, returns `None` only for `ps`'s confirmed no-such-process
+answer (exit 1 with empty output), and refuses any other `ps` outcome — permission, an unknown
+exit code, malformed or empty output, or a mismatched UID — as ambiguous. A reused PID is proven
+dead because its live identity differs from the recorded start. The child cannot exec until the
+gate opens and the durable `released` marker; an unverifiable start identity closes the gate and
+waits a bounded time without signalling, and nothing is ever released or registered for it.
+
+When a retryable unstarted intent lacks valid fresh proof, **`--apply` itself exits 0** with
+the structured `registration-reconciliation-required` challenge (the same builder the optional
+read-only `--registration-status --plan … --authority …` mode uses). Generic failures still
+exit 2, so the engine never blindly retries a root RPC after an ordinary error or password
+denial. The challenge mutates nothing and carries `planSha256`, exact `runnerName`/`uid`, the
+protected helper/source-client/configuration hashes, attempt count and first start, and
+`registrationIntent {attemptNonce, createdAt, state, pid, startIdentity,
+localUnstartedVerified}`. `runnerId` is absent because none exists. The gateway may emit absence
+proof only from that real challenge, after verifying the bound identity and a fresh authenticated
+listing made after `createdAt`; the installer accepts it once. A released/unknown state yields a
+generic refusal instead of a challenge, so the gateway refuses without a root retry.
 
 Crash recovery is explicit, not inferred from "no other run exists". The account step writes a
 protected journal intent before creating the private group and before each of the six DS

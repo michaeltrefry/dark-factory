@@ -31,14 +31,18 @@ public static class GuiCollectorHost
         await probe("/usr/bin/xcodebuild", ["-license", "check"], ct);
         var runtimes = JsonNode.Parse(await probe("/usr/bin/xcrun", ["simctl", "list", "runtimes", "-j"], ct))?["runtimes"]?.AsArray();
         var runtime = configuration["runtime"]?.GetValue<string>();
-        if (runtime is null || runtimes is null || !runtimes.Any(r => r?["isAvailable"]?.GetValue<bool>() == true
-            && r?["identifier"]?.GetValue<string>() == "com.apple.CoreSimulator.SimRuntime." + runtime))
+        var runtimeId = runtime is null ? null : FullIdentifier(runtime, "com.apple.CoreSimulator.SimRuntime.");
+        if (runtimeId is null || runtimes is null || !runtimes.Any(r => r?["isAvailable"]?.GetValue<bool>() == true
+            && r?["identifier"]?.GetValue<string>() == runtimeId))
             throw new InvalidOperationException("Pinned available iOS simulator runtime is not installed; install it and prepare again.");
         var devices = JsonNode.Parse(await probe("/usr/bin/xcrun", ["simctl", "list", "devicetypes", "-j"], ct))?["devicetypes"]?.AsArray();
         var device = configuration["deviceType"]?.GetValue<string>();
-        if (device is null || devices is null || !devices.Any(d => d?["identifier"]?.GetValue<string>() == "com.apple.CoreSimulator.SimDeviceType." + device))
+        var deviceId = device is null ? null : FullIdentifier(device, "com.apple.CoreSimulator.SimDeviceType.");
+        if (deviceId is null || devices is null || !devices.Any(d => d?["identifier"]?.GetValue<string>() == deviceId))
             throw new InvalidOperationException("Pinned iPhone simulator type is not installed; install it and prepare again.");
     }
+
+    static string FullIdentifier(string value, string prefix) => value.StartsWith(prefix, StringComparison.Ordinal) ? value : prefix + value;
 
     static async Task<string> ProbeAsync(string program, string[] arguments, CancellationToken ct)
     {

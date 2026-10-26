@@ -41,6 +41,34 @@ class FakeHost:
         self.fields = {}
         self.services = set()
         self.unremovable = set()
+        self.processes = {}
+        self.next_pid = 900
+        self.spawn_identity = None
+        self.ambiguous_pids = set()
+        self.gated = []
+
+    def process_identity(self, pid, uid=None):
+        if pid in self.ambiguous_pids:
+            raise setup.Refused('process state is unknown')
+        identity = self.processes.get(pid)
+        if identity is None:
+            return None
+        require = setup.require
+        require(identity.startswith(str(uid) + ' '), 'process identity is ambiguous')
+        return identity
+
+    def kill(self, pid):
+        self.processes.pop(pid, None)
+
+    def start_gated(self, argv, **kwargs):
+        self.calls.append(('gated_start', argv, kwargs))
+        if self.fail == 'gate-spawn':
+            raise setup.Refused('simulated spawn failure')
+        self.next_pid += 1
+        self.processes[self.next_pid] = self.spawn_identity if self.spawn_identity is not None else ('503 collector ' + str(self.next_pid))
+        gate = FakeGate(self, self.next_pid, argv, kwargs)
+        self.gated.append(gate)
+        return gate
 
     def account(self, name):
         return self.accounts.get(name)
@@ -130,6 +158,24 @@ class FakeHost:
         if label not in self.unremovable:
             self.services.discard(label)
         self._after('stop')
+
+
+class FakeGate:
+    def __init__(self, host, pid, argv, kwargs):
+        self.host, self.pid, self.argv, self.kwargs = host, pid, argv, kwargs
+        self.start_identity = host.processes[pid]
+        self.released = False
+
+    def release(self):
+        self.released = True
+        self.host.calls.append(('gate_release', self.pid))
+        self.host.run(self.argv, **self.kwargs)
+
+    def abort(self):
+        self.host.kill(self.pid)
+
+    def wait(self):
+        return 0
 
 
 class Contracts(unittest.TestCase):
@@ -500,6 +546,230 @@ class Contracts(unittest.TestCase):
         backup = self.root / 'var/db/dark-factory/gui-collector/rollback/.credentials'
         self.assertEqual(0o600, backup.stat().st_mode & 0o777)
 
+    def interrupted_registration(self):
+        original = self.installer.stage
+        def crash(name):
+            original(name)
+            if name == 'registration-attempted':
+                raise setup.Refused('simulated crash after durable intent')
+        self.installer.stage = crash
+        try:
+            with self.assertRaises(setup.Refused):
+                self.apply()
+        finally:
+            self.installer.stage = original
+        self.assertFalse((self.root / 'Users/_factorygui/actions-runner/.runner').exists())
+        return self.installer.receipt['registrationAttempt']
+
+    def proof(self, **changes):
+        attempt = self.installer.receipt['registrationAttempt']
+        proof = dict(attemptNonce=attempt['nonce'], runnerName=self.plan['runnerName'],
+                     checkedAt=time.time(), status='absent', appPermissionsVerified=True)
+        proof.update(changes)
+        return proof
+
+    def test_provably_unstarted_registration_resumes_with_fresh_absence_proof(self):
+        attempt = self.interrupted_registration()
+        self.assertEqual('reserved', attempt['state'])
+        self.authority['registrationAbsence'] = self.proof()
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', self.apply()['status'])
+        configs = [c for c in self.host.calls if isinstance(c[0], list) and c[0][0].endswith('config.sh')]
+        self.assertEqual(1, len(configs))
+        self.assertEqual(2, self.installer.receipt['registrationAttempts'])
+        self.assertEqual('released', self.installer.receipt['registrationAttempt']['state'])
+
+    def test_unstarted_registration_without_absence_proof_stays_refused(self):
+        self.interrupted_registration()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(isinstance(c[0], list) and c[0][0].endswith('config.sh') for c in self.host.calls))
+
+    def test_absence_proof_must_match_the_exact_attempt_and_name(self):
+        for change in ({'attemptNonce': 'f' * 32}, {'runnerName': 'factory-gui-other-9999'},
+                       {'status': 'present'}, {'appPermissionsVerified': False}):
+            with self.subTest(proof=change):
+                case = self.fresh()
+                case.interrupted_registration()
+                case.authority['registrationAbsence'] = case.proof(**change)
+                with self.assertRaises(setup.Refused):
+                    case.apply()
+                self.assertFalse(any(isinstance(c[0], list) and c[0][0].endswith('config.sh')
+                                     for c in case.host.calls))
+
+    def test_absence_proof_must_be_fresh(self):
+        for checked in (time.time() - 301, time.time() + 60):
+            with self.subTest(checkedAt=checked):
+                case = self.fresh()
+                attempt = case.interrupted_registration()
+                # Keep the attempt older than the stale proof so only the freshness rule can reject it.
+                attempt['startedAt'] = time.time() - 600
+                case.installer.save()
+                case.authority['registrationAbsence'] = case.proof(checkedAt=checked)
+                with self.assertRaises(setup.Refused):
+                    case.apply()
+
+    def test_released_or_unknown_registration_is_never_retried(self):
+        for change in ({'state': 'released'}, {'state': 'unknown'}):
+            with self.subTest(attempt=change):
+                case = self.fresh()
+                case.interrupted_registration()
+                case.host.processes[777] = 'collector 777'
+                case.installer.receipt['registrationAttempt'].update(
+                    change, pid=777, startIdentity='collector 777')
+                case.host.kill(777)
+                case.installer.save()
+                case.authority['registrationAbsence'] = case.proof()
+                with self.assertRaises(setup.Refused):
+                    case.apply()
+
+    def crash_after_state(self, state):
+        original = self.installer.save
+        def crash():
+            original()
+            attempt = self.installer.receipt.get('registrationAttempt') or {}
+            if attempt.get('state') == state:
+                raise setup.Refused('simulated crash after ' + state)
+        self.installer.save = crash
+        try:
+            with self.assertRaises(setup.Refused):
+                self.apply()
+        finally:
+            self.installer.save = original
+        self.assertEqual(state, self.installer.receipt['registrationAttempt']['state'])
+        return self.installer.receipt['registrationAttempt']
+
+    def test_unreleased_child_alive_blocks_retry_then_dead_allows_one(self):
+        attempt = self.crash_after_state('unreleased')
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(c[0] == 'gate_release' for c in self.host.calls))
+        self.host.kill(attempt['pid'])
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', self.apply()['status'])
+        self.assertEqual(2, self.installer.receipt['registrationAttempts'])
+        self.assertEqual(1, len([c for c in self.host.calls if c[0] == 'gate_release']))
+
+    def test_missing_proof_for_unstarted_intent_is_a_structured_challenge(self):
+        self.interrupted_registration()
+        with self.assertRaises(setup.ReconciliationRequired):
+            self.apply()
+        challenge = self.installer.registration_status(self.authority['planSha256'])
+        self.assertEqual('registration-reconciliation-required', challenge['status'])
+        self.assertIs(True, challenge['registrationIntent']['localUnstartedVerified'])
+        self.assertLess(challenge['attempts'], 2)
+
+    def test_released_state_is_a_generic_refusal_not_a_retry_challenge(self):
+        self.crash_after_state('released')
+        self.host.kill(self.installer.receipt['registrationAttempt']['pid'])
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused) as caught:
+            self.apply()
+        self.assertNotIsInstance(caught.exception, setup.ReconciliationRequired)
+
+    def test_released_gated_child_is_never_retried_even_if_dead(self):
+        attempt = self.crash_after_state('released')
+        self.assertFalse(any(c[0] == 'gate_release' for c in self.host.calls))
+        self.host.kill(attempt['pid'])
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(c[0] == 'gate_release' for c in self.host.calls))
+
+    def test_reserved_intent_with_a_pid_is_refused(self):
+        self.interrupted_registration()
+        self.installer.receipt['registrationAttempt'].update(pid=1234, startIdentity='collector 1234')
+        self.installer.save()
+        self.host.processes[1234] = 'collector 1234'
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+
+    def native_identity(self, answer):
+        original = setup.subprocess.run
+        setup.subprocess.run = lambda argv, **kw: answer
+        try:
+            return setup.Host().process_identity(1234, 503)
+        finally:
+            setup.subprocess.run = original
+
+    def test_process_identity_distinguishes_exact_dead_live_and_ambiguous(self):
+        def answer(code, out='', err=''):
+            return types.SimpleNamespace(returncode=code, stdout=out.encode(), stderr=err.encode())
+        self.assertIsNone(self.native_identity(answer(1)))
+        self.assertEqual('503 Mon Oct 26 10:00:00 2026',
+                         self.native_identity(answer(0, '503  Mon Oct 26 10:00:00 2026\n')))
+        for invalid in (answer(1, '', 'ps: permission denied'), answer(2), answer(0, '504 Mon Oct'),
+                        answer(0, '503'), answer(0, '')):
+            with self.subTest(answer=invalid):
+                with self.assertRaises(setup.Refused):
+                    self.native_identity(invalid)
+
+    def test_ambiguous_process_state_never_authorizes_dead_unreleased(self):
+        attempt = self.crash_after_state('unreleased')
+        self.host.ambiguous_pids.add(attempt['pid'])
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused) as caught:
+            self.apply()
+        self.assertNotIsInstance(caught.exception, setup.ReconciliationRequired)
+
+    def test_reused_pid_with_a_different_identity_allows_one_retry(self):
+        attempt = self.crash_after_state('unreleased')
+        self.host.processes[attempt['pid']] = '503 different-start'
+        self.authority['registrationAbsence'] = self.proof()
+        self.assertEqual('awaiting-owner-online-verification-old-untouched', self.apply()['status'])
+
+    def test_unverifiable_child_identity_never_releases_or_registers(self):
+        self.host.spawn_identity = ''
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(c[0] == 'gate_release' for c in self.host.calls))
+        self.assertFalse(any(isinstance(c[0], list) and c[0][0].endswith('config.sh') for c in self.host.calls))
+        self.assertEqual('reserved', self.installer.receipt['registrationAttempt']['state'])
+
+    def test_registration_status_challenge_is_readonly_and_omits_runner_id(self):
+        attempt = self.interrupted_registration()
+        before = self.root.joinpath('var/db/dark-factory/gui-collector/receipt.json').read_bytes()
+        status = self.installer.registration_status(self.authority['planSha256'])
+        after = self.root.joinpath('var/db/dark-factory/gui-collector/receipt.json').read_bytes()
+        self.assertEqual(before, after)
+        self.assertEqual('registration-reconciliation-required', status['status'])
+        self.assertEqual('reserved', status['registrationIntent']['state'])
+        self.assertIs(True, status['registrationIntent']['localUnstartedVerified'])
+        self.assertEqual(attempt['nonce'], status['registrationIntent']['attemptNonce'])
+        self.assertNotIn('runnerId', status)
+        self.assertEqual(self.plan['helperSha256'], status['helperSha256'])
+        self.assertEqual(self.plan['sourceJobSha256'], status['sourceJobSha256'])
+
+    def test_registration_retry_budget_and_window_are_bounded(self):
+        case = self.fresh()
+        case.interrupted_registration()
+        case.installer.receipt['registrationAttempts'] = 2
+        case.installer.save()
+        case.authority['registrationAbsence'] = case.proof()
+        with self.assertRaises(setup.Refused):
+            case.apply()
+        case = self.fresh()
+        case.interrupted_registration()
+        case.installer.receipt['registrationFirstStartedAt'] = time.time() - 3601
+        case.installer.save()
+        case.authority['registrationAbsence'] = case.proof()
+        with self.assertRaises(setup.Refused):
+            case.apply()
+
+    def test_local_credentials_contradicting_absence_are_refused(self):
+        self.interrupted_registration()
+        (self.root / 'Users/_factorygui/actions-runner/.credentials').write_text('uncertain local')
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+        self.assertFalse(any(isinstance(c[0], list) and c[0][0].endswith('config.sh') for c in self.host.calls))
+
+    def test_local_registration_with_remote_absence_mismatch_is_refused(self):
+        self.apply()
+        self.authority['registrationAbsence'] = self.proof()
+        with self.assertRaises(setup.Refused):
+            self.apply()
+
     def test_partial_registration_is_not_blindly_repeated(self):
         self.host.fail = 'config.sh'
         with self.assertRaises(setup.Refused):
@@ -574,13 +844,20 @@ class Contracts(unittest.TestCase):
         def result(code, error=''):
             return types.SimpleNamespace(returncode=code, stderr=error.encode(), stdout=b'')
         def notfound(target):
-            return result(1, "Could not find service \"actions.runner.old\" in domain for user gui: 502: %s" % target)
+            # The literal native shape: "Bad request." then the quoted service and its domain,
+            # with NO full target string appended. Exit status is 113 for a missing service.
+            domain = {'gui/502/actions.runner.old': 'user gui: 502',
+                      'user/502/actions.runner.old': 'uid: 502',
+                      'system/actions.runner.old': 'system'}[target]
+            return result(113, 'Bad request.\nCould not find service "actions.runner.old" in domain for %s' % domain)
         self.assertTrue(fake(lambda target: result(0) if target == 'gui/502' else notfound(target)))
         self.assertFalse(fake(lambda target: result(0)))
-        self.assertFalse(fake(lambda target: result(0) if target == 'gui/502' else result(1, 'Operation not permitted')))
-        self.assertFalse(fake(lambda target: result(1, 'Could not find service but other text') if target != 'gui/502' else result(0)))
+        self.assertFalse(fake(lambda target: result(0) if target == 'gui/502' else result(113, 'Operation not permitted')))
+        self.assertFalse(fake(lambda target: result(113, 'Bad request.\nCould not find service "other" in domain for user gui: 502') if target != 'gui/502' else result(0)))
+        self.assertFalse(fake(lambda target: result(113, 'Bad request.\nCould not find service "actions.runner.old" in domain for uid: 501') if target != 'gui/502' else result(0)))
+        self.assertFalse(fake(lambda target: result(113, 'Bad request.\nCould not find service "actions.runner.old" in domain for user user: 502') if target != 'gui/502' else result(0)))
         with self.assertRaises(setup.Refused):
-            fake(lambda target: result(1, 'Could not find domain for gui: 502'))
+            fake(lambda target: result(1, 'Bad request.\nCould not find domain for gui: 502'))
 
     def test_unknown_service_state_blocks_and_preserves_old_files(self):
         self.apply()
@@ -692,7 +969,6 @@ MUTATIONS = [
     ('registration-root', "uid=p['uid'], gid=p['uid'], home=home", "uid=None, gid=None, home=home", 'test_native_token_environment_and_no_default_labels'),
     ('online-order', "online.get('status') == 'online'", 'True', 'test_online_required_before_old_retirement'),
     ('reregister', "if not (runner / '.runner').exists():", 'if True:', 'test_idempotent_resume_never_registers_again'),
-    ('uncertain-register', "require('registration-attempted' not in self.receipt['stages'],", 'require(True,', 'test_partial_registration_is_not_blindly_repeated'),
     ('acl', 'and self.host.acl_free(path)', 'and True', 'test_acl_rejected_on_resume'),
     ('sudo-command', "str(HELPER) + '\\n'", "'/bin/sh' + '\\n'", 'test_sudoers_is_exact_fixed_command'),
     ('daemon-user', "'UserName': p['user']", "'UserName': 'lwrunner'", 'test_launchdaemon_is_non_gui_service_user'),
@@ -731,7 +1007,23 @@ MUTATIONS = [
     ('retirement-intent', 'if intent is not None:', 'if False:', 'test_retirement_intent_mismatch_is_refused'),
     ('resume-skip-bootout', "if not self.host.service_absent(old['serviceLabel']):", 'if True:', 'test_crash_after_bootout_effect_resumes_without_second_bootout'),
     ('duplicate-field-write', "self.host.write_account_field(name, key, value)", "self.host.write_account_field(name, key, value)\n            self.host.write_account_field(name, key, value)", 'test_crash_after_each_account_creation_effect_resumes_exact'),
-    ('service-domain-proof', "if 'Could not find service' not in error or target not in error:", 'if False:', 'test_real_service_absence_proof_checks_every_domain'),
+    ('service-domain-proof', 'if not _absent_diagnostic(error, label, domain_text):', 'if False:', 'test_real_service_absence_proof_checks_every_domain'),
+    ('registration-absence-status', "if not (absence is not None and absence.get('status') == 'absent'", 'if not (True', 'test_absence_proof_must_match_the_exact_attempt_and_name'),
+    ('registration-absence-name', "if absence.get('runnerName') != p['runnerName']:", 'if False:', 'test_absence_proof_must_match_the_exact_attempt_and_name'),
+    ('registration-absence-nonce', "if absence.get('attemptNonce') != attempt.get('nonce'):", 'if False:', 'test_absence_proof_must_match_the_exact_attempt_and_name'),
+    ('registration-absence-fresh', "if not (type(checked) in (int, float) and attempt.get('startedAt') <= checked <= time.time()", 'if not (True', 'test_absence_proof_must_be_fresh'),
+    ('registration-budget', "require(attempts < MAX_REGISTRATION_ATTEMPTS, 'registration attempt budget is exhausted')", "require(True, 'registration attempt budget is exhausted')", 'test_registration_retry_budget_and_window_are_bounded'),
+    ('registration-window', "require(now <= first + REGISTRATION_RETRY_WINDOW, 'registration retry window has expired')", "require(True, 'registration retry window has expired')", 'test_registration_retry_budget_and_window_are_bounded'),
+    ('registration-local-creds', "if (runner / name).exists() or (runner / name).is_symlink():", 'if False:', 'test_local_credentials_contradicting_absence_are_refused'),
+    ('registration-local-mismatch', "require(authority.get('registrationAbsence') is None,\n                    'remote absence was proven but a local registration exists: reconcile before retrying')", "require(True, 'remote absence was proven but a local registration exists: reconcile before retrying')", 'test_local_registration_with_remote_absence_mismatch_is_refused'),    ('registration-state', "require(state in ('reserved', 'unreleased'),", "require(True,", 'test_released_or_unknown_registration_is_never_retried'),
+    ('registration-unreleased-alive', "require(self.host.process_identity(pid, self.p['uid']) != identity,", "require(True,", 'test_unreleased_child_alive_blocks_retry_then_dead_allows_one'),
+    ('registration-reserved-pid', "require(attempt.get('pid') is None and attempt.get('startIdentity') is None,", "require(True,", 'test_reserved_intent_with_a_pid_is_refused'),
+    ('registration-release-order', "self.receipt['registrationAttempt']['state'] = 'released'\n        self.save()\n        gate.release()", "gate.release()\n        self.receipt['registrationAttempt']['state'] = 'released'\n        self.save()", 'test_released_gated_child_is_never_retried_even_if_dead'),
+    ('registration-challenge-type', 'raise ReconciliationRequired(reason)', 'raise Refused(reason)', 'test_missing_proof_for_unstarted_intent_is_a_structured_challenge'),
+    ('process-ambiguous', "if result.returncode == 1 and not output.strip() and not errors.strip():", 'if True:', 'test_process_identity_distinguishes_exact_dead_live_and_ambiguous'),
+    ('process-identity-fields', "require(len(parts) == 2 and parts[0] == str(uid) and parts[1].strip(),", 'require(True,', 'test_process_identity_distinguishes_exact_dead_live_and_ambiguous'),
+    ('child-identity-check', "if not (isinstance(gate.start_identity, str) and gate.start_identity):", 'if False:', 'test_unverifiable_child_identity_never_releases_or_registers'),
+
 ]
 
 

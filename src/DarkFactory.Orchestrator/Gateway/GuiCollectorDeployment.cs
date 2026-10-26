@@ -42,8 +42,13 @@ public sealed partial class GuiCollectorDeployment(HttpClient http, GitHubApp ga
     }
     public sealed record WorkflowAuthority(string Path, string Sha256, bool CollectorProtocol);
     public sealed record OnlineAuthority(long RunnerId, string RunnerName, string Status, string[] Labels);
+    public sealed record RegistrationAbsenceProof(string AttemptNonce, double CheckedAt, string RunnerName, string Status, bool AppPermissionsVerified);
     public sealed record Authority(string Kind, string PlanSha256, long ExpiresAt, bool AppPermissionsVerified,
-        bool NewNameAbsent, WorkflowAuthority[] MigratedWorkflows, OnlineAuthority? Online = null, long? RemovedOldRunnerId = null);
+        bool NewNameAbsent, WorkflowAuthority[] MigratedWorkflows, OnlineAuthority? Online = null, long? RemovedOldRunnerId = null)
+    {
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public RegistrationAbsenceProof? RegistrationAbsence { get; init; }
+    }
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { WriteIndented = true };
     public static string Hash(byte[] bytes) => Convert.ToHexStringLower(SHA256.HashData(bytes));
     public static string Hash(string text) => Hash(Encoding.UTF8.GetBytes(text));
@@ -378,7 +383,7 @@ public sealed partial class GuiCollectorDeployment(HttpClient http, GitHubApp ga
         await stderr; // never relay runner/sudo errors, which may contain credentials
         if (process.ExitCode != 0) throw new InvalidOperationException("Local installer refused or root authorization was not granted. Old retirement is not assumed; retain the deployment journal and resume.");
         var result = JsonNode.Parse(output)?.AsObject() ?? throw new InvalidOperationException("Invalid installer receipt.");
-        if (result["status"]?.GetValue<string>() is not ("awaiting-owner-online-verification-old-untouched" or "awaiting-owner-exact-old-registration-removal" or "complete"))
+        if (result["status"]?.GetValue<string>() is not ("registration-reconciliation-required" or "awaiting-owner-online-verification-old-untouched" or "awaiting-owner-exact-old-registration-removal" or "complete"))
             throw new InvalidOperationException("Installer returned no accepted stage receipt.");
         return result;
     }

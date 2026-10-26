@@ -499,6 +499,83 @@ public sealed class GuiCollectorDeploymentTests
         Assert.DoesNotContain(fixture.Api.Calls, c => c.Method == "DELETE");
     }
 
+    [Theory]
+    [InlineData("reserved")]
+    [InlineData("unreleased")]
+    public async Task A_root_verified_prelaunch_crash_gets_one_fresh_plan_and_nonce_bound_absence_retry(string state)
+    {
+        var fixture = new InstallationFixture { ChallengeFirst = true, ChallengeState = state };
+        var complete = await fixture.Run();
+        Assert.Equal("complete", complete["status"]!.GetValue<string>());
+        Assert.Equal(1, fixture.Challenges);
+        Assert.Equal(2, fixture.Events.Count(e => e == "token"));
+        Assert.True(fixture.Events.IndexOf("challenge") < fixture.Events.IndexOf("absence-get"));
+        Assert.True(fixture.Events.IndexOf("absence-get") < fixture.Events.IndexOf("register"));
+        Assert.Single(fixture.Events, e => e == "delete-old-7");
+        Assert.NotNull(fixture.Absence);
+        Assert.Equal(new string('d', 32), fixture.Absence.AttemptNonce);
+        Assert.Equal(Name, fixture.Absence.RunnerName);
+        Assert.Equal("absent", fixture.Absence.Status);
+        Assert.Equal(Now.ToUnixTimeMilliseconds() / 1000.0, fixture.Absence.CheckedAt);
+        Assert.True(fixture.Absence.AppPermissionsVerified);
+    }
+
+    [Fact]
+    public async Task A_registration_seen_after_the_root_challenge_is_never_treated_as_absent_or_retried()
+    {
+        var fixture = new InstallationFixture { ChallengeFirst = true, ConflictAfterChallenge = true };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Run());
+        Assert.Equal(1, fixture.Challenges);
+        Assert.Single(fixture.Events, e => e == "token");
+        Assert.DoesNotContain("register", fixture.Events);
+        Assert.DoesNotContain("delete-old-7", fixture.Events);
+    }
+
+    [Fact]
+    public async Task A_repeated_unstarted_challenge_is_bounded_to_one_automatic_gateway_retry()
+    {
+        var fixture = new InstallationFixture { ChallengeFirst = true, ChallengeAgain = true };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Run());
+        Assert.Equal(2, fixture.Challenges);
+        Assert.Equal(2, fixture.Events.Count(e => e == "token"));
+        Assert.DoesNotContain("register", fixture.Events);
+        Assert.DoesNotContain("delete-old-7", fixture.Events);
+    }
+
+    [Theory]
+    [InlineData("released")]
+    [InlineData("unverified")]
+    [InlineData("reserved-pid")]
+    [InlineData("unreleased-no-identity")]
+    [InlineData("wrong-plan")]
+    [InlineData("wrong-name")]
+    [InlineData("bad-nonce")]
+    [InlineData("exhausted")]
+    [InlineData("expired")]
+    [InlineData("future-intent")]
+    public async Task Ambiguous_POSTs_and_unbound_or_expired_root_intents_never_get_a_remote_absence_authority(string corrupt)
+    {
+        var fixture = new InstallationFixture();
+        var challenge = fixture.Challenge();
+        var intent = challenge["registrationIntent"]!.AsObject();
+        switch (corrupt)
+        {
+            case "released": intent["state"] = "released"; break;
+            case "unverified": intent["localUnstartedVerified"] = false; break;
+            case "reserved-pid": intent["pid"] = 123; break;
+            case "unreleased-no-identity": intent["state"] = "unreleased"; intent["pid"] = 123; break;
+            case "wrong-plan": challenge["planSha256"] = new string('0', 64); break;
+            case "wrong-name": challenge["runnerName"] = "factory-gui-other"; break;
+            case "bad-nonce": intent["attemptNonce"] = "not-a-nonce"; break;
+            case "exhausted": challenge["attempts"] = 2; break;
+            case "expired": challenge["firstStartedAt"] = Now.AddHours(-2).ToUnixTimeMilliseconds() / 1000.0; break;
+            case "future-intent": intent["createdAt"] = Now.AddSeconds(1).ToUnixTimeMilliseconds() / 1000.0; break;
+        }
+        var reservation = Evidence with { PlanSha256 = GuiCollectorDeployment.Hash(fixture.PlanBytes) };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Client(fixture.Api).RegistrationAbsenceAsync(fixture.PlanBytes, reservation, Hashes, challenge, CancellationToken.None));
+        Assert.Empty(fixture.Api.Calls);
+    }
+
     sealed class InstallationFixture
     {
         public readonly JsonObject PlanObject;
@@ -511,6 +588,10 @@ public sealed class GuiCollectorDeploymentTests
         public string ConfigurationPin = new('c', 64);
         bool registered;
         bool onlineListed;
+        public bool ChallengeFirst, ChallengeAgain, ConflictAfterChallenge;
+        public int Challenges;
+        public string ChallengeState = "reserved";
+        public GuiCollectorDeployment.RegistrationAbsenceProof? Absence;
         public InstallationFixture()
         {
             PlanObject = JsonNode.Parse(Plan)!.AsObject();
@@ -537,6 +618,10 @@ public sealed class GuiCollectorDeploymentTests
                     return Answer(new { value = ConfigurationPin });
                 if (path.StartsWith("/repos/michaeltrefry/dark-factory-gui-control/actions/runners?")) {
                     Assert.Equal("GET", method);
+                    if (Challenges > 0 && !registered) {
+                        Events.Add("absence-get");
+                        if (ConflictAfterChallenge) return Runners(Runner(44, Name, "offline", GuiCollectorDeployment.BootstrapLabel(GuiCollectorDeployment.Hash(PlanBytes))));
+                    }
                     if (registered && !onlineListed) { Events.Add("online-get"); onlineListed = true; }
                     return registered ? Runners(Runner(9, Name, Online ? "online" : "offline", FinalLabel ? GuiCollectorDeployment.Label : GuiCollectorDeployment.BootstrapLabel(GuiCollectorDeployment.Hash(PlanBytes)))) : Runners();
                 }
@@ -559,6 +644,19 @@ public sealed class GuiCollectorDeploymentTests
             ["configurationSha256"] = new string('c', 64), ["status"] = status,
             ["stages"] = RootRetired ? new JsonArray("old-backup-protected", "old-retired") : ProtectedBackup ? new JsonArray("old-backup-protected") : new JsonArray()
         };
+        public JsonObject Challenge()
+        {
+            var challenge = Receipt("registration-reconciliation-required");
+            challenge.Remove("runnerId");
+            challenge["attempts"] = 1;
+            challenge["firstStartedAt"] = Now.AddSeconds(-30).ToUnixTimeMilliseconds() / 1000.0;
+            challenge["registrationIntent"] = new JsonObject { ["attemptNonce"] = new string('d', 32),
+                ["createdAt"] = Now.AddSeconds(-10).ToUnixTimeMilliseconds() / 1000.0, ["state"] = ChallengeState,
+                ["pid"] = ChallengeState == "unreleased" ? JsonValue.Create(123) : null,
+                ["startIdentity"] = ChallengeState == "unreleased" ? JsonValue.Create("503 Mon Oct 26 01:02:03 2026") : null,
+                ["localUnstartedVerified"] = true };
+            return challenge;
+        }
         public Task<JsonObject> Run()
         {
             var reservation = Evidence with { PlanSha256 = GuiCollectorDeployment.Hash(PlanBytes) };
@@ -573,6 +671,14 @@ public sealed class GuiCollectorDeploymentTests
                     return Task.FromResult(Receipt("awaiting-owner-exact-old-registration-removal"));
                 }
                 Assert.Equal(KnownId is null ? "REGISTRATION_SECRET" : "", token);
+                if (ChallengeFirst && (Challenges == 0 || ChallengeAgain)) {
+                    Challenges++; Events.Add("challenge"); return Task.FromResult(Challenge());
+                }
+                if (ChallengeFirst) {
+                    Assert.NotNull(authority.RegistrationAbsence);
+                    Absence = authority.RegistrationAbsence;
+                    Assert.Contains("absence-get", Events);
+                }
                 Events.Add("register"); registered = true;
                 return Task.FromResult(Receipt("awaiting-owner-online-verification-old-untouched"));
             }, (id, ct) => {

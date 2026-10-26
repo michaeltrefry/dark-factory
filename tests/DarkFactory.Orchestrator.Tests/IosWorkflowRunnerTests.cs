@@ -33,6 +33,17 @@ public sealed class IosWorkflowRunnerTests
                 Assert.Matches("^actions/(download|upload)-artifact@[0-9a-f]{40}$", action.ToString());
     }
 
+    /// <summary>The Python program a sealed workflow's <c>run</c> block executes, without the heredoc wrapper.</summary>
+    internal static string PythonProgram(string run)
+    {
+        var lines = run.Replace("\r\n", "\n").Split('\n');
+        var start = Array.FindIndex(lines, line => line.Contains("python3 -I - <<", StringComparison.Ordinal));
+        if (start < 0) throw new InvalidDataException("run block has no Python heredoc.");
+        var end = lines.Length - 1;
+        while (end > start && (lines[end].Trim() is "" or "PY" or "PYCODE")) end--;
+        return string.Join('\n', lines[(start + 1)..(end + 1)]);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -48,9 +59,7 @@ public sealed class IosWorkflowRunnerTests
             && name.ToString().StartsWith("Acquire", StringComparison.Ordinal));
         var env = (YamlMappingNode)acquisition.Children[new YamlScalarNode("env")];
         Assert.Equal("${{ steps.plan.outputs.sides }}", env.Children[new YamlScalarNode("SIDES")].ToString());
-        var shell = acquisition.Children[new YamlScalarNode("run")].ToString();
-        var script = shell[(shell.IndexOf('\n') + 1)..];
-        script = script[..script.LastIndexOf('\n')];
+        var script = PythonProgram(acquisition.Children[new YamlScalarNode("run")].ToString());
         var directory = Directory.CreateTempSubdirectory("df-source-sides-").FullName;
         try
         {
@@ -192,9 +201,7 @@ public sealed class IosWorkflowRunnerTests
         var steps = (YamlSequenceNode)((YamlMappingNode)jobs.Children[new YamlScalarNode("sources")]).Children[new YamlScalarNode("steps")];
         var plan = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
             && name.ToString() == "Select requested execution side");
-        var run = plan.Children[new YamlScalarNode("run")].ToString();
-        var script = run[(run.IndexOf('\n') + 1)..];
-        script = script[..script.LastIndexOf('\n')];
+        var script = PythonProgram(plan.Children[new YamlScalarNode("run")].ToString());
         var directory = Directory.CreateTempSubdirectory("df-source-plan-").FullName;
         try
         {
@@ -241,7 +248,7 @@ public sealed class IosWorkflowRunnerTests
                 for name,old,new in [
                     ('overlay-opposite-always', "if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):", "if parsed.get('overlayPaths'):"),
                     ('overlay-opposite-never', "if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):", "if False:"),
-                    ('legacy-sides-reduced', "sides = ['base', 'head']\n          if execution:", "sides = ['base', 'head']\n          if False:")]:
+                    ('legacy-sides-reduced', "sides = ['base', 'head']\nif execution:", "sides = ['base', 'head']\nif False:")]:
                     if old not in original: raise AssertionError('mutation anchor missing: '+name)
                     script=original.replace(old,new,1);red=run()
                     if not red.failures or red.errors: raise AssertionError('not an assertion-only RED: '+name+str(red.errors))

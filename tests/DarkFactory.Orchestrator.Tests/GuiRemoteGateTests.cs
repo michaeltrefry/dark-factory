@@ -224,7 +224,7 @@ public class GuiRemoteGateTests
             await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
             var output = await stdout + await stderr;
             Assert.True(process.ExitCode == 0, output);
-            Assert.Contains("Ran 40 tests", output);
+            Assert.Contains("Ran 43 tests", output);
         }
         finally { owned?.KillIfStillRunning(); Directory.Delete(directory, true); }
     }
