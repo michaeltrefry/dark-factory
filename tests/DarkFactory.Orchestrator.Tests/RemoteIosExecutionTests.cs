@@ -433,7 +433,9 @@ class Fixtures(unittest.TestCase):
             for execution,expected in [('', ['base','head']),(json.dumps({'side':'base'}),['base']),(json.dumps({'side':'head'}),['head'])]:
                 output=pathlib.Path(d)/'output';output.write_text('')
                 r.subprocess.run([sys.executable,'-I','-c',script],env={'EXECUTION':execution,'GITHUB_OUTPUT':str(output)},check=True,stdin=r.subprocess.DEVNULL,capture_output=True)
-                self.assertEqual(expected,json.loads(output.read_text().split('=',1)[1]))
+                outputs=dict(line.split('=',1) for line in output.read_text().splitlines())
+                self.assertEqual(expected,json.loads(outputs['sides']))
+                self.assertEqual(expected,json.loads(outputs['archive_sides']))
         self.assertTrue('side: ${{ fromJSON(needs.sources.outputs.sides) }}' in WORKFLOW and 'factory-ios-result-${{ inputs.nonce }}-${{ matrix.side }}' in WORKFLOW and 'EXECUTION_BUDGET_SECONDS: ${{ inputs.execution_budget_seconds }}' in WORKFLOW and 'EXECUTION_DEADLINE_UNIX_SECONDS: ${{ inputs.execution_deadline_unix_seconds }}' in WORKFLOW)
     def test_offline_resolution_is_source_only_after_mirror_install_before_build(self):
         payload,calls,_=self.run_main(hydrated=True)
