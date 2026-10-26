@@ -258,7 +258,7 @@ public sealed class WorkerPrepareTests : IDisposable
         // The root lets a user reach a session's directory by name and list nothing.
         Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute,
             File.GetUnixFileMode(WorkerPrepare.SpoolRootOf(_root)));
-        Assert.InRange(reads, 1, WorkerSandbox.AclReads);
+        Assert.InRange(reads, 1, AclObservationReads);
     }
 
     /// <summary>A listing with the long directory line <c>ls -led</c> prints first, then the given ACL entries.</summary>
@@ -279,22 +279,29 @@ public sealed class WorkerPrepareTests : IDisposable
         .Any(m => !m.Groups["who"].Value.StartsWith("user:", StringComparison.Ordinal)
             && !m.Groups["who"].Value.StartsWith("group:", StringComparison.Ordinal));
 
+    // Test observation only: macOS may keep printing an unresolved role-account UUID for several seconds under load.
+    // Never widen the production ACL decision or keep reading a resolved security failure until it passes.
+    internal const int AclObservationReads = 20;
+    private static readonly TimeSpan AclObservationRetry = TimeSpan.FromMilliseconds(500);
+
     /// <summary>
     /// The listing, read again only while a principal is unresolved (<see cref="UnresolvedPrincipal"/>): at most
-    /// <see cref="WorkerSandbox.AclReads"/> reads, <see cref="WorkerSandbox.AclRetry"/> apart. A listing whose principals are
+    /// <see cref="AclObservationReads"/> reads, <see cref="AclObservationRetry"/> apart. A listing whose principals are
     /// all named is a verdict at once: a missing right or an unexpected writer fails the check there and is never read again
     /// until it passes.
     /// </summary>
-    internal static async Task<(string Listing, int Reads)> ReadSettledAclAsync(Func<CancellationToken, Task<string>> read)
+    internal static async Task<(string Listing, int Reads)> ReadSettledAclAsync(Func<CancellationToken, Task<string>> read,
+        Func<TimeSpan, Task>? delay = null)
     {
+        delay ??= static interval => Task.Delay(interval);
         var listing = "";
-        for (var attempt = 1; attempt <= WorkerSandbox.AclReads; attempt++)
+        for (var attempt = 1; attempt <= AclObservationReads; attempt++)
         {
             listing = await read(CancellationToken.None);
             if (!UnresolvedPrincipal(listing)) return (listing, attempt);
-            if (attempt < WorkerSandbox.AclReads) await Task.Delay(WorkerSandbox.AclRetry);
+            if (attempt < AclObservationReads) await delay(AclObservationRetry);
         }
-        return (listing, WorkerSandbox.AclReads);
+        return (listing, AclObservationReads);
     }
 
     private static async Task<(string Listing, int Reads, bool Resolved)> SettledAclAsync(Func<CancellationToken, Task<string>> read)
@@ -303,19 +310,24 @@ public sealed class WorkerPrepareTests : IDisposable
         return (listing, reads, !UnresolvedPrincipal(listing));
     }
 
-    [Fact]
-    public async Task An_acl_listing_whose_principal_is_a_uuid_is_read_again_until_it_names_its_user()
+    [Theory]
+    [InlineData(3)]
+    [InlineData(12)]
+    public async Task An_acl_listing_whose_principal_is_a_uuid_is_read_again_until_it_names_its_user(int resolvesAfter)
     {
         var uuid = Long(" 0: 1E9A2C4B-6D3F-4A5E-9B7C-2D4E6F8A0B1C allow add_file\n");
         var named = Long(" 0: user:nobody allow add_file\n");
         var reads = 0;
+        var delays = new List<TimeSpan>();
         var (listing, count) = await ReadSettledAclAsync(_ =>
         {
             reads++;
-            return Task.FromResult(reads < 3 ? uuid : named);
-        });
-        Assert.Equal(3, count);
-        Assert.Equal(3, reads);
+            return Task.FromResult(reads < resolvesAfter ? uuid : named);
+        }, interval => { delays.Add(interval); return Task.CompletedTask; });
+        Assert.Equal(resolvesAfter - 1, delays.Count);
+        Assert.All(delays, interval => Assert.Equal(TimeSpan.FromMilliseconds(500), interval));
+        Assert.Equal(resolvesAfter, count);
+        Assert.Equal(resolvesAfter, reads);
         Assert.False(UnresolvedPrincipal(listing));
         Assert.True(WorkerSandbox.Grants(listing, "nobody", "add_file"), listing);
     }
@@ -325,13 +337,15 @@ public sealed class WorkerPrepareTests : IDisposable
     {
         var uuid = Long(" 0: 1E9A2C4B-6D3F-4A5E-9B7C-2D4E6F8A0B1C allow add_file\n");
         var reads = 0;
+        var delays = 0;
         var (listing, count) = await ReadSettledAclAsync(_ =>
         {
             reads++;
             return Task.FromResult(uuid);
-        });
-        Assert.Equal(WorkerSandbox.AclReads, count);
-        Assert.Equal(WorkerSandbox.AclReads, reads);
+        }, _ => { delays++; return Task.CompletedTask; });
+        Assert.Equal(AclObservationReads - 1, delays);
+        Assert.Equal(AclObservationReads, count);
+        Assert.Equal(AclObservationReads, reads);
         Assert.True(UnresolvedPrincipal(listing));
         // A UUID is never the sandbox user: it grants nothing and opens the directory to somebody.
         Assert.False(WorkerSandbox.Grants(listing, "nobody", "add_file"), listing);
@@ -348,11 +362,13 @@ public sealed class WorkerPrepareTests : IDisposable
             : Long(" 0: user:nobody allow add_file\n 0: user:someone allow add_file\n");
         Assert.False(UnresolvedPrincipal(listing));
         var reads = 0;
+        var delays = 0;
         var (read, count) = await ReadSettledAclAsync(_ =>
         {
             reads++;
             return Task.FromResult(listing);
-        });
+        }, _ => { delays++; return Task.CompletedTask; });
+        Assert.Equal(0, delays);
         Assert.Equal(1, count);
         Assert.Equal(1, reads);
         // Never read again until it passes: the verdict is the listing's own.
