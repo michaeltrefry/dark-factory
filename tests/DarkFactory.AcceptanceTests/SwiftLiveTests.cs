@@ -72,7 +72,10 @@ public class SwiftLiveTests
             (change.Source, change.SourceText), (change.Test, change.TestText));
 
         Assert.Equal([change.TestId], set.Tests);
-        Assert.Equal("DfE2eSwiftTests.P1a2b3c4dTests/testDoubles", change.TestId);
+        const string runtimeId = "DfE2eSwiftTests.P1a2b3c4dTests/testDoubles";
+        Assert.Equal(runtimeId, SwiftNewTests.RuntimeId(change.TestId));
+        Assert.Equal(SwiftNewTests.TestKey(SwiftSeeds.PackageManifest, runtimeId), change.TestId);
+        await AssertPackageExecutionAsync(set, change.TestId, runtimeId, xctest: true);
         Assert.Empty(set.Unisolable);
         // The Xcode strategy leaves a SwiftPM package's files to the SwiftPM one.
         var xcode = await IdentifyAsync(new XcodeNewTests(), Seed(SwiftSeeds.PackageSeed, SwiftSeeds.PackageDir),
@@ -89,8 +92,56 @@ public class SwiftLiveTests
         var set = await IdentifyAsync(new SwiftNewTests(xcode: true), Seed(SwiftSeeds.PackageSeed, SwiftSeeds.PackageDir), (seed.Test, seed.TestText));
 
         Assert.Equal([seed.TestId], set.Tests);
-        Assert.Equal("DfE2eSwiftTests.e2eAlreadyPassesOnTheBase()", seed.TestId);
+        const string runtimeId = "DfE2eSwiftTests.e2eAlreadyPassesOnTheBase()";
+        Assert.Equal(runtimeId, SwiftNewTests.RuntimeId(seed.TestId));
+        Assert.Equal(SwiftNewTests.TestKey(SwiftSeeds.PackageManifest, runtimeId), seed.TestId);
+        await AssertPackageExecutionAsync(set, seed.TestId, runtimeId, xctest: false);
         Assert.Empty(set.Unisolable);
+    }
+
+    private static async Task AssertPackageExecutionAsync(NewTestSet set, string key, string runtimeId, bool xctest)
+    {
+        Assert.Equal(SwiftSeeds.PackageManifest, set.Projects[key]);
+        var steps = await new SwiftNewTests().StepsAsync(null!, "head", set.Tests, set.Projects, ".results", TestContext.Current.CancellationToken);
+        var test = Assert.Single(steps, step => step.Phase == TestPhase.Test);
+        var args = test.Args.ToList();
+        Assert.Equal("./" + SwiftSeeds.PackageDir, args[args.IndexOf("--package-path") + 1]);
+        Assert.Equal(SwiftNewTests.Filter(runtimeId), args[args.IndexOf("--filter") + 1]);
+        if (xctest)
+        {
+            Assert.Equal(SwiftNewTests.XCTestOutputName(key), test.CaptureOutput);
+        }
+        else
+        {
+            Assert.Equal(SwiftNewTests.ResultPattern(key), test.ResultFilePattern);
+            Assert.Equal(".results/" + SwiftNewTests.ReportName(key), args[args.IndexOf("--xunit-output") + 1]);
+        }
+    }
+
+    [Fact]
+    public void A_package_qualified_result_cannot_be_reinterpreted_as_xcode_ios_execution_proof()
+    {
+        var app = Seed(SwiftSeeds.IosSeed, SwiftSeeds.IosDir);
+        var native = SwiftSeeds.IosUnitTest(SwiftSeeds.IosDir, 1, "proof").TestId;
+        var projects = app.Where(f => f.Key.EndsWith(".xcodeproj/project.pbxproj", StringComparison.Ordinal)).ToDictionary(f => f.Key, f => f.Value);
+        Assert.Equal((XcodeProject.IOS, XcodeTarget.UnitTestBundle), SwiftLive.TargetOf(projects, native));
+        // Even a package key whose runtime portion resembles a real Xcode id is not an Xcode target's test.
+        var package = SwiftNewTests.TestKey(SwiftSeeds.PackageManifest, native);
+        Assert.NotEqual(native, package);
+        Assert.Null(SwiftLive.TargetOf(projects, package));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_result_without_an_xcode_target_separator_is_not_an_ios_execution_proof(bool qualified)
+    {
+        const string native = "DfE2eSwiftTests.freeTest()";
+        var id = qualified ? SwiftNewTests.TestKey(SwiftSeeds.PackageManifest, native) : native;
+        (string? Platform, string ProductType)? target = null;
+        var error = Record.Exception(() => target = SwiftLive.TargetOf(new Dictionary<string, string>(), id));
+        Assert.Null(error);
+        Assert.Null(target);
     }
 
     [Fact]

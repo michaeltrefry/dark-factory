@@ -183,7 +183,7 @@ public sealed class GuiCollectorDeploymentTests
         Assert.Equal("DELETE", api.Calls[1].Method);
         Assert.Equal("GET", api.Calls[2].Method);
         Assert.Equal(7, await client.RetireAsync(Repo, Replacement, 7, Old, CancellationToken.None));
-        Assert.Single(api.Calls.Where(c => c.Method == "DELETE"));
+        Assert.Single(api.Calls, c => c.Method == "DELETE");
     }
 
     [Fact]
@@ -202,7 +202,7 @@ public sealed class GuiCollectorDeploymentTests
         Assert.Equal(7, await Client(api).RetireAsync(Repo, Replacement, 7, Old, CancellationToken.None, GuiCollectorDeployment.SourceRepository));
         Assert.Equal("GET", api.Calls[0].Method);
         Assert.StartsWith("/repos/michaeltrefry/dark-factory-gui-control/", api.Calls[0].Path);
-        Assert.Single(api.Calls.Where(c => c.Method == "DELETE"));
+        Assert.Single(api.Calls, c => c.Method == "DELETE");
     }
 
     [Theory]
@@ -226,7 +226,7 @@ public sealed class GuiCollectorDeploymentTests
                 : Runners(Runner(9, Name, labels: [GuiCollectorDeployment.Label]), Runner(7, Old));
         });
         Assert.Equal(7, await Client(api).RetireAsync(Repo, Replacement, 7, Old, CancellationToken.None));
-        Assert.Single(api.Calls.Where(c => c.Method == "DELETE"));
+        Assert.Single(api.Calls, c => c.Method == "DELETE");
         Assert.Equal(3, api.Calls.Count(c => c.Method == "GET"));
     }
 
@@ -369,7 +369,7 @@ public sealed class GuiCollectorDeploymentTests
         Assert.Equal("complete", complete["status"]!.GetValue<string>());
         Assert.Equal(new[] { "token", "register", "record-id", "online-get", "backup", "delete-old-7", "retire" }, fixture.Events);
         Assert.Equal(9, fixture.KnownId);
-        Assert.Single(fixture.Api.Calls.Where(c => c.Method == "DELETE"));
+        Assert.Single(fixture.Api.Calls, c => c.Method == "DELETE");
         Assert.DoesNotContain(fixture.Api.Calls, c => c.Path.Contains("/merge") || c.Path.Contains("/reviews"));
     }
 
@@ -404,8 +404,8 @@ public sealed class GuiCollectorDeploymentTests
         fixture.CompleteRetirement = true;
         var complete = await fixture.Run();
         Assert.Equal("complete", complete["status"]!.GetValue<string>());
-        Assert.Single(fixture.Events.Where(e => e == "token"));
-        Assert.Single(fixture.Events.Where(e => e == "delete-old-7"));
+        Assert.Single(fixture.Events, e => e == "token");
+        Assert.Single(fixture.Events, e => e == "delete-old-7");
         Assert.Equal(2, fixture.Events.Count(e => e == "retire"));
         Assert.Equal(2, fixture.Events.Count(e => e == "record-id"));
     }
@@ -462,8 +462,8 @@ public sealed class GuiCollectorDeploymentTests
         await Client(fixture.Api).PromoteRunnerAsync(fixture.PlanBytes, complete, CancellationToken.None);
         await Client(fixture.Api).PromoteRunnerAsync(fixture.PlanBytes, complete, CancellationToken.None);
         Assert.True(fixture.FinalLabel);
-        Assert.Single(fixture.Events.Where(e => e == "token"));
-        Assert.Single(fixture.Events.Where(e => e == "delete-old-7"));
+        Assert.Single(fixture.Events, e => e == "token");
+        Assert.Single(fixture.Events, e => e == "delete-old-7");
         Assert.Equal(lostAnswer ? 1 : 2, fixture.Events.Count(e => e == "promote"));
     }
 

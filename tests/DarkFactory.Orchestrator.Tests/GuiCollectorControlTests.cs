@@ -66,7 +66,7 @@ public sealed class GuiCollectorControlTests
         using var http = api.Client("https://api.github.com/");
         await Client(http).ProvisionControlRepositoryAsync(CancellationToken.None);
         Assert.Equal(2, reads);
-        Assert.Single(api.Requests.Where(r => r.Method == HttpMethod.Post));
+        Assert.Single(api.Requests, r => r.Method == HttpMethod.Post);
         Assert.All(api.Requests, r => Assert.DoesNotContain(Source, r.PathAndQuery));
         AssertOwnerAndAppCredentials(api);
         var workflow = JsonNode.Parse(api.Requests.Single(r => r.PathAndQuery.EndsWith("/permissions/workflow")).Body!)!;
@@ -109,7 +109,7 @@ public sealed class GuiCollectorControlTests
         var error = await Assert.ThrowsAsync<InvalidOperationException>(() => Client(http).ProvisionControlRepositoryAsync(CancellationToken.None));
         Assert.DoesNotContain(OwnerToken, error.Message);
         Assert.DoesNotContain("PRIVATE_RESPONSE", error.Message);
-        Assert.Single(api.Requests.Where(r => r.Method != HttpMethod.Get));
+        Assert.Single(api.Requests, r => r.Method != HttpMethod.Get);
         Assert.True(JsonNode.Parse(api.Requests.Last().Body!)!["private"]!.GetValue<bool>());
     }
 
@@ -199,7 +199,7 @@ public sealed class GuiCollectorControlTests
         using var http = api.Client("https://api.github.com/");
         await Client(http).ProvisionControlRepositoryAsync(CancellationToken.None);
         Assert.Equal(2, installationReads);
-        Assert.Single(api.Requests.Where(r => r.PathAndQuery == "/user/installations/7/repositories/456"));
+        Assert.Single(api.Requests, r => r.PathAndQuery == "/user/installations/7/repositories/456");
         AssertOwnerAndAppCredentials(api);
     }
 
@@ -478,6 +478,7 @@ public sealed class GuiCollectorControlTests
     }
 
     [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     public async Task Root_entry_stages_compiled_owner_private_bytes_outside_a_malicious_checkout_and_passes_no_checkout_script()
     {
         var root = Path.Combine(OperatingSystem.IsMacOS() ? "/private/tmp" : Path.GetTempPath(), "df-gui-bootstrap-test-" + Guid.NewGuid().ToString("N"));

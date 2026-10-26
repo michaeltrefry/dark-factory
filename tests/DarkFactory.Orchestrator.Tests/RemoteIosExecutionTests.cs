@@ -91,6 +91,8 @@ class NativePrincipal:
         self.filesystem=filesystem
         self.root,self.worktree,self.home=root,worktree,root/'native-home'
         self.home.mkdir();(self.home/'tmp').mkdir();self.profile=root/'native.sb'
+        developer='/Applications/Xcode.app/Contents/Developer'
+        self.env={'DEVELOPER_DIR':developer,'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(self.home),'CFFIXED_USER_HOME':str(self.home),'TMPDIR':str(self.home/'tmp'),'SWIFTPM_MODULECACHE_OVERRIDE':str(self.home/'module-cache'),'xcrun_nocache':'1'}
         self.registry_endpoints([])
     def registry_endpoints(self,endpoints):
         self.profile.write_text(r.sandbox_profile(self.root,[self.home,self.worktree],endpoints)+('' if self.filesystem else '\n(allow file-read* file-write*)\n'))
@@ -98,9 +100,23 @@ class NativePrincipal:
         developer='/Applications/Xcode.app/Contents/Developer'
         tools={'/usr/bin/python3':developer+'/usr/bin/python3','/usr/bin/swift':developer+'/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift'}
         args=[tools.get(args[0],args[0]),*args[1:]]
-        result=r.subprocess.run(['/usr/bin/sandbox-exec','-f',str(self.profile),*args],cwd=cwd,env={'DEVELOPER_DIR':developer,'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':str(self.home),'CFFIXED_USER_HOME':str(self.home),'TMPDIR':str(self.home/'tmp'),'SWIFTPM_MODULECACHE_OVERRIDE':str(self.home/'module-cache'),'xcrun_nocache':'1'},stdin=r.subprocess.DEVNULL,capture_output=True)
+        result=r.subprocess.run(['/usr/bin/sandbox-exec','-f',str(self.profile),*args],cwd=cwd,env=self.env,stdin=r.subprocess.DEVNULL,capture_output=True)
         return result.returncode,result.stdout.decode()+result.stderr.decode()
 class Fixtures(unittest.TestCase):
+    def test_native_principal_carries_installed_git_configuration_to_source_commands(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);worktree=root/'base';worktree.mkdir()
+            principal=NativePrincipal(root,worktree)
+            principal.env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_SYSTEM':'/dev/null','GIT_CONFIG_GLOBAL':str(principal.home/'.factory-gitconfig')})
+            with patch.object(r.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=b'',stderr=b'')) as native:
+                principal.run(['/usr/bin/git','--version'],worktree)
+            environment=native.call_args.kwargs['env']
+            self.assertEqual('1',environment.get('GIT_CONFIG_NOSYSTEM'))
+            self.assertEqual('/dev/null',environment.get('GIT_CONFIG_SYSTEM'))
+            self.assertEqual(str(principal.home/'.factory-gitconfig'),environment.get('GIT_CONFIG_GLOBAL'))
+            self.assertEqual(str(principal.home),environment.get('HOME'))
+
     def parse(self, value):
         return r.parse_execution(json.dumps(value), REQUEST)
     def test_test_environment_validation_and_job_local_resolution(self):

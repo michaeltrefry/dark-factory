@@ -24,7 +24,7 @@ public sealed class GuiCollectorHostedTests
         Assert.Equal(Sha, result.Commit);
         Assert.Equal(RemoteIosWorkflow.Path, result.Before.Path);
         Assert.Equal("", result.Before.Sha256);
-        var create = Assert.Single(fixture.Api.Calls.Where(c => c.Method == "POST"));
+        var create = Assert.Single(fixture.Api.Calls, c => c.Method == "POST");
         var body = JsonNode.Parse(create.Body!)!;
         Assert.Equal("dark-factory-s6-fixtures", body["name"]!.GetValue<string>());
         Assert.False(body["private"]!.GetValue<bool>());

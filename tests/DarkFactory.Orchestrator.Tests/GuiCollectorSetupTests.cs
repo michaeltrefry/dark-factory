@@ -7,6 +7,7 @@ namespace DarkFactory.Orchestrator.Tests;
 public class GuiCollectorSetupTests
 {
     [Theory]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     [InlineData("test_setup_gui_collector.py", "GUI_SETUP_CONTRACT_RESULT ", 46, false)]
     [InlineData("test_gui_source_job.py", "GUI_SOURCE_CONTRACT_RESULT ", 13, false)]
     [InlineData("test_gui_source_job.py", "GUI_SOURCE_MUTATION_RESULT ", 16, true)]

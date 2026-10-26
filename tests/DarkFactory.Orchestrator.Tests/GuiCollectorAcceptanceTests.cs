@@ -36,7 +36,7 @@ public sealed class GuiCollectorAcceptanceTests
         Assert.False(result.Receipt.SourceStartedWhileBlocked);
         Assert.Equal(Config, result.Receipt.ConfigurationSha256);
         Assert.Equal(new[] { "read", "write" }, api.Mints);
-        Assert.Single(api.Calls.Where(c => c.Method == "POST" && c.Path.EndsWith("/dispatches")));
+        Assert.Single(api.Calls, c => c.Method == "POST" && c.Path.EndsWith("/dispatches"));
         Assert.Contains(api.Calls, c => c.Path.EndsWith("?ref=" + Sha));
         Assert.All(api.Calls.Where(c => !c.Path.EndsWith("/installation") && !c.Path.Contains("/access_tokens")),
             c => Assert.Equal("Bearer GATE_" + (c.Method == "POST" ? "write" : "read"), c.Auth));

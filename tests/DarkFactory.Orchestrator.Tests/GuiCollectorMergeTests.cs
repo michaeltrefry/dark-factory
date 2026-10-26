@@ -25,7 +25,7 @@ public sealed class GuiCollectorMergeTests
         var result = await fixture.Client.MergeGeneratedPullAsync(fixture.Original, fixture.Desired, 4, true, CancellationToken.None);
         Assert.True(result.Merged);
         Assert.Equal(Head, result.Head);
-        var merge = Assert.Single(fixture.Api.Calls.Where(c => c.Method == "PUT" && c.Path.EndsWith("/merge")));
+        var merge = Assert.Single(fixture.Api.Calls, c => c.Method == "PUT" && c.Path.EndsWith("/merge"));
         Assert.Equal(Head, JsonNode.Parse(merge.Body!)!["sha"]!.GetValue<string>());
         Assert.DoesNotContain(fixture.Api.Calls, c => c.Path.Contains("/reviews"));
         if (ci == "none") Assert.Contains("not a CI pass", result.Reason);
@@ -67,7 +67,7 @@ public sealed class GuiCollectorMergeTests
     {
         var fixture = new Fixture("passed") { RejectMerge = true };
         await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Client.MergeGeneratedPullAsync(fixture.Original, fixture.Desired, 4, true, CancellationToken.None));
-        Assert.Single(fixture.Api.Calls.Where(c => c.Method == "PUT"));
+        Assert.Single(fixture.Api.Calls, c => c.Method == "PUT");
         Assert.False(fixture.Merged);
     }
 
