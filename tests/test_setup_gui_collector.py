@@ -57,7 +57,7 @@ class FakeHost:
         require(identity.startswith(str(uid) + ' '), 'process identity is ambiguous')
         return identity
 
-    def kill(self, pid):
+    def mark_process_exited(self, pid):
         self.processes.pop(pid, None)
 
     def start_gated(self, argv, **kwargs):
@@ -172,7 +172,7 @@ class FakeGate:
         self.host.run(self.argv, **self.kwargs)
 
     def abort(self):
-        self.host.kill(self.pid)
+        self.host.mark_process_exited(self.pid)
 
     def wait(self):
         return 0
@@ -616,7 +616,7 @@ class Contracts(unittest.TestCase):
                 case.host.processes[777] = 'collector 777'
                 case.installer.receipt['registrationAttempt'].update(
                     change, pid=777, startIdentity='collector 777')
-                case.host.kill(777)
+                case.host.mark_process_exited(777)
                 case.installer.save()
                 case.authority['registrationAbsence'] = case.proof()
                 with self.assertRaises(setup.Refused):
@@ -644,7 +644,7 @@ class Contracts(unittest.TestCase):
         with self.assertRaises(setup.Refused):
             self.apply()
         self.assertFalse(any(c[0] == 'gate_release' for c in self.host.calls))
-        self.host.kill(attempt['pid'])
+        self.host.mark_process_exited(attempt['pid'])
         self.assertEqual('awaiting-owner-online-verification-old-untouched', self.apply()['status'])
         self.assertEqual(2, self.installer.receipt['registrationAttempts'])
         self.assertEqual(1, len([c for c in self.host.calls if c[0] == 'gate_release']))
@@ -660,7 +660,7 @@ class Contracts(unittest.TestCase):
 
     def test_released_state_is_a_generic_refusal_not_a_retry_challenge(self):
         self.crash_after_state('released')
-        self.host.kill(self.installer.receipt['registrationAttempt']['pid'])
+        self.host.mark_process_exited(self.installer.receipt['registrationAttempt']['pid'])
         self.authority['registrationAbsence'] = self.proof()
         with self.assertRaises(setup.Refused) as caught:
             self.apply()
@@ -669,7 +669,7 @@ class Contracts(unittest.TestCase):
     def test_released_gated_child_is_never_retried_even_if_dead(self):
         attempt = self.crash_after_state('released')
         self.assertFalse(any(c[0] == 'gate_release' for c in self.host.calls))
-        self.host.kill(attempt['pid'])
+        self.host.mark_process_exited(attempt['pid'])
         self.authority['registrationAbsence'] = self.proof()
         with self.assertRaises(setup.Refused):
             self.apply()

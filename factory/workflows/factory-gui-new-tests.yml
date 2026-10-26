@@ -37,6 +37,7 @@ jobs:
     permissions: {}
     outputs:
       sides: ${{ steps.plan.outputs.sides }}
+      archive_sides: ${{ steps.plan.outputs.archive_sides }}
     steps:
       - name: Select requested execution side
         id: plan
@@ -47,17 +48,20 @@ jobs:
           import json, os
           execution = os.environ['EXECUTION']
           sides = ['base', 'head']
+          archive_sides = sides.copy()
           if execution:
               parsed = json.loads(execution)
               side = parsed['side']
               if side not in ('base', 'head'):
                   raise ValueError('invalid execution side')
               sides = [side]
+              archive_sides = sides.copy()
               # The opposite archive is needed only when this execution's overlay copies from the other revision.
               if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):
-                  sides.append('head' if side == 'base' else 'base')
+                  archive_sides.append('head' if side == 'base' else 'base')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('sides=' + json.dumps(sides) + '\n')
+              output.write('archive_sides=' + json.dumps(archive_sides) + '\n')
           PY
       # Public immutable source only: never mint a cross-repository token or
       # silently reuse the collector repository's installation authority.
@@ -67,7 +71,7 @@ jobs:
           TRUSTED_REPOSITORIES: ${{ vars.FACTORY_GUI_TRUSTED_REPOSITORIES }}
           BASE: ${{ inputs.base }}
           HEAD: ${{ inputs.head }}
-          SIDES: ${{ steps.plan.outputs.sides }}
+          SIDES: ${{ steps.plan.outputs.archive_sides }}
         run: |
           python3 -I - <<'PYCODE'
           import json, os, re, urllib.request

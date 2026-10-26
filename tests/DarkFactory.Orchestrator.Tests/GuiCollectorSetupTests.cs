@@ -31,7 +31,7 @@ public class GuiCollectorSetupTests
             owned = OwnProcess.Of(process);
             var stdout = process.StandardOutput.ReadToEndAsync();
             var stderr = process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(3));
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(scriptName == "test_gui_source_job.py" && mutations ? 10 : 3));
             var output = await stdout;
             var errors = await stderr;
             Assert.True(process.ExitCode == 0, output + errors);

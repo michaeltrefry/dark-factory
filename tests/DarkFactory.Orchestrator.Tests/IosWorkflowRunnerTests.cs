@@ -58,7 +58,7 @@ public sealed class IosWorkflowRunnerTests
         var acquisition = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
             && name.ToString().StartsWith("Acquire", StringComparison.Ordinal));
         var env = (YamlMappingNode)acquisition.Children[new YamlScalarNode("env")];
-        Assert.Equal("${{ steps.plan.outputs.sides }}", env.Children[new YamlScalarNode("SIDES")].ToString());
+        Assert.Equal("${{ steps.plan.outputs.archive_sides }}", env.Children[new YamlScalarNode("SIDES")].ToString());
         var script = PythonProgram(acquisition.Children[new YamlScalarNode("run")].ToString());
         var directory = Directory.CreateTempSubdirectory("df-source-sides-").FullName;
         try
@@ -202,13 +202,30 @@ public sealed class IosWorkflowRunnerTests
         var plan = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
             && name.ToString() == "Select requested execution side");
         var script = PythonProgram(plan.Children[new YamlScalarNode("run")].ToString());
+        var sources = (YamlMappingNode)jobs.Children[new YamlScalarNode("sources")];
+        var outputs = (YamlMappingNode)sources.Children[new YamlScalarNode("outputs")];
+        var check = (YamlMappingNode)jobs.Children[new YamlScalarNode("check")];
+        var strategy = (YamlMappingNode)check.Children[new YamlScalarNode("strategy")];
+        var matrix = (YamlMappingNode)strategy.Children[new YamlScalarNode("matrix")];
+        var acquisition = steps.Children.Cast<YamlMappingNode>().Single(step => step.Children.TryGetValue(new YamlScalarNode("name"), out var name)
+            && name.ToString().StartsWith("Acquire", StringComparison.Ordinal));
+        var acquisitionEnv = (YamlMappingNode)acquisition.Children[new YamlScalarNode("env")];
+        var payload = new
+        {
+            script,
+            outputs = outputs.Children.ToDictionary(pair => pair.Key.ToString(), pair => pair.Value.ToString()),
+            matrix = matrix.Children[new YamlScalarNode("side")].ToString(),
+            archive = acquisitionEnv.Children[new YamlScalarNode("SIDES")].ToString()
+        };
         var directory = Directory.CreateTempSubdirectory("df-source-plan-").FullName;
         try
         {
             const string harness = """
-                import io, json, os, sys, tempfile, unittest
-                script = json.loads(sys.stdin.read())
-                def sides(execution):
+                import io, json, os, re, sys, tempfile, unittest
+                payload = json.loads(sys.stdin.read())
+                script = payload['script']
+                matrix = payload['matrix']
+                def selection(execution):
                     with tempfile.TemporaryDirectory() as directory:
                         output = os.path.join(directory, 'output')
                         open(output, 'w').close()
@@ -220,10 +237,27 @@ public sealed class IosWorkflowRunnerTests
                         finally:
                             os.environ = previous
                         value = open(output).read()
-                    return json.loads(value.split('sides=', 1)[1].strip())
+                    step_outputs = dict(line.split('=', 1) for line in value.splitlines())
+                    def step_value(expression):
+                        match = re.fullmatch(r'\$\{\{ steps\.plan\.outputs\.([a-z_]+) \}\}', expression)
+                        assert match, 'unknown step output expression: ' + expression
+                        return json.loads(step_outputs[match[1]])
+                    job_outputs = {name: step_value(expression) for name, expression in payload['outputs'].items()}
+                    match = re.fullmatch(r'\$\{\{ fromJSON\(needs\.sources\.outputs\.([a-z_]+)\) \}\}', matrix)
+                    assert match, 'unknown matrix expression: ' + matrix
+                    return job_outputs[match[1]], step_value(payload['archive'])
+                def sides(execution):
+                    return selection(execution)[1]
                 class Cases(unittest.TestCase):
                     def test_legacy_request_without_execution_keeps_both_sides(self):
-                        self.assertEqual(sides(''), ['base', 'head'])
+                        self.assertEqual(selection(''), (['base', 'head'], ['base', 'head']))
+                    def test_rendered_matrix_runs_only_requested_side_even_when_overlay_needs_opposite_archive(self):
+                        for side in ('base', 'head'):
+                            opposite = 'head' if side == 'base' else 'base'
+                            for overlay, paths in (('b'*40, ['Sources/Shared']), ('a'*40, ['Sources/Shared']), ('b'*40, [])):
+                                execution = json.dumps(dict(side=side, commit='a'*40, overlayFrom=overlay, overlayPaths=paths))
+                                expected_archives = [side, opposite] if paths and overlay != 'a'*40 else [side]
+                                self.assertEqual(selection(execution), ([side], expected_archives))
                     def test_head_only_needs_no_base_archive(self):
                         self.assertEqual(sides('{"side":"head","commit":"' + 'a'*40 + '"}'), ['head'])
                     def test_cross_revision_overlay_adds_only_the_opposite_side(self):
@@ -248,14 +282,21 @@ public sealed class IosWorkflowRunnerTests
                 for name,old,new in [
                     ('overlay-opposite-always', "if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):", "if parsed.get('overlayPaths'):"),
                     ('overlay-opposite-never', "if parsed.get('overlayPaths') and parsed.get('overlayFrom') != parsed.get('commit'):", "if False:"),
-                    ('legacy-sides-reduced', "sides = ['base', 'head']\nif execution:", "sides = ['base', 'head']\nif False:")]:
+                    ('legacy-sides-reduced', "if execution:", "if False:")]:
                     if old not in original: raise AssertionError('mutation anchor missing: '+name)
                     script=original.replace(old,new,1);red=run()
                     if not red.failures or red.errors: raise AssertionError('not an assertion-only RED: '+name+str(red.errors))
                     print('MUTANT RED '+name)
                     script=original
                     if not run().wasSuccessful(): raise AssertionError('restoration failed: '+name)
-                print('6 source plan contracts passed; 3 mutants RED/restored GREEN')
+                original_matrix = matrix
+                matrix = '${{ fromJSON(needs.sources.outputs.archive_sides) }}'
+                red = run()
+                if not red.failures or red.errors: raise AssertionError('not an assertion-only RED: archive-dependencies-reused-as-execution-matrix')
+                print('MUTANT RED archive-dependencies-reused-as-execution-matrix')
+                matrix = original_matrix
+                if not run().wasSuccessful(): raise AssertionError('matrix restoration failed')
+                print('7 source plan contracts passed; 4 mutants RED/restored GREEN')
                 """;
             var start = new ProcessStartInfo("python3", ["-I", "-c", harness])
             {
@@ -265,12 +306,12 @@ public sealed class IosWorkflowRunnerTests
             using var process = Process.Start(start)!;
             var stdout = process.StandardOutput.ReadToEndAsync();
             var stderr = process.StandardError.ReadToEndAsync();
-            await process.StandardInput.WriteAsync(System.Text.Json.JsonSerializer.Serialize(script));
+            await process.StandardInput.WriteAsync(System.Text.Json.JsonSerializer.Serialize(payload));
             process.StandardInput.Close();
             await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
             var output = await stdout + await stderr;
             Assert.True(process.ExitCode == 0, output);
-            Assert.Contains("6 source plan contracts passed; 3 mutants RED/restored GREEN", output);
+            Assert.Contains("7 source plan contracts passed; 4 mutants RED/restored GREEN", output);
         }
         finally { Directory.Delete(directory, true); }
     }
